@@ -115,11 +115,18 @@ export class SocketIOAPI {
     private socketGeneration = 0;
     private transportConnected = false;
     private lastDisconnectedSocket?: any;
+    private retiredSocket?: any;
     private transportConnectedSignal = deferred<number>();
     private connectionAcceptedSignal = deferred<{generation: number, publicId: string}>();
+    private connectionAcceptedGeneration?: number;
     private v2ProjectResponse?: Deferred<ProjectEntity> & {generation: number};
     private documentMembershipQueue: Promise<void> = Promise.resolve();
     private legacyV1Rejected = false;
+    private legacyProbeAttempted = false;
+    private legacyV1Confirmed = false;
+    private readonly legacyFallbackAllowed: boolean;
+    private realtimeSchemeBeforeAlternative: Exclude<ConnectionScheme, 'Alt'> = 'v2';
+    private pollingFallbackAttempts = 0;
     private disposed = false;
 
     constructor(private url:string,
@@ -127,6 +134,11 @@ export class SocketIOAPI {
                 private readonly identity:Identity,
                 private readonly projectId:string)
     {
+        const hostname = new URL(url).hostname.toLowerCase();
+        // Hosted Overleaf requires projectId on the handshake. Never probe it
+        // with the queryless legacy protocol, even after a slow v2 response.
+        this.legacyFallbackAllowed =
+            hostname !== 'overleaf.com' && !hostname.endsWith('.overleaf.com');
         this.init();
     }
 
@@ -143,6 +155,8 @@ export class SocketIOAPI {
         // this client — explaining the "connection lost" loop reported in issue #309.
         if (this.socket) {
             try {
+                this.retiredSocket = this.socket;
+                this.stopSocketReconnect(this.socket);
                 // Notify all in-flight requests before removing handlers, then
                 // gracefully close the connection (sends FIN, not RST).
                 if (typeof this.socket.disconnect === 'function') {
@@ -171,11 +185,24 @@ export class SocketIOAPI {
                 break;
             case 'v2':
                 this.record = undefined;
-                const query = `?projectId=${this.projectId}&t=${Date.now()}`;
+                // The 0.9 client adds a fresh cache-busting timestamp itself.
+                const query = new URLSearchParams({projectId: this.projectId}).toString();
                 this.socket = this.api._initSocketV0(this.identity, query);
                 break;
         }
         const socketAtInit = this.socket;
+        const managerAtInit = socketAtInit?.socket ?? socketAtInit?.io;
+        const websocketDisabledForAttempt =
+            this.scheme !== 'Alt' && this.pollingFallbackAttempts > 0;
+        if (websocketDisabledForAttempt && managerAtInit?.options) {
+            // A proxy-level WebSocket failure can leave the 0.9 session id
+            // unusable before its slow transport fallback runs. Retry this one
+            // connection with the polling transport, as Overleaf's client does.
+            managerAtInit.options.transports = ['xhr-polling'];
+            // The downgrade is one-shot. A polling failure must not permanently
+            // lock out a self-hosted deployment which only allows WebSockets.
+            this.pollingFallbackAttempts -= 1;
+        }
         // resume handlers
         this.initInternalHandlers(socketAtInit);
         // Re-register existing event handlers on the new socket
@@ -185,6 +212,23 @@ export class SocketIOAPI {
         // socket.io can connect synchronously in tests or alternative transports.
         if (socketAtInit.connected === true) {
             this.markTransportConnected(socketAtInit);
+        }
+        console.log('SocketIOAPI: initialized realtime transport', {
+            scheme: this._socketInitScheme,
+            generation: this.socketGeneration,
+            projectQueryMatches: this.projectQueryMatches(socketAtInit),
+            websocketDisabledForAttempt,
+        });
+        // Match Overleaf's connection order: configure the manager and attach
+        // every listener before starting the asynchronous transport handshake.
+        if (
+            this.scheme !== 'Alt' &&
+            managerAtInit &&
+            !managerAtInit.connected &&
+            !managerAtInit.connecting &&
+            typeof managerAtInit.connect === 'function'
+        ) {
+            managerAtInit.connect();
         }
     }
 
@@ -201,8 +245,63 @@ export class SocketIOAPI {
         return this.socketGeneration;
     }
 
+    private stopSocketReconnect(socket: any) {
+        const manager = socket?.socket ?? socket?.io;
+        if (!manager) { return; }
+        if (manager.options) {
+            manager.options.reconnect = false;
+        }
+        if (typeof manager.reconnection === 'function') {
+            manager.reconnection(false);
+        }
+        for (const timerName of ['reconnectionTimer', 'reconnectTimer']) {
+            if (manager[timerName]) {
+                clearTimeout(manager[timerName]);
+                delete manager[timerName];
+            }
+        }
+        manager.reconnecting = false;
+        manager._reconnecting = false;
+    }
+
+    private projectQueryMatches(socket: any): boolean {
+        if ((this._socketInitScheme ?? this.scheme) !== 'v2') { return true; }
+        const manager = socket?.socket ?? socket?.io;
+        const rawQuery = manager?.options?.query;
+        if (typeof rawQuery !== 'string') { return false; }
+        return new URLSearchParams(rawQuery).get('projectId') === this.projectId;
+    }
+
+    private projectQueryDiagnostics(socket: any) {
+        const manager = socket?.socket ?? socket?.io;
+        const rawQuery = manager?.options?.query;
+        const configuredProjectId = typeof rawQuery === 'string' ?
+            new URLSearchParams(rawQuery).get('projectId') : null;
+        const objectIdPattern = /^[0-9a-f]{24}$/i;
+        return {
+            projectQueryMatches: configuredProjectId === this.projectId,
+            expectedProjectIdValid: objectIdPattern.test(this.projectId),
+            configuredProjectIdPresent: configuredProjectId !== null,
+            configuredProjectIdValid: configuredProjectId !== null && objectIdPattern.test(configuredProjectId),
+        };
+    }
+
     invalidateCurrentTransport() {
         this._socketInitScheme = undefined;
+        this.connectionAcceptedGeneration = undefined;
+
+        const socket = this.socket;
+        if (!socket) { return; }
+        this.retiredSocket = socket;
+        // Defensively cancel any reconnect loop which the legacy client may
+        // already have scheduled; changing its option afterwards is insufficient.
+        this.stopSocketReconnect(socket);
+        // Invalidate the generation synchronously so late project/identity events
+        // cannot become authoritative while the outer retry is backing off.
+        if (this.lastDisconnectedSocket !== socket) {
+            this.markTransportDisconnected(socket);
+        }
+        setTimeout(() => socket.disconnect?.(), 0);
     }
 
     private resetTransportState() {
@@ -220,6 +319,7 @@ export class SocketIOAPI {
             true,
         ));
         this.connectionAcceptedSignal = deferred<{generation: number, publicId: string}>();
+        this.connectionAcceptedGeneration = undefined;
         this.rejectV2ProjectResponse(new SocketRequestError(
             'stale_connection',
             'Socket transport was replaced',
@@ -227,14 +327,15 @@ export class SocketIOAPI {
         ));
     }
 
-    private markTransportConnected(socket: any) {
-        if (socket !== this.socket || this.transportConnected) { return; }
+    private markTransportConnected(socket: any): boolean {
+        if (socket !== this.socket || socket === this.retiredSocket || this.transportConnected) { return false; }
         this.lastDisconnectedSocket = undefined;
         this.transportConnected = true;
         this.transportConnectedSignal.resolve(this.socketGeneration);
         if (this.scheme === 'v2') {
             this.ensureV2ProjectResponse();
         }
+        return true;
     }
 
     private markTransportDisconnected(socket: any) {
@@ -254,6 +355,7 @@ export class SocketIOAPI {
             true,
         ));
         this.connectionAcceptedSignal = deferred<{generation: number, publicId: string}>();
+        this.connectionAcceptedGeneration = undefined;
         this.rejectV2ProjectResponse(new SocketRequestError(
             'disconnected',
             'Socket disconnected before the project session was ready',
@@ -336,14 +438,31 @@ export class SocketIOAPI {
 
     private initInternalHandlers(socketAtInit: any) {
         socketAtInit.on('connect', () => {
-            this.markTransportConnected(socketAtInit);
-            console.log('SocketIOAPI: connected');
+            if (this.markTransportConnected(socketAtInit)) {
+                this.pollingFallbackAttempts = 0;
+                console.log('SocketIOAPI: connected');
+            }
         });
         socketAtInit.on('disconnect', () => {
             this.markTransportDisconnected(socketAtInit);
+            if (
+                !this.disposed &&
+                socketAtInit === this.socket &&
+                socketAtInit !== this.retiredSocket
+            ) {
+                // Do not enter socket.io 0.9's automatic reconnect loop. Retire
+                // the failed transport; the VFS single-flight retry creates a
+                // clean replacement after this disconnect event is delivered.
+                this.invalidateCurrentTransport();
+            }
         });
         socketAtInit.on('connectionAccepted', (_:any, publicId:any) => {
-            if (socketAtInit !== this.socket) { return; }
+            if (
+                socketAtInit !== this.socket ||
+                socketAtInit === this.retiredSocket ||
+                !this.transportConnected
+            ) { return; }
+            this.connectionAcceptedGeneration = this.socketGeneration;
             this.connectionAcceptedSignal.resolve({
                 generation: this.socketGeneration,
                 publicId: String(publicId ?? ''),
@@ -351,13 +470,25 @@ export class SocketIOAPI {
         });
         socketAtInit.on('connect_failed', () => {
             console.log('SocketIOAPI: connect_failed');
+            if (
+                !this.disposed &&
+                socketAtInit === this.socket &&
+                socketAtInit !== this.retiredSocket
+            ) {
+                this.invalidateCurrentTransport();
+            }
         });
         socketAtInit.on('forceDisconnect', (message:string, delay=10) => {
             console.log('SocketIOAPI: forceDisconnect', message);
         });
         socketAtInit.on('connectionRejected', (err:any) => {
+            if (socketAtInit !== this.socket || socketAtInit === this.retiredSocket) { return; }
             const message = String(err?.message || err);
-            console.log('SocketIOAPI: connectionRejected.', message);
+            console.log('SocketIOAPI: connectionRejected.', message, {
+                scheme: this._socketInitScheme ?? this.scheme,
+                generation: this.socketGeneration,
+                ...this.projectQueryDiagnostics(socketAtInit),
+            });
             const rejection = new SocketRequestError(
                 'server_error',
                 `Project connection rejected: ${message}`,
@@ -366,32 +497,53 @@ export class SocketIOAPI {
             );
             this.rejectV2ProjectResponse(rejection);
             const activeScheme = this._socketInitScheme ?? this.scheme;
-            // Modern servers explicitly reject legacy handshakes which omit the
-            // project id. Once observed, never bounce back to that known-bad
-            // protocol because a later v2 attempt has a transient failure.
-            if (activeScheme === 'v1' && /missing\/bad.*projectId/i.test(message)) {
+            // A rejected legacy probe is not useful to repeat with the same
+            // parameters. Return monotonically to the project-query protocol.
+            if (activeScheme === 'v1') {
                 this.legacyV1Rejected = true;
                 this.scheme = 'v2';
             }
             this.invalidateCurrentTransport();
-            // Disable auto-reconnect on this socket: the server explicitly rejected
-            // our connection parameters. Reconnecting would just get rejected again,
-            // creating unnecessary TCP connection churn (and RST packets).
-            if (socketAtInit.socket?.options) {
-                socketAtInit.socket.options.reconnect = false;
-            } else if (socketAtInit.io && typeof socketAtInit.io.reconnect === 'function') {
-                socketAtInit.io.reconnect(false);
-            }
-            setTimeout(() => socketAtInit.disconnect?.(), 0);
         });
         socketAtInit.on('error', (err:any) => {
-            // Log error instead of throwing to avoid crashing the extension
-            console.error('SocketIOAPI: socket error', err?.message || err);
+            if (socketAtInit !== this.socket || socketAtInit === this.retiredSocket) { return; }
+            const message = String(err?.message || err);
+            console.error('SocketIOAPI: socket error', message, {
+                scheme: this._socketInitScheme ?? this.scheme,
+                generation: this.socketGeneration,
+                ...this.projectQueryDiagnostics(socketAtInit),
+            });
+            const activeScheme = this._socketInitScheme ?? this.scheme;
+            const invalidHandshake = /client not handshaken/i.test(message);
+            const websocketProxyFailure = /unexpected server response \(5\d\d\)/i.test(message);
+            const manager = socketAtInit?.socket ?? socketAtInit?.io;
+            // An HTTP handshake error in socket.io 0.9 clears `connecting`
+            // before emitting a plain response body such as "Bad Gateway".
+            // A WebSocket transport error keeps `connecting` true while its
+            // built-in transport fallback is still viable.
+            const terminalBeforeTransport =
+                !this.transportConnected &&
+                manager?.connected !== true &&
+                manager?.connecting !== true;
+            if (invalidHandshake || websocketProxyFailure || terminalBeforeTransport) {
+                if (invalidHandshake && activeScheme === 'v1') {
+                    this.legacyV1Rejected = true;
+                    this.scheme = 'v2';
+                }
+                if (websocketProxyFailure) {
+                    this.pollingFallbackAttempts = 1;
+                }
+                this.invalidateCurrentTransport();
+            }
         });
 
         if (this.scheme==='v2') {
             socketAtInit.on('joinProjectResponse', (res:any) => {
-                if (socketAtInit !== this.socket) { return; }
+                if (
+                    socketAtInit !== this.socket ||
+                    socketAtInit === this.retiredSocket ||
+                    !this.transportConnected
+                ) { return; }
                 const publicId = res.publicId as string;
                 const project = res.project as ProjectEntity;
                 this.ensureV2ProjectResponse().resolve(project);
@@ -410,6 +562,8 @@ export class SocketIOAPI {
         this._handlers = [];
 
         const socket = this.socket;
+        this.retiredSocket = socket;
+        this.stopSocketReconnect(socket);
         try {
             socket?.disconnect?.();
         } finally {
@@ -423,6 +577,7 @@ export class SocketIOAPI {
         );
         this.transportConnectedSignal.reject(error);
         this.connectionAcceptedSignal.reject(error);
+        this.connectionAcceptedGeneration = undefined;
         this.rejectV2ProjectResponse(error);
         this.transportConnected = false;
         this.lastDisconnectedSocket = undefined;
@@ -439,7 +594,12 @@ export class SocketIOAPI {
     }
 
     toggleAlternativeConnectionScheme(url: string, updatedRecord?: ProjectEntity) {
-        this.scheme = this.scheme==='Alt' ? 'v2' : 'Alt';
+        if (this.scheme === 'Alt') {
+            this.scheme = this.realtimeSchemeBeforeAlternative;
+        } else {
+            this.realtimeSchemeBeforeAlternative = this.scheme;
+            this.scheme = 'Alt';
+        }
         if (updatedRecord) {
             this.url = url;
             this.record = Promise.resolve(updatedRecord);
@@ -494,11 +654,18 @@ export class SocketIOAPI {
                         handler();
                     });
                     break;
-                case handlers.onConnectionAccepted:
-                    this.socket.on('connectionAccepted', (_:any, publicId:any) => {
+                case handlers.onConnectionAccepted: {
+                    const socketAtRegistration = this.socket;
+                    socketAtRegistration.on('connectionAccepted', (_:any, publicId:any) => {
+                        if (
+                            socketAtRegistration !== this.socket ||
+                            socketAtRegistration === this.retiredSocket ||
+                            !this.transportConnected
+                        ) { return; }
                         handler(publicId);
                     });
                     break;
+                }
                 case handlers.onClientUpdated:
                     this.socket.on('clientTracking.clientUpdated', (user:UpdateUserSchema) => {
                         handler(user);
@@ -553,7 +720,7 @@ export class SocketIOAPI {
      * @param {string} projectId - The project id.
      * @returns {Promise}
      */
-    async joinProject(project_id:string): Promise<ProjectEntity> {
+    async joinProject(project_id:string, timeoutMs: number = ACK_TIMEOUT_MS): Promise<ProjectEntity> {
         const generation = await this.waitUntilConnected();
         const activeScheme = this._socketInitScheme ?? this.scheme;
         switch(activeScheme) {
@@ -566,7 +733,7 @@ export class SocketIOAPI {
                         socketAtJoin,
                         'joinProject',
                         [{project_id}],
-                        ACK_TIMEOUT_MS,
+                        timeoutMs,
                         generation,
                         (candidate) => candidate === this.socketGeneration && socketAtJoin === this.socket,
                         {
@@ -579,10 +746,26 @@ export class SocketIOAPI {
                             ),
                         },
                     );
+                    if (activeScheme === 'v1') {
+                        this.legacyV1Confirmed = true;
+                    }
                     this.record = Promise.resolve(response[0]);
                     return response[0];
                 } catch (error) {
-                    if (!isRecoverableTransportInterruption(error)) {
+                    const failedUnconfirmedLegacyProbe =
+                        activeScheme === 'v1' &&
+                        this.legacyProbeAttempted &&
+                        !this.legacyV1Confirmed;
+                    if (failedUnconfirmedLegacyProbe) {
+                        // A legacy compatibility probe is strictly one-shot. Any
+                        // unsuccessful v1 join returns to the project-query protocol.
+                        this.legacyV1Rejected = true;
+                        this.scheme = 'v2';
+                    }
+                    if (
+                        failedUnconfirmedLegacyProbe ||
+                        !isRecoverableTransportInterruption(error)
+                    ) {
                         this.invalidateCurrentTransport();
                     }
                     throw error;
@@ -598,17 +781,28 @@ export class SocketIOAPI {
                     );
                 }
                 try {
-                    const projectResponse = response.promise.then(
-                        project => ({kind: 'project' as const, project}),
-                    );
-                    const handshake = this.legacyV1Rejected ? projectResponse : Promise.race([
-                        projectResponse,
-                        this.waitUntilConnectionAccepted(generation).then(() => ({kind: 'legacy' as const})),
-                    ]);
-                    const result = await withTimeout(handshake, 'project handshake', ACK_TIMEOUT_MS);
-                    if (result.kind === 'legacy') {
-                        // Older self-hosted servers accept the transport first and
-                        // require an explicit joinProject request on a v1 socket.
+                    // Modern v2 servers can emit connectionAccepted before
+                    // joinProjectResponse. Event order therefore cannot identify a
+                    // legacy server: doing so would replace a valid project-query
+                    // socket with a v1 socket that omits projectId.
+                    const project = await withTimeout(response.promise, 'project handshake', timeoutMs);
+                    this.record = Promise.resolve(project);
+                    return project;
+                } catch (error) {
+                    const acceptedButNoProject =
+                        error instanceof SocketRequestError &&
+                        error.code === 'timeout' &&
+                        this.legacyFallbackAllowed &&
+                        !this.legacyV1Rejected &&
+                        !this.legacyProbeAttempted &&
+                        this.connectionAcceptedGeneration === generation &&
+                        generation === this.socketGeneration &&
+                        this.transportConnected;
+                    if (acceptedButNoProject) {
+                        // Older self-hosted servers accept the transport but require
+                        // an explicit joinProject request on a v1 socket. Only make
+                        // this compatibility fallback after the full v2 deadline.
+                        this.legacyProbeAttempted = true;
                         this.scheme = 'v1';
                         this.invalidateCurrentTransport();
                         throw new SocketRequestError(
@@ -617,12 +811,9 @@ export class SocketIOAPI {
                             false,
                         );
                     }
-                    this.record = Promise.resolve(result.project);
-                    return result.project;
-                } catch (error) {
                     // A connected transport which times out or is explicitly
-                    // rejected is not reusable. A normal disconnect is left to
-                    // socket.io's automatic reconnect on the same socket.
+                    // rejected is not reusable. Disconnects are also retired by
+                    // the transport handler and replaced by the VFS retry loop.
                     if (!isRecoverableTransportInterruption(error)) {
                         this.invalidateCurrentTransport();
                     }

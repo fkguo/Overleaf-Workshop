@@ -6,6 +6,8 @@ import { StatusInfo } from '../scm';
 export type Events = {
     'fileWillOpenEvent': {uri: vscode.Uri},
     'pdfWillOpenEvent': {uri: vscode.Uri, doc:PdfDocument, webviewPanel:vscode.WebviewPanel},
+    'pdfViewerReadyEvent': {uri: vscode.Uri, webviewPanel:vscode.WebviewPanel},
+    'pdfViewDisposedEvent': {uri: vscode.Uri, webviewPanel:vscode.WebviewPanel},
     'spellCheckLanguageUpdateEvent': {language:string},
     'compilerUpdateEvent': {compiler:string},
     'rootDocUpdateEvent': {rootDocId:string},

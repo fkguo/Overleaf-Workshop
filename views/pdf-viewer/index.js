@@ -37,6 +37,11 @@
         pdfSidebarView: SidebarView.NONE,
     };
     let firstLoaded = true;
+    let pendingSyncCode;
+    let pdfLoadGeneration = 0;
+    let loadingPdfGeneration = 0;
+    let readyPdfGeneration = 0;
+    let loadingPdfDocument;
 
     function updatePdfViewerState() {
         const pdfViewerState = vscode.getState() || globalPdfViewerState;
@@ -149,47 +154,78 @@
     }
 
     async function updatePdf(pdf) {
+        const generation = ++pdfLoadGeneration;
+        // The old PDF remains mounted while getDocument parses the replacement.
+        // Do not consume a new SyncTeX result against that stale viewport.
+        readyPdfGeneration = 0;
         const doc = await pdfjsLib.getDocument({
             data: pdf,
             cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.10.111/cmaps/',
             cMapPacked: true
         }).promise;
+        if (generation !== pdfLoadGeneration) {
+            await doc.destroy();
+            return;
+        }
         if (firstLoaded) {
             firstLoaded = false;
         } else {
             backupPdfViewerState();
         }
         PDFViewerApplication.isViewerEmbedded = true;
+        loadingPdfGeneration = generation;
+        loadingPdfDocument = doc;
         PDFViewerApplication.load(doc);
     }
 
-    // Reference: https://github.com/James-Yu/LaTeX-Workshop/blob/master/viewer/latexworkshop.ts#L306
-    function syncCode(pdf) {
-        const _idx = Math.ceil(pdf.length / 2) - 1;
-        const container = document.getElementById('viewerContainer');
-        const maxScrollX = window.innerWidth * 0.9;
-        const minScrollX = window.innerWidth * 0.1;
-        const pageNum = pdf[_idx].page;
-        const h = pdf[_idx].h;
-        const v = pdf[_idx].v;
-        const page = document.getElementsByClassName('page')[pageNum - 1];
-        if (page === null || page === undefined) {
-            return;
+    function revealSyncCode(pdf) {
+        if (
+            readyPdfGeneration !== pdfLoadGeneration ||
+            PDFViewerApplication.pdfDocument !== loadingPdfDocument
+        ) {
+            return false;
         }
-        const {viewport} = PDFViewerApplication.pdfViewer.getPageView(pageNum - 1);
-        let [left, top] = viewport.convertToPdfPoint(h , v);
-        let scrollX = page.offsetLeft + left;
-        scrollX = Math.min(scrollX, maxScrollX);
-        scrollX = Math.max(scrollX, minScrollX);
-        const scrollY = page.offsetTop + page.offsetHeight - top;
-        if (PDFViewerApplication.pdfViewer.scrollMode === 1) {
-            // horizontal scrolling
-            container.scrollLeft = page.offsetLeft;
-        } else {
-            // vertical scrolling
-            container.scrollTop = scrollY - document.body.offsetHeight * 0.4;
+        if (!Array.isArray(pdf) || pdf.length === 0) {
+            return true;
         }
+        const target = pdf.find(item => Number.isInteger(item.page) && item.page > 0);
+        if (!target) {
+            return true;
+        }
+        const pageView = PDFViewerApplication.pdfViewer.getPageView(target.page - 1);
+        if (!pageView?.viewport) {
+            return false;
+        }
+
+        const {viewport} = pageView;
+        const viewBoxHeight = viewport.viewBox[3] + 10;
+        const width = Number(target.width) || 0;
+        const height = Number(target.height) || 0;
+        const x = Number(target.h) + width / 2;
+        const y = viewBoxHeight - (Number(target.v) + height / 2);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) { return true; }
+
+        // Let PDF.js reveal the page and transform the PDF point. This also
+        // switches the mounted page in ScrollMode.PAGE, where off-page divs are
+        // intentionally detached and have unusable DOM offsets.
+        PDFViewerApplication.pdfViewer.scrollPageIntoView({
+            pageNumber: target.page,
+            destArray: [null, {name: 'XYZ'}, x, y, null],
+            ignoreDestinationZoom: true,
+        });
         backupPdfViewerState();
+        return true;
+    }
+
+    function flushPendingSyncCode() {
+        if (pendingSyncCode && revealSyncCode(pendingSyncCode)) {
+            pendingSyncCode = undefined;
+        }
+    }
+
+    function syncCode(pdf) {
+        pendingSyncCode = pdf;
+        window.requestAnimationFrame(flushPendingSyncCode);
     }
 
     //Reference: https://github.com/overleaf/overleaf/blob/main/services/web/frontend/js/features/pdf-preview/util/pdf-js-wrapper.js#L163
@@ -214,7 +250,17 @@
         .then(() => {
             const {eventBus, _boundEvents} = PDFViewerApplication;
             eventBus._off("beforeprint", _boundEvents.beforePrint);
-            eventBus.on('documentloaded', updatePdfViewerState);
+            eventBus.on('documentloaded', () => {
+                if (
+                    loadingPdfGeneration !== pdfLoadGeneration ||
+                    PDFViewerApplication.pdfDocument !== loadingPdfDocument
+                ) { return; }
+                readyPdfGeneration = loadingPdfGeneration;
+                updatePdfViewerState();
+                window.requestAnimationFrame(flushPendingSyncCode);
+            });
+            eventBus._on('pagesloaded', flushPendingSyncCode);
+            eventBus._on('pagerendered', flushPendingSyncCode);
             // backup scale
             eventBus._on('scalechanged', backupPdfViewerState);
             eventBus._on("zoomin", backupPdfViewerState);

@@ -51,15 +51,13 @@ export interface SyncPdfResponseSchema {
     column: number
 }
 
-export interface SyncCodeResponseSchema {
-    pdf: Array<{
-        page: number,
-        h: number,
-        v: number,
-        width: number,
-        height: number,
-    }>
-}
+export type SyncCodeResponseSchema = Array<{
+    page: number,
+    h: number,
+    v: number,
+    width: number,
+    height: number,
+}>;
 
 export interface SnippetItemSchema {
     meta: string,
@@ -249,19 +247,23 @@ export class BaseAPI {
 
     // Reference: "github:overleaf/overleaf/services/web/frontend/js/ide/connection/ConnectionManager.js#L137"
     _initSocketV0(identity:Identity, query?:string) {
-        const url = new URL(this.url).origin + (query ?? '');
-        return (require('socket.io-client').connect as any)(url, {
-            // Enable auto-reconnect to avoid creating new TCP connections on transient failures.
-            // Creating new connections without proper teardown of old ones causes TCP RST packets
-            // when the server sends data on abandoned connections (see issue #309).
-            // Note: socket.io-client 0.9.x uses space-separated option names.
-            reconnect: true,
-            'reconnection delay': 1000,
-            'reconnection limit': 16000,
-            'max reconnection attempts': 10,
+        const origin = new URL(this.url).origin;
+        // socket.io-client 0.9.x builds each handshake from options.query.
+        // Keep the project identity there explicitly, matching Overleaf's client.
+        const socketQuery = (query ?? '').replace(/^\?/, '');
+        console.log(
+            'SocketIOAPI: opening realtime transport',
+            socketQuery ? '(project query configured)' : '(legacy queryless mode)',
+        );
+        return (require('socket.io-client').connect as any)(origin, {
+            // Overleaf drives reconnects explicitly. The legacy client's automatic
+            // reconnect path can reuse a failed transport after a proxy 502.
+            reconnect: false,
+            'auto connect': false,
             'force new connection': true,
+            query: socketQuery,
             extraHeaders: {
-                'Origin': new URL(this.url).origin,
+                'Origin': origin,
                 'Cookie': identity.cookies,
             }
         });
@@ -624,14 +626,15 @@ export class BaseAPI {
     }
 
     async compile(identity:Identity, projectId:string, rootResourcePath:string|null,
-        draft:boolean=false, stopOnFirstError:boolean=false
+        draft:boolean=false, stopOnFirstError:boolean=false, editorId?: string
     ) {
         const body = {
             check: 'silent',
             draft,
             incrementalCompilesEnabled: true,
             rootResourcePath,   // file path e.g. "main.tex"
-            stopOnFirstError
+            stopOnFirstError,
+            editorId,
         };
 
         this.setIdentity(identity);
@@ -751,19 +754,34 @@ export class BaseAPI {
         return downloadWithRanges(absoluteUrl, headers, (url, init) => fetch(url, init));
     }
 
-    async proxySyncPdf(identity:Identity, projectId:string, page:number, h:number, v:number, buildId:string) {
+    async proxySyncPdf(identity:Identity, projectId:string, page:number, h:number, v:number, editorId:string, buildId:string, clsiServerId?: string) {
         this.setIdentity(identity);
-        const request = `project/${projectId}/sync/pdf?page=${page}&h=${h.toFixed(2)}&v=${v.toFixed(2)}&editorId=${uuidv4()}&buildId=${buildId}`;
-        return this.request('GET', `project/${projectId}/sync/pdf?page=${page}&h=${h.toFixed(2)}&v=${v.toFixed(2)}&editorId=${uuidv4()}&buildId=${buildId}`,
+        const params = new URLSearchParams({
+            page: String(page),
+            h: h.toFixed(2),
+            v: v.toFixed(2),
+            editorId,
+        });
+        params.set('buildId', buildId);
+        if (clsiServerId) { params.set('clsiserverid', clsiServerId); }
+        return this.request('GET', `project/${projectId}/sync/pdf?${params.toString()}`,
                             undefined, (res) => {
                                 const syncPdf = (JSON.parse(res!) as any).code[0] as SyncPdfResponseSchema;
                                 return {syncPdf};
                             });
     }
 
-    async proxySyncCode(identity:Identity, projectId:string, file:string, line:number, column:number, buildId:string) {
+    async proxySyncCode(identity:Identity, projectId:string, file:string, line:number, column:number, editorId:string, buildId:string, clsiServerId?: string) {
         this.setIdentity(identity);
-        return this.request('GET', `project/${projectId}/sync/code?file=${file}&line=${line}&column=${column}&editorId=${uuidv4()}&buildId=${buildId}`,
+        const params = new URLSearchParams({
+            file,
+            line: String(line),
+            column: String(column),
+            editorId,
+        });
+        params.set('buildId', buildId);
+        if (clsiServerId) { params.set('clsiserverid', clsiServerId); }
+        return this.request('GET', `project/${projectId}/sync/code?${params.toString()}`,
                             undefined, (res) => {
                                 const syncCode = (JSON.parse(res!) as any).pdf as SyncCodeResponseSchema;
                                 return {syncCode};

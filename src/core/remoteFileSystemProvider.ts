@@ -16,6 +16,9 @@ import {
     prepareDocumentUpdate,
     requiresVersionConfirmation,
 } from './documentUpdate';
+import { v4 as uuidv4 } from 'uuid';
+import { resolveSynctexOutputIdentity } from '../compile/synctex';
+import { parseProjectUri, projectConnectionKey } from './projectUri';
 
 const __OUTPUTS_ID = `${ROOT_NAME}-outputs`;
 
@@ -53,6 +56,7 @@ export interface OutputFileEntity extends FileEntity {
     url: string, // `project/${projectId}/user/${userId}/output/${build}/output/${path}`
     type: string, //output file type (postfix)
     build: string, //build id
+    editorId?: string,
 }
 
 export interface FolderEntity extends FileEntity {
@@ -116,17 +120,7 @@ export class File implements vscode.FileStat {
 }
 
 export function parseUri(uri: vscode.Uri) {
-    const query:any = uri.query.split('&').reduce((acc, v) => {
-        const [key,value] = v.split('=');
-        return {...acc, [key]:value};
-    }, {});
-    const [userId, projectId] = [query.user, query.project];
-    const _pathParts = uri.path.split('/');
-    const serverName = uri.authority;
-    const projectName = decodeURIComponent(_pathParts[1]);
-    const pathParts = _pathParts.splice(2);
-    const identifier = `${userId}/${projectId}/${projectName}`;
-    return {userId, projectId, serverName, projectName, identifier, pathParts};
+    return parseProjectUri(uri.authority, uri.path, uri.query);
 }
 
 export class VirtualFileSystem extends vscode.Disposable {
@@ -143,6 +137,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     private reconnectingNotification: boolean = false;
     private previousRoot?: ProjectEntity;
     private hasCompletedInitialConnection = false;
+    private connectionRequested = false;
     private documentWrites = new Map<string, Promise<void>>();
     private documentJoinTasks = new Map<string, Promise<{doc: DocumentEntity, content: string}>>();
     private joiningDocuments = new Map<string, {generation: number, updates: UpdateSchema[]}>();
@@ -153,6 +148,8 @@ export class VirtualFileSystem extends vscode.Disposable {
     private outputBuildId?: string;
     private compileGroup?: string;
     private clsiServerId?: string;
+    private readonly editorId = uuidv4();
+    private outputEditorId?: string;
     private pdfDownloadDomain?: string;
     private notify: (events:vscode.FileChangeEvent[])=>void;
     private clientManagerItem?: {manager: ClientManager, triggers: vscode.Disposable[]};
@@ -221,6 +218,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (this.disposed) {
             throw vscode.FileSystemError.Unavailable('The Overleaf project is closed');
         }
+        this.connectionRequested = true;
         if (this.root) {
             return Promise.resolve(this.root);
         }
@@ -359,10 +357,10 @@ export class VirtualFileSystem extends vscode.Disposable {
                 lastError = error;
                 this.root = undefined;
                 this.joiningProject = undefined;
-                // Let socket.io exhaust its automatic reconnect first. If the
-                // connection waiter itself times out while still offline, the
-                // physical socket is no longer making progress and must be
-                // replaced for the next outer attempt.
+                // A failed/disconnected legacy transport is not reused. The
+                // socket state machine normally retires it immediately; this
+                // timeout guard also retires a transport which never emitted a
+                // terminal event.
                 if (
                     error instanceof SocketRequestError &&
                     error.code === 'timeout' &&
@@ -797,6 +795,12 @@ export class VirtualFileSystem extends vscode.Disposable {
             onDisconnected: () => {
                 console.log("Disconnected");
                 if (this.disposed) { return; }
+                // A constructor-only prefetch is not an active project session.
+                // Do not let its first disconnect trigger project initialization,
+                // retries, and user-facing connection-loss notifications.
+                if (!this.connectionRequested && !this.initializing && !this.hasCompletedInitialConnection) {
+                    return;
+                }
                 if (this.root) {
                     this.previousRoot = this.root;
                 }
@@ -1622,45 +1626,78 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (events.length > 0) { this.notify(events); }
     }
 
-    async compile(force:boolean=false, draft:boolean=false, stopOnFirstError:boolean=false, rootDocId?:string) {
+    async compile(
+        force:boolean=false,
+        draft:boolean=false,
+        stopOnFirstError:boolean=false,
+        rootDocId?:string,
+        isCurrent: () => boolean = () => true,
+        onServerCompileStarted: () => void = () => {},
+    ) {
         if (force || (this.root && this.isDirty)) {
+            const wasDirty = this.isDirty;
+            const cancelled = () => {
+                return !isCurrent();
+            };
             this.isDirty = false;
-            let needCacheClearFirst = false;
-            try{
-                await this.resolve(this.pathToUri(OUTPUT_FOLDER_NAME, "output.log"));
-            }
-            catch (e) {
-                needCacheClearFirst = true;
-            }
-            const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-            // clear cache if needed
-            if (needCacheClearFirst) {
-                await this.api.deleteAuxFiles(identity, this.projectId);
-            }
-            // compile project
-            const resolvedRootDocId = rootDocId ?? this.root?.rootDoc_id ?? null;
-            let rootResourcePath: string | null = null;
-            if (resolvedRootDocId) {
-                const rootEntry = this._resolveById(resolvedRootDocId);
-                if (rootEntry?.path) {
-                    rootResourcePath = rootEntry.path.replace(/^\//, '');
+            try {
+                let needCacheClearFirst = false;
+                try{
+                    await this.resolve(this.pathToUri(OUTPUT_FOLDER_NAME, "output.log"));
+                }
+                catch (e) {
+                    needCacheClearFirst = true;
+                }
+                if (cancelled()) { return undefined; }
+                const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+                if (cancelled()) { return undefined; }
+                // clear cache if needed
+                if (needCacheClearFirst) {
+                    await this.api.deleteAuxFiles(identity, this.projectId);
+                    if (cancelled()) { return undefined; }
+                }
+                // compile project
+                const resolvedRootDocId = rootDocId ?? this.root?.rootDoc_id ?? null;
+                let rootResourcePath: string | null = null;
+                if (resolvedRootDocId) {
+                    const rootEntry = this._resolveById(resolvedRootDocId);
+                    if (rootEntry?.path) {
+                        rootResourcePath = rootEntry.path.replace(/^\//, '');
+                    } else {
+                        console.warn(`Unable to resolve root document id '${resolvedRootDocId}' to a path; compiling without explicit rootResourcePath.`);
+                    }
+                }
+                if (cancelled()) { return undefined; }
+                onServerCompileStarted();
+                const res = await this.api.compile(
+                    identity,
+                    this.projectId,
+                    rootResourcePath,
+                    draft,
+                    stopOnFirstError,
+                    this.editorId,
+                );
+                if (cancelled()) { return undefined; }
+                if (res.type==='success' && res.compile?.status==='success') {
+                    // Store CDN download info from the response for subsequent output file requests
+                    this.compileGroup = res.compile.compileGroup;
+                    this.clsiServerId = res.compile.clsiServerId;
+                    this.pdfDownloadDomain = res.compile.pdfDownloadDomain;
+                    this.updateOutputs(res.compile.outputFiles);
+                    return true;
                 } else {
-                    console.warn(`Unable to resolve root document id '${resolvedRootDocId}' to a path; compiling without explicit rootResourcePath.`);
+                    if (res.message!==undefined) {
+                        console.error('Compile failure.', res.message);
+                    }
+                    return false;
                 }
-            }
-            const res = await this.api.compile(identity, this.projectId, rootResourcePath, draft, stopOnFirstError);
-            if (res.type==='success' && res.compile?.status==='success') {
-                // Store CDN download info from the response for subsequent output file requests
-                this.compileGroup = res.compile.compileGroup;
-                this.clsiServerId = res.compile.clsiServerId;
-                this.pdfDownloadDomain = res.compile.pdfDownloadDomain;
-                this.updateOutputs(res.compile.outputFiles);
-                return true;
-            } else {
-                if (res.message!==undefined) {
-                    console.error('Compile failure.', res.message);
+            } catch (error) {
+                this.isDirty = this.isDirty || wasDirty;
+                throw error;
+            } finally {
+                if (cancelled()) {
+                    this.isDirty = this.isDirty || wasDirty;
                 }
-                return false;
             }
         }
         return Promise.resolve(undefined);
@@ -1682,8 +1719,9 @@ export class VirtualFileSystem extends vscode.Disposable {
     async updateOutputs(outputs: Array<OutputFileEntity>) {
         if (this.root) {
             // update output buildId
-            // '/project/65dbfff719ad65b54b9eaed4/user/65094b5fa537faaba0bec01f/build/19620231e54-5372f67292889500/output/output.aux' --> 19620231e54-5372f67292889500'
-            this.outputBuildId = outputs[0].url.match(/\/build\/([^\/]+)/)?.[1];
+            const outputIdentity = resolveSynctexOutputIdentity(outputs, this.editorId);
+            this.outputBuildId = outputIdentity.buildId;
+            this.outputEditorId = outputIdentity.editorId;
 
             const rootFolder = this.root.rootFolder[0];
             if (this.removeEntityById(rootFolder, 'folder', __OUTPUTS_ID)) {
@@ -1714,8 +1752,21 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async syncCode(filePath: string, line:number, column:number) {
+        if (!this.outputBuildId || !this.outputEditorId) {
+            vscode.window.showErrorMessage(vscode.l10n.t('SyncTeX is unavailable until the PDF has been compiled successfully.'));
+            return undefined;
+        }
         const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-        const res = await this.api.proxySyncCode(identity, this.projectId, filePath, line, column, this.outputBuildId ?? '');
+        const res = await this.api.proxySyncCode(
+            identity,
+            this.projectId,
+            filePath,
+            line,
+            column,
+            this.outputEditorId,
+            this.outputBuildId,
+            this.clsiServerId,
+        );
         if (res.type==='success') {
             return res.syncCode;
         } else {
@@ -1727,8 +1778,21 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async syncPdf(page:number, h:number, v:number) {
+        if (!this.outputBuildId || !this.outputEditorId) {
+            vscode.window.showErrorMessage(vscode.l10n.t('SyncTeX is unavailable until the PDF has been compiled successfully.'));
+            return undefined;
+        }
         const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-        const res = await this.api.proxySyncPdf(identity, this.projectId, page, h, v, this.outputBuildId ?? '');
+        const res = await this.api.proxySyncPdf(
+            identity,
+            this.projectId,
+            page,
+            h,
+            v,
+            this.outputEditorId,
+            this.outputBuildId,
+            this.clsiServerId,
+        );
         if (res.type==='success') {
             return res.syncPdf;
         } else {
@@ -1979,7 +2043,10 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider, vsco
     }
 
     private vfsKey(uri: vscode.Uri): string {
-        return `${uri.authority}\0${uri.query}`;
+        // Raw query serialization can differ between a restored workspace root
+        // and its restored editors. Canonical identity prevents duplicate VFS
+        // instances and duplicate realtime sockets for the same project.
+        return projectConnectionKey(uri.authority, uri.query);
     }
 
     private getVFS(uri: vscode.Uri): Promise<VirtualFileSystem> {

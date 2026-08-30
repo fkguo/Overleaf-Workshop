@@ -234,7 +234,7 @@ describe('assertCurrentConnection', () => {
 });
 
 describe('isRecoverableTransportInterruption', () => {
-    it('keeps the same socket for automatic reconnect interruptions', () => {
+    it('classifies disconnect-family errors as recoverable interruptions', () => {
         for (const code of ['disconnected', 'not_connected', 'stale_connection'] as const) {
             assert.equal(isRecoverableTransportInterruption(
                 new SocketRequestError(code, code, true),
@@ -242,7 +242,7 @@ describe('isRecoverableTransportInterruption', () => {
         }
     });
 
-    it('replaces a socket after a connected handshake timeout or server rejection', () => {
+    it('classifies a connected handshake timeout or server rejection as terminal', () => {
         assert.equal(isRecoverableTransportInterruption(
             new SocketRequestError('timeout', 'timeout', false),
         ), false);
