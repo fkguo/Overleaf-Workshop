@@ -11,7 +11,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     constructor(
         private readonly vfs: VirtualFileSystem,
-        private readonly publicId: string,
+        private publicId: string,
         private readonly extensionUri: vscode.Uri,
         private readonly socket: SocketIOAPI,
     ) {
@@ -68,6 +68,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     private sendMessage(content: string) {
         this.vfs.sendMessage(this.publicId, content);
+    }
+
+    updatePublicId(publicId: string) {
+        this.publicId = publicId;
     }
 
     private onReceivedMessage(message: ProjectMessageResponseSchema) {

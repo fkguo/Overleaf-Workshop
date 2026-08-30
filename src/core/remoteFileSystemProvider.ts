@@ -1,6 +1,5 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import * as vscode from 'vscode';
-import * as DiffMatchPatch from 'diff-match-patch';
 import { BaseAPI, MemberEntity, ProjectSettingsSchema } from '../api/base';
 import { SocketIOAPI, UpdateSchema } from '../api/socketio';
 import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
@@ -9,6 +8,14 @@ import { ClientManager } from '../collaboration/clientManager';
 import { EventBus } from '../utils/eventBus';
 import { SCMCollectionProvider } from '../scm/scmCollectionProvider';
 import { ExtendedBaseAPI, ProjectLinkedFileProvider, UrlLinkedFileProvider } from '../api/extendedBase';
+import { assertCurrentConnection, SocketRequestError, withTimeout } from '../api/socketRequest';
+import {
+    buildRecoveryUpdate,
+    desiredChangesArePresent,
+    isSenderConfirmation,
+    prepareDocumentUpdate,
+    requiresVersionConfirmation,
+} from './documentUpdate';
 
 const __OUTPUTS_ID = `${ROOT_NAME}-outputs`;
 
@@ -75,6 +82,22 @@ export interface ProjectEntity {
     settings: ProjectSettingsSchema,
 }
 
+type DocumentVersionWaiter = {
+    expectedVersion: number,
+    resolve: () => void,
+    reject: (error: Error) => void,
+    timer: NodeJS.Timeout,
+};
+
+type PendingDocumentUpdate = {
+    update: UpdateSchema,
+    desiredContent: string,
+    mergedContent: string,
+    submittedPublicIds: string[],
+    alternativeConnection: boolean,
+    localBase: string,
+};
+
 export class File implements vscode.FileStat {
     type: vscode.FileType;
     name: string;
@@ -108,6 +131,7 @@ export function parseUri(uri: vscode.Uri) {
 
 export class VirtualFileSystem extends vscode.Disposable {
     private root?: ProjectEntity;
+    private joiningProject?: ProjectEntity;
     private currentVersion?: number;
     private context: vscode.ExtensionContext;
     private api: BaseAPI;
@@ -116,14 +140,15 @@ export class VirtualFileSystem extends vscode.Disposable {
     private userId: string;
     private isDirty: boolean = true;
     private initializing?: Promise<ProjectEntity>;
-    private retryConnection: number = 0;
-    private retryTimer?: NodeJS.Timeout;
-    /** Whether a "Reconnecting..." notification is currently shown */
     private reconnectingNotification: boolean = false;
-    /** Timestamp of last disconnect for debounce */
-    private lastDisconnectTime: number = 0;
-    /** Whether event handlers have been registered on the current socket */
-    private handlersRegistered: boolean = false;
+    private previousRoot?: ProjectEntity;
+    private hasCompletedInitialConnection = false;
+    private documentWrites = new Map<string, Promise<void>>();
+    private documentJoinTasks = new Map<string, Promise<{doc: DocumentEntity, content: string}>>();
+    private joiningDocuments = new Map<string, {generation: number, updates: UpdateSchema[]}>();
+    private documentVersionWaiters = new Map<string, Set<DocumentVersionWaiter>>();
+    private pendingDocumentUpdates = new Map<string, PendingDocumentUpdate>();
+    private freshConnectionRequested = false;
     private outputBuildId?: string;
     private compileGroup?: string;
     private clsiServerId?: string;
@@ -166,10 +191,17 @@ export class VirtualFileSystem extends vscode.Disposable {
         } else {
             throw new Error( vscode.l10n.t('Cannot init SocketIOAPI for {serverName}', {serverName}) );
         }
+        // Register one logical handler set for the lifetime of this VFS. SocketIOAPI
+        // rebinds this set when a connection scheme requires a new physical socket.
+        this.remoteWatch();
     }
 
     get _userId() {
         return this.userId;
+    }
+
+    get isReady() {
+        return this.root !== undefined && this.socket.isConnected;
     }
 
     async init() : Promise<ProjectEntity> {
@@ -177,130 +209,230 @@ export class VirtualFileSystem extends vscode.Disposable {
             return Promise.resolve(this.root);
         }
 
-        if (!this.initializing) {
-            this.initializing = this.initializingPromise;
-        }
-        return this.initializing;
+        return this.startInitialization(false);
     }
 
-    private get initializingPromise(): Promise<ProjectEntity> {
+    private startInitialization(showProgress: boolean): Promise<ProjectEntity> {
+        if (this.root) {
+            return Promise.resolve(this.root);
+        }
+        if (this.initializing) {
+            if (showProgress) { this.showReconnectProgress(this.initializing); }
+            return this.initializing;
+        }
+
+        // Schedule the body after publishing the single-flight promise. Some
+        // alternative transports emit disconnect synchronously during init.
+        const operation = Promise.resolve().then(() => this.connectWithRetry());
+        let tracked!: Promise<ProjectEntity>;
+        tracked = operation.finally(() => {
+            if (this.initializing === tracked) {
+                this.initializing = undefined;
+            }
+        });
+        this.initializing = tracked;
+        if (showProgress) { this.showReconnectProgress(tracked); }
+        return tracked;
+    }
+
+    private showReconnectProgress(operation: Promise<ProjectEntity>) {
+        if (this.reconnectingNotification) { return; }
+        this.reconnectingNotification = true;
+        void vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: vscode.l10n.t('Reconnecting to {serverName}...', {serverName:this.serverName}),
+            cancellable: false,
+        }, async () => {
+            try {
+                await operation;
+            } catch {
+                // The connection failure dialog is emitted by connectWithRetry.
+            } finally {
+                this.reconnectingNotification = false;
+            }
+        });
+    }
+
+    private async connectWithRetry(): Promise<ProjectEntity> {
         const MAX_RETRIES = 5;
         const BASE_DELAY_MS = 1000; // 1 second base delay
+        let lastError: unknown;
 
-        // if retry connection exhausted, show error
-        if (this.retryConnection >= MAX_RETRIES) {
-            this.retryConnection = 0;
-            this.initializing = undefined;
-            this.reconnectingNotification = false;
-            vscode.window.showErrorMessage(
-                vscode.l10n.t('Connection lost: {serverName}', {serverName:this.serverName}),
-                vscode.l10n.t('Reload'),
-                vscode.l10n.t('Retry'),
-            ).then((choice) => {
-                if (choice === vscode.l10n.t('Reload')) {
-                    vscode.commands.executeCommand("workbench.action.reloadWindow");
-                } else if (choice === vscode.l10n.t('Retry')) {
-                    this.retryConnection = 0;
-                    this.handlersRegistered = false;
-                    this.socket.init(); // Recreate socket after all auto-reconnect attempts exhausted
-                    this.initializing = this.initializingPromise;
-                    this.init().catch(() => {});
-                }
-            });
-            throw new Error( vscode.l10n.t('Connection lost') );
-        }
-
-        // exponential backoff delay: 1s, 2s, 4s, 8s, 16s
-        const delayMs = this.retryConnection > 0 ? Math.min(BASE_DELAY_MS * Math.pow(2, this.retryConnection - 1), 16000) : 0;
-
-        // Show reconnecting notification on first retry
-        if (this.retryConnection === 1 && !this.reconnectingNotification) {
-            this.reconnectingNotification = true;
-            vscode.window.withProgress({
-                location: vscode.ProgressLocation.Notification,
-                title: vscode.l10n.t('Reconnecting to {serverName}...', {serverName:this.serverName}),
-                cancellable: false,
-            }, async () => {
-                // Keep the notification visible while reconnecting
-                await new Promise<void>((resolve) => {
-                    const check = () => {
-                        if (this.root || this.retryConnection >= MAX_RETRIES) {
-                            this.reconnectingNotification = false;
-                            resolve();
-                        } else {
-                            setTimeout(check, 500);
-                        }
-                    };
-                    check();
-                });
-            });
-        }
-
-        // Wait for backoff delay before retrying
-        const attemptReconnect = async (): Promise<ProjectEntity> => {
+        for (let attempt = 0; attempt < MAX_RETRIES; attempt += 1) {
+            const delayMs = attempt > 0 ? Math.min(BASE_DELAY_MS * Math.pow(2, attempt - 1), 16000) : 0;
             if (delayMs > 0) {
                 await new Promise(resolve => setTimeout(resolve, delayMs));
             }
 
-            // Only recreate the socket when the connection scheme has changed
-            // (e.g., v1→v2 after connectionRejected). For transient disconnects,
-            // socket.io's built-in auto-reconnect handles re-establishing the TCP
-            // connection without creating a new one — avoiding TCP RST packets.
             if (this.socket.needsReinit) {
                 this.socket.init();
-                this.handlersRegistered = false;
             }
 
-            // Register event handlers once on the current socket
-            if (!this.handlersRegistered) {
-                this.remoteWatch();
-                this.handlersRegistered = true;
-            }
-
-            this.root = undefined;
-            return this.socket.joinProject(this.projectId).then(async (project) => {
-                // Reset retry counter on success
-                this.retryConnection = 0;
-                this.reconnectingNotification = false;
-                // fetch project settings
-                const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-                project.settings = (await this.api.getProjectSettings(identity, this.projectId)).settings!;
+            try {
+                const connectionGeneration = await this.socket.waitUntilConnected();
+                const project = await this.socket.joinProject(this.projectId);
+                assertCurrentConnection(
+                    connectionGeneration,
+                    this.socket.generation,
+                    this.socket.isConnected,
+                );
+                // Realtime events may arrive after joinProject but before the
+                // settings request completes. Apply them to this candidate tree;
+                // it is not exposed as ready until the generation is rechecked.
+                this.joiningProject = project;
+                const settingsResponse = await withTimeout(
+                    GlobalStateManager.authenticate(this.context, this.serverName).then(
+                        identity => this.api.getProjectSettings(identity, this.projectId),
+                    ),
+                    'project settings',
+                    15000,
+                );
+                if (settingsResponse.type !== 'success' || !settingsResponse.settings) {
+                    throw new SocketRequestError(
+                        'server_error',
+                        `Unable to load project settings: ${settingsResponse.message || 'missing settings'}`,
+                        false,
+                    );
+                }
+                project.settings = settingsResponse.settings;
+                assertCurrentConnection(
+                    connectionGeneration,
+                    this.socket.generation,
+                    this.socket.isConnected,
+                );
+                this.restoreDocumentRuntime(this.previousRoot, project);
                 this.root = project;
+                this.joiningProject = undefined;
+                this.previousRoot = project;
                 const activeCondition = (vscode.workspace.workspaceFolders===undefined) || (vscode.workspace.workspaceFolders?.[0].uri.scheme!==ROOT_NAME) || (vscode.workspace.workspaceFolders?.[0].uri===this.origin);
-                // Register: [collaboration] ClientManager on Statusbar
-                if (activeCondition) {
-                    if (this.clientManagerItem?.triggers) {
-                        this.clientManagerItem.triggers.forEach((trigger) => trigger.dispose());
-                        delete this.clientManagerItem;
-                    }
+                if (activeCondition && !this.clientManagerItem) {
                     const clientManager = new ClientManager(this, this.context, this.publicId||'', this.socket);
                     this.clientManagerItem = {
                         manager: clientManager,
                         triggers: clientManager.triggers,
                     };
                 }
-                // Register: [scm] SCMCollectionProvider in explorer
-                if (activeCondition) {
-                    if (this.scmCollectionItem?.triggers) {
-                        this.scmCollectionItem.triggers.forEach((trigger) => trigger.dispose());
-                        delete this.scmCollectionItem;
-                    }
+                if (activeCondition && !this.scmCollectionItem) {
                     const scmCollection = new SCMCollectionProvider(this, this.context);
                     this.scmCollectionItem = {
                         collection: scmCollection,
                         triggers: scmCollection.triggers,
                     };
                 }
-                // trigger the first compile
-                vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compile`);
+                if (!this.hasCompletedInitialConnection) {
+                    this.hasCompletedInitialConnection = true;
+                    vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compile`);
+                }
                 return project;
-            }).catch((err) => {
-                this.retryConnection += 1;
-                return this.initializingPromise;
-            });
-        };
+            } catch (error) {
+                lastError = error;
+                this.root = undefined;
+                this.joiningProject = undefined;
+                if (error instanceof SocketRequestError) {
+                    this.socket.invalidateCurrentTransport();
+                }
+            }
+        }
 
-        return attemptReconnect();
+        console.error('Overleaf project connection failed', lastError);
+        void vscode.window.showErrorMessage(
+            vscode.l10n.t('Connection lost: {serverName}', {serverName:this.serverName}),
+            vscode.l10n.t('Reload'),
+            vscode.l10n.t('Retry'),
+        ).then((choice) => {
+            if (choice === vscode.l10n.t('Reload')) {
+                vscode.commands.executeCommand('workbench.action.reloadWindow');
+            } else if (choice === vscode.l10n.t('Retry')) {
+                this.socket.init();
+                void this.startInitialization(true).catch(() => {});
+            }
+        });
+        throw new Error(vscode.l10n.t('Connection lost'));
+    }
+
+    private documentMap(project?: ProjectEntity): Map<string, DocumentEntity> {
+        const result = new Map<string, DocumentEntity>();
+        const visit = (folder: FolderEntity) => {
+            folder.docs.forEach(doc => result.set(doc._id, doc));
+            folder.folders.forEach(visit);
+        };
+        project?.rootFolder.forEach(visit);
+        return result;
+    }
+
+    private invalidateDocumentSessions(project?: ProjectEntity) {
+        this.documentMap(project).forEach((doc) => {
+            doc.version = undefined;
+            doc.remoteCache = undefined;
+            doc.lastVersion = undefined;
+            this.rejectDocumentVersionWaiters(doc._id, new Error('Document session disconnected'));
+        });
+    }
+
+    private restoreDocumentRuntime(previous: ProjectEntity | undefined, current: ProjectEntity) {
+        const previousDocs = this.documentMap(previous);
+        this.documentMap(current).forEach((doc, id) => {
+            const oldDoc = previousDocs.get(id);
+            if (!oldDoc) { return; }
+            doc.localCache = oldDoc.localCache ?? oldDoc.remoteCache;
+            doc.remoteCache = undefined;
+            doc.version = undefined;
+            doc.lastVersion = undefined;
+            doc.mtime = oldDoc.mtime;
+        });
+    }
+
+    private waitForDocumentVersion(docId: string, expectedVersion: number, timeoutMs = 15000) {
+        let waiter!: DocumentVersionWaiter;
+        const promise = new Promise<void>((resolve, reject) => {
+            waiter = {
+                expectedVersion,
+                resolve,
+                reject,
+                timer: setTimeout(() => {
+                    this.removeDocumentVersionWaiter(docId, waiter);
+                    reject(new SocketRequestError(
+                        'timeout',
+                        `Timed out waiting for document ${docId} version ${expectedVersion}`,
+                        true,
+                    ));
+                }, timeoutMs),
+            };
+            const waiters = this.documentVersionWaiters.get(docId) ?? new Set<DocumentVersionWaiter>();
+            waiters.add(waiter);
+            this.documentVersionWaiters.set(docId, waiters);
+        });
+        return {
+            promise,
+            cancel: () => this.removeDocumentVersionWaiter(docId, waiter),
+        };
+    }
+
+    private removeDocumentVersionWaiter(docId: string, waiter: DocumentVersionWaiter) {
+        clearTimeout(waiter.timer);
+        const waiters = this.documentVersionWaiters.get(docId);
+        waiters?.delete(waiter);
+        if (waiters?.size === 0) {
+            this.documentVersionWaiters.delete(docId);
+        }
+    }
+
+    private resolveDocumentVersionWaiters(docId: string, version: number) {
+        const waiters = this.documentVersionWaiters.get(docId);
+        waiters?.forEach((waiter) => {
+            if (version >= waiter.expectedVersion) {
+                this.removeDocumentVersionWaiter(docId, waiter);
+                waiter.resolve();
+            }
+        });
+    }
+
+    private rejectDocumentVersionWaiters(docId: string, error: Error) {
+        const waiters = this.documentVersionWaiters.get(docId);
+        waiters?.forEach((waiter) => {
+            this.removeDocumentVersionWaiter(docId, waiter);
+            waiter.reject(error);
+        });
     }
 
     get isInvisibleMode() {
@@ -308,12 +440,11 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     toggleInvisibleMode() {
-        // Clear disconnect debounce to prevent false retry trigger during mode switch
-        this.lastDisconnectTime = 0;
-        this.handlersRegistered = false; // Will re-register on the new socket scheme
-        if (this.retryTimer) {
-            clearTimeout(this.retryTimer);
-            this.retryTimer = undefined;
+        if (!this.isInvisibleMode && this.pendingDocumentUpdates.size > 0) {
+            void vscode.window.showErrorMessage(
+                vscode.l10n.t('Wait for pending realtime document saves before enabling Invisible Mode.'),
+            );
+            return;
         }
         this.socket.toggleAlternativeConnectionScheme(this.origin.toString(), this.root);
         this.socket.disconnect(); // jump to `onDisconnected` handler
@@ -355,10 +486,11 @@ export class VirtualFileSystem extends vscode.Disposable {
     _resolveById(entityId: string, root?: FolderEntity, path?:string):{
         parentFolder: FolderEntity, fileEntity: FileEntity, fileType:FileType, path:string
     } | undefined {
-        if (!this.root) {
-            throw vscode.FileSystemError.FileNotFound();
+        const project = this.root ?? this.joiningProject;
+        if (!project) {
+            return undefined;
         }
-        root = root || this.root.rootFolder[0];
+        root = root || project.rootFolder[0];
         path = path || '/';
 
         if (root._id === entityId) {
@@ -383,8 +515,9 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     walk(filter:(entity:FileEntity)=>boolean): {entity:FileEntity, path:string}[] {
-        const result = [];
+        const result: {entity:FileEntity, path:string}[] = [];
         const folders = this.root ? [{entity:this.root.rootFolder[0], path:'/'}] : [];
+        if (folders.length === 0) { return result; }
 
         // apply filter to root folder
         filter(folders[0].entity) && result.push(folders[0]);
@@ -436,37 +569,79 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
+    private applyDocumentUpdate(update: UpdateSchema) {
+        const res = this._resolveById(update.doc);
+        if (res===undefined) { return; }
+
+        const doc = res.fileEntity as DocumentEntity;
+        const senderConfirmation = isSenderConfirmation(update);
+        if (doc.version === undefined) {
+            doc.remoteCache = undefined;
+            doc.lastVersion = undefined;
+            this.rejectDocumentVersionWaiters(doc._id, new Error('Document update arrived without an active session'));
+            return;
+        }
+        if (update.v < doc.version) {
+            // The update is already represented by a newer joinDoc snapshot.
+            if (senderConfirmation) {
+                this.resolveDocumentVersionWaiters(doc._id, update.v);
+            }
+            return;
+        }
+        if (update.v > doc.version) {
+            doc.remoteCache = undefined;
+            doc.version = undefined;
+            doc.lastVersion = undefined;
+            this.rejectDocumentVersionWaiters(doc._id, new Error('Document version changed unexpectedly'));
+            return;
+        }
+
+        doc.version += 1;
+        if (update.op && doc.remoteCache!==undefined) {
+            let content = doc.remoteCache;
+            update.op.forEach((op) => {
+                if (op.i) {
+                    content = content.slice(0, op.p) + op.i + content.slice(op.p);
+                } else if (op.d) {
+                    const deleteUtf8 = Buffer.from(op.d, 'ascii').toString('utf-8');
+                    content = content.slice(0, op.p) + content.slice(op.p+deleteUtf8.length);
+                }
+            });
+            const _uri = this.pathToUri(res.path).toString();
+            const _doc = vscode.workspace.textDocuments.find((doc) => doc.uri.toString()===_uri);
+            // if doc dirty, local cache should diverge from remote cache
+            if (_doc && !_doc.isDirty) {doc.localCache = content;}
+            doc.remoteCache = content;
+            this.isDirty = true;
+            this.notify([
+                {type: vscode.FileChangeType.Changed, uri: this.pathToUri(res.path)}
+            ]);
+        }
+        if (senderConfirmation) {
+            this.resolveDocumentVersionWaiters(doc._id, update.v);
+        }
+    }
+
     private remoteWatch(): void {
         this.socket.updateEventHandlers({
             onDisconnected: () => {
-                if (this.root===undefined) { return; } // bypass the first initialization
                 console.log("Disconnected");
-                // Debounce: ignore rapid disconnect/reconnect cycles (within 2 seconds)
-                const now = Date.now();
-                if (now - this.lastDisconnectTime < 2000) {
-                    console.log("Disconnected: debounced (too soon since last disconnect)");
-                    return;
+                if (this.root) {
+                    this.previousRoot = this.root;
                 }
-                this.lastDisconnectTime = now;
-                // Clear any pending retry timer
-                if (this.retryTimer) {
-                    clearTimeout(this.retryTimer);
-                }
-                // Delay reconnection attempt slightly to allow transient issues to resolve
-                this.retryTimer = setTimeout(() => {
-                    this.retryConnection += 1;
-                    this.initializing = this.initializingPromise;
-                }, 1000);
+                this.invalidateDocumentSessions(this.previousRoot);
+                this.root = undefined;
+                this.joiningProject = undefined;
+                this.publicId = undefined;
+                // Gate filesystem operations immediately. The shared initialization
+                // task waits for transport reconnect and then joins the project.
+                void this.startInitialization(true).catch(() => {});
             },
             onConnectionAccepted: (publicId:string) => {
-                this.retryConnection = 0;
-                this.reconnectingNotification = false;
-                this.lastDisconnectTime = 0;
-                if (this.retryTimer) {
-                    clearTimeout(this.retryTimer);
-                    this.retryTimer = undefined;
-                }
+                // connectionAccepted is transport-level only. Project readiness is
+                // established exclusively by connectWithRetry after joinProject.
                 this.publicId = publicId;
+                this.clientManagerItem?.manager.updatePublicId(publicId);
             },
             onFileCreated: (parentFolderId:string, type:FileType, entity:FileEntity) => {
                 const res = this._resolveById(parentFolderId);
@@ -515,36 +690,12 @@ export class VirtualFileSystem extends vscode.Disposable {
                 }
             },
             onFileChanged: (update:UpdateSchema) => {
-                const res = this._resolveById(update.doc);
-                if (res===undefined) { return; }
-
-                const doc = res.fileEntity as DocumentEntity;
-                if (update.v===doc.version) {
-                    doc.version += 1;
-                    if (update.op && doc.remoteCache!==undefined) {
-                        let content = doc.remoteCache;
-                        update.op.forEach((op) => {
-                            if (op.i) {
-                                content = content.slice(0, op.p) + op.i + content.slice(op.p);
-                            } else if (op.d) {
-                                const deleteUtf8 = Buffer.from(op.d, 'ascii').toString('utf-8');
-                                content = content.slice(0, op.p) + content.slice(op.p+deleteUtf8.length);
-                            }
-                        });
-                        const _uri = this.pathToUri(res.path).toString();
-                        const _doc = vscode.workspace.textDocuments.find((doc) => doc.uri.toString()===_uri);
-                        // if doc dirty, local cache should diverge from remote cache
-                        if (_doc && !_doc.isDirty) {doc.localCache = content;}
-                        doc.remoteCache = content;
-                        this.isDirty = true;
-                        this.notify([
-                            {type: vscode.FileChangeType.Changed, uri: this.pathToUri(res.path)}
-                        ]);
-                    }
-                } else {
-                    doc.remoteCache = undefined;
-                    doc.localCache = undefined;
+                const joining = this.joiningDocuments.get(update.doc);
+                if (joining && joining.generation === this.socket.generation) {
+                    joining.updates.push(update);
+                    return;
                 }
+                this.applyDocumentUpdate(update);
             },
             onSpellCheckLanguageUpdated: (language:string) => {
                 if (this.root) {
@@ -619,11 +770,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 EventBus.fire('fileWillOpenEvent', {uri});
                 return new TextEncoder().encode(content);
             } else {
-                const res = await this.socket.joinDoc(fileEntity._id);
-                const content = res.docLines.join('\n');
-                doc.version = res.version;
-                doc.remoteCache = content;
-                doc.localCache  = content;
+                const {content} = await this.ensureDocumentSession(doc._id);
                 EventBus.fire('fileWillOpenEvent', {uri});
                 return new TextEncoder().encode(content);
             }
@@ -819,7 +966,186 @@ export class VirtualFileSystem extends vscode.Disposable {
         ]);
     }
 
+    private currentDocument(docId: string): DocumentEntity {
+        const resolved = this._resolveById(docId);
+        if (!resolved || resolved.fileType !== 'doc') {
+            throw vscode.FileSystemError.FileNotFound();
+        }
+        return resolved.fileEntity as DocumentEntity;
+    }
+
+    private async joinFreshDocumentSession(docId: string): Promise<{doc: DocumentEntity, content: string}> {
+        const previous = this.documentJoinTasks.get(docId) ?? Promise.resolve(undefined);
+        const task = previous.catch(() => undefined).then(() => this.performDocumentJoin(docId));
+        this.documentJoinTasks.set(docId, task);
+        try {
+            return await task;
+        } finally {
+            if (this.documentJoinTasks.get(docId) === task) {
+                this.documentJoinTasks.delete(docId);
+            }
+        }
+    }
+
+    private async performDocumentJoin(docId: string): Promise<{doc: DocumentEntity, content: string}> {
+        // init() is a project-ready barrier. joinDoc then creates a fresh document
+        // session for the current socket generation and supplies its authoritative
+        // version/content.
+        await this.init();
+        const connectionGeneration = await this.socket.waitUntilConnected();
+        const joining = {generation: connectionGeneration, updates: [] as UpdateSchema[]};
+        this.joiningDocuments.set(docId, joining);
+        try {
+            const res = await this.socket.joinDoc(docId);
+            assertCurrentConnection(
+                connectionGeneration,
+                this.socket.generation,
+                this.socket.isConnected,
+            );
+            // The project tree may have been replaced while the async join was in
+            // progress. Commit session state only to the current entity generation.
+            const doc = this.currentDocument(docId);
+            const remoteContent = res.docLines.join('\n');
+            doc.version = res.version;
+            doc.remoteCache = remoteContent;
+            doc.localCache ??= remoteContent;
+            doc.lastVersion = undefined;
+
+            const responseUpdates = res.updates.filter((update: any) =>
+                update && typeof update.v === 'number' && (update.op === undefined || Array.isArray(update.op)),
+            ).map((update: UpdateSchema) => ({...update, doc: update.doc || docId}));
+            [...responseUpdates, ...joining.updates]
+                .sort((left, right) => left.v - right.v)
+                .forEach(update => this.applyDocumentUpdate(update));
+
+            const current = this.currentDocument(docId);
+            if (current.version === undefined || current.remoteCache === undefined) {
+                throw new Error('Document updates could not be reconciled with the join snapshot');
+            }
+            return {doc: current, content: current.remoteCache};
+        } finally {
+            if (this.joiningDocuments.get(docId) === joining) {
+                this.joiningDocuments.delete(docId);
+            }
+        }
+    }
+
+    private async ensureDocumentSession(docId: string): Promise<{doc: DocumentEntity, content: string}> {
+        await this.init();
+        const doc = this.currentDocument(docId);
+        if (doc.version !== undefined && doc.remoteCache !== undefined) {
+            return {doc, content: doc.remoteCache};
+        }
+        return this.joinFreshDocumentSession(docId);
+    }
+
     async writeFile(uri: vscode.Uri, content:Uint8Array, create:boolean, overwrite:boolean) {
+        const key = uri.toString();
+        const previous = this.documentWrites.get(key) ?? Promise.resolve();
+        const operation = previous.catch(() => {}).then(
+            () => this.writeFileNow(uri, content, create, overwrite),
+        ).catch((error) => {
+            if (error instanceof SocketRequestError && error.outcomeUnknown) {
+                this.forceFreshConnection();
+            }
+            throw error;
+        });
+        this.documentWrites.set(key, operation);
+        try {
+            await operation;
+        } finally {
+            if (this.documentWrites.get(key) === operation) {
+                this.documentWrites.delete(key);
+            }
+        }
+    }
+
+    private forceFreshConnection() {
+        if (this.freshConnectionRequested) { return; }
+        this.freshConnectionRequested = true;
+        if (this.root) {
+            this.previousRoot = this.root;
+        }
+        this.invalidateDocumentSessions(this.previousRoot);
+        this.root = undefined;
+        this.socket.init();
+        void this.startInitialization(true).finally(() => {
+            this.freshConnectionRequested = false;
+        }).catch(() => {});
+    }
+
+    private async recoverPendingDocumentUpdate(docId: string): Promise<void> {
+        const pending = this.pendingDocumentUpdates.get(docId);
+        if (!pending) { return; }
+
+        if (pending.alternativeConnection) {
+            // Alternative mode stages content locally and never queues realtime
+            // OT. Its interrupted saves are recomputed from the fresh HTTP state;
+            // a pending realtime OT must be recovered on a realtime transport.
+            this.pendingDocumentUpdates.delete(docId);
+            return;
+        }
+        if (this.isInvisibleMode) {
+            throw new Error('A pending realtime document update cannot be recovered in Invisible Mode');
+        }
+
+        await this.ensureDocumentSession(docId);
+        const currentPublicId = this.publicId;
+        const recoveryUpdate = buildRecoveryUpdate(pending.update, pending.submittedPublicIds);
+        const versionWaiter = requiresVersionConfirmation(this.isInvisibleMode) ?
+            this.waitForDocumentVersion(docId, pending.update.v) : undefined;
+        if (currentPublicId && !pending.submittedPublicIds.includes(currentPublicId)) {
+            pending.submittedPublicIds.push(currentPublicId);
+        }
+        try {
+            await this.socket.applyOtUpdate(docId, recoveryUpdate);
+            await versionWaiter?.promise;
+        } catch (error) {
+            versionWaiter?.cancel();
+            if (!(error instanceof SocketRequestError && error.outcomeUnknown)) {
+                this.pendingDocumentUpdates.delete(docId);
+                throw error;
+            }
+            // Some older deployments acknowledge queueing but do not broadcast
+            // the sender-only version event. After the timeout, accept only an
+            // authoritative snapshot which proves the desired edits are present.
+            try {
+                const authoritative = await this.joinFreshDocumentSession(docId);
+                if (desiredChangesArePresent(
+                    pending.localBase,
+                    authoritative.content,
+                    pending.desiredContent,
+                )) {
+                    authoritative.doc.localCache = pending.desiredContent;
+                    this.pendingDocumentUpdates.delete(docId);
+                    return;
+                }
+            } catch {
+                // Keep the exact pending operation for another deduplicated retry.
+            }
+            throw error;
+        }
+
+        if (this.isInvisibleMode) {
+            const doc = this.currentDocument(docId);
+            doc.localCache = pending.desiredContent;
+            doc.remoteCache = pending.mergedContent;
+        } else {
+            const authoritative = await this.joinFreshDocumentSession(docId);
+            if (!desiredChangesArePresent(
+                pending.localBase,
+                authoritative.content,
+                pending.desiredContent,
+            )) {
+                this.pendingDocumentUpdates.delete(docId);
+                throw new Error('The recovered update was not present in the authoritative document');
+            }
+            authoritative.doc.localCache = pending.desiredContent;
+        }
+        this.pendingDocumentUpdates.delete(docId);
+    }
+
+    private async writeFileNow(uri: vscode.Uri, content:Uint8Array, create:boolean, overwrite:boolean) {
         const {fileType, fileEntity} = await this._resolveUri(uri);
 
         // if non-exists --> create it
@@ -834,20 +1160,34 @@ export class VirtualFileSystem extends vscode.Disposable {
 
         // if exists and is doc --> update
         if (fileType && fileType==='doc' && fileEntity) {
-            const doc = fileEntity as DocumentEntity;
+            const docId = fileEntity._id;
             const _content = new TextDecoder().decode(content);
-            if (doc.version===undefined || doc.localCache===undefined || doc.remoteCache===undefined) {
+            await this.recoverPendingDocumentUpdate(docId);
+            const session = await this.ensureDocumentSession(docId);
+            const doc = session.doc;
+            const remoteContent = session.content;
+            if (remoteContent === _content) {
+                doc.localCache = remoteContent;
+                doc.remoteCache = remoteContent;
+                this.isDirty = false;
                 return;
             }
-            const dmp = new DiffMatchPatch();
-            const patches = dmp.patch_make(doc.localCache,  doc.remoteCache);
-
-            const mergeResArray = dmp.patch_apply(patches, _content);
-            const mergeRes = mergeResArray[0] as string;
+            const localBase = doc.localCache ?? remoteContent;
+            const sessionVersion = doc.version;
+            if (sessionVersion === undefined) {
+                throw new Error('Document session has no version after joinDoc');
+            }
+            const prepared = prepareDocumentUpdate(localBase, remoteContent, _content);
+            const mergeRes = prepared.mergedContent;
+            if (!prepared.mergeApplied) {
+                doc.version = undefined;
+                doc.remoteCache = undefined;
+                throw new Error('Unable to merge remote document changes safely; the document was not written');
+            }
             const update = {
                 doc: doc._id,
                 lastV: doc.lastVersion,
-                v: doc.version,
+                v: sessionVersion,
                 // Reference: services/web/frontend/js/vendor/libs/sharejs.js#L1288
                 hash: (()=>{
                     if (!doc.mtime || Date.now()-doc.mtime>5000) {
@@ -857,37 +1197,76 @@ export class VirtualFileSystem extends vscode.Disposable {
                         ).digest('hex');
                     }
                 })() as string,
-                op: (()=>{
-                    const remoteCacheAscii = Buffer.from(doc.remoteCache, 'utf-8').toString('utf-8');
-                    const mergeResAscii = Buffer.from(mergeRes, 'utf-8').toString('utf-8');
-                    let currentPos = 0;
-                    return dmp.diff_main(remoteCacheAscii, mergeResAscii)
-                                .map((part) => {
-                                    // part[0] === -1: delete, 0: equal, 1: insert; part[1]: compared content
-                                    const incCount = part[0] === -1 ? 0 : part[1].length;
-                                    currentPos += incCount;
-                                    // add op when content not equal
-                                    if (part[0] !== 0) {
-                                        return {
-                                            p: currentPos - incCount,
-                                            i: part[0] ===  1 ?  part[1] : undefined,
-                                            d: part[0] === -1 ?  part[1] : undefined,
-                                        };
-                                    }
-                                })
-                                .filter(x => x) as any;
-                })(),
+                op: prepared.operations,
             };
             this.isDirty = (update.op && update.op.length) ? true : false;
-            await this.socket.applyOtUpdate(doc._id, update);
-            doc.localCache = mergeRes;
-            doc.remoteCache = mergeRes;
+            if (!this.isDirty) {
+                doc.localCache = _content;
+                doc.remoteCache = mergeRes;
+                if (_content !== mergeRes) {
+                    setTimeout(() => {
+                        this.notify([
+                            {type: vscode.FileChangeType.Changed, uri: uri}
+                        ]);
+                    }, 10);
+                }
+                return;
+            }
+
+            if (!this.isInvisibleMode && !this.publicId) {
+                throw new SocketRequestError(
+                    'not_connected',
+                    'Realtime session has no accepted public id',
+                    false,
+                );
+            }
+
+            const sentVersion = sessionVersion;
+            const versionWaiter = requiresVersionConfirmation(this.isInvisibleMode) ?
+                this.waitForDocumentVersion(doc._id, sentVersion) : undefined;
+            const pending: PendingDocumentUpdate = {
+                update,
+                desiredContent: _content,
+                mergedContent: mergeRes,
+                submittedPublicIds: this.publicId ? [this.publicId] : [],
+                alternativeConnection: this.isInvisibleMode,
+                localBase,
+            };
+            this.pendingDocumentUpdates.set(doc._id, pending);
+            try {
+                await this.socket.applyOtUpdate(doc._id, update);
+                await versionWaiter?.promise;
+            } catch (error) {
+                versionWaiter?.cancel();
+                // The server may have applied an update whose acknowledgement was
+                // lost. Preserve the local base, invalidate the remote session, and
+                // let the next save rejoin/recompute instead of replaying stale OT.
+                doc.version = undefined;
+                doc.remoteCache = undefined;
+                doc.lastVersion = undefined;
+                if (this.isInvisibleMode || !(error instanceof SocketRequestError && error.outcomeUnknown)) {
+                    this.pendingDocumentUpdates.delete(doc._id);
+                }
+                throw error;
+            }
+            if (this.isInvisibleMode) {
+                doc.localCache = _content;
+                doc.remoteCache = mergeRes;
+            } else {
+                const authoritative = await this.joinFreshDocumentSession(doc._id);
+                if (!desiredChangesArePresent(localBase, authoritative.content, _content)) {
+                    this.pendingDocumentUpdates.delete(doc._id);
+                    throw new Error('The server did not confirm all local document changes; the document remains unsaved');
+                }
+                authoritative.doc.localCache = _content;
+            }
+            this.pendingDocumentUpdates.delete(doc._id);
             setTimeout(() => {
                 this.notify([
                     {type: vscode.FileChangeType.Changed, uri: uri}
                 ]);
             }, 10);
-            doc.lastVersion = doc.version;                
+            doc.lastVersion = sentVersion;
         }
     }
 

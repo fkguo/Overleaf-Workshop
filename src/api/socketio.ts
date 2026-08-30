@@ -3,6 +3,7 @@ import { Identity, BaseAPI, ProjectMessageResponseSchema } from './base';
 import { FileEntity, DocumentEntity, FileRefEntity, FileType, FolderEntity, ProjectEntity } from '../core/remoteFileSystemProvider';
 import { EventBus } from '../utils/eventBus';
 import { SocketIOAlt } from './socketioAlt';
+import { requestWithAck, SocketRequestError, withTimeout } from './socketRequest';
 
 function decodePackedUtf8(text: string): string {
     return Buffer.from(text, 'latin1').toString('utf-8');
@@ -46,6 +47,7 @@ export interface UpdateSchema {
     v: number, //doc version number
     lastV?: number, //last version number
     hash?: string, //(not needed if lastV is provided)
+    dupIfSource?: string[], //deduplicate an in-flight op after reconnect
     meta?: {
         source: string, //socketio client id
         ts: number, //unix timestamp
@@ -74,6 +76,28 @@ export interface EventsHandler {
 
 type ConnectionScheme = 'Alt' | 'v1' | 'v2';
 
+type Deferred<T> = {
+    promise: Promise<T>,
+    resolve: (value: T) => void,
+    reject: (reason?: unknown) => void,
+};
+
+function deferred<T>(): Deferred<T> {
+    let resolve!: (value: T) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+        resolve = res;
+        reject = rej;
+    });
+    // A v2 project response can be superseded before joinProject starts awaiting it.
+    // Mark the promise handled while retaining the original rejection for consumers.
+    promise.catch(() => {});
+    return {promise, resolve, reject};
+}
+
+const CONNECT_TIMEOUT_MS = 15000;
+const ACK_TIMEOUT_MS = 15000;
+
 export class SocketIOAPI {
     private scheme: ConnectionScheme = 'v1';
     private record?: Promise<ProjectEntity>;
@@ -82,9 +106,15 @@ export class SocketIOAPI {
     private _eventBusCleanups: Array<()=>void> = [];
 
     private socket?: any;
-    private emit: any;
     /** Track the scheme used when the socket was last initialized */
     private _socketInitScheme?: ConnectionScheme;
+    private socketGeneration = 0;
+    private transportConnected = false;
+    private lastDisconnectedSocket?: any;
+    private transportConnectedSignal = deferred<number>();
+    private connectionAcceptedSignal = deferred<{generation: number, publicId: string}>();
+    private v2ProjectResponse?: Deferred<ProjectEntity> & {generation: number};
+    private documentMembershipQueue: Promise<void> = Promise.resolve();
 
     constructor(private url:string,
                 private readonly api:BaseAPI,
@@ -95,6 +125,7 @@ export class SocketIOAPI {
     }
 
     init() {
+        this.resetTransportState();
         // Clean up old EventBus listeners before creating new socket
         this._cleanupEventBusListeners();
 
@@ -105,13 +136,13 @@ export class SocketIOAPI {
         // this client — explaining the "connection lost" loop reported in issue #309.
         if (this.socket) {
             try {
-                // Remove all listeners to prevent stale event handlers from firing
-                if (typeof this.socket.removeAllListeners === 'function') {
-                    this.socket.removeAllListeners();
-                }
-                // Gracefully close the connection (sends FIN, not RST)
+                // Notify all in-flight requests before removing handlers, then
+                // gracefully close the connection (sends FIN, not RST).
                 if (typeof this.socket.disconnect === 'function') {
                     this.socket.disconnect();
+                }
+                if (typeof this.socket.removeAllListeners === 'function') {
+                    this.socket.removeAllListeners();
                 }
             } catch {
                 // Best-effort cleanup; socket may already be in a bad state
@@ -133,36 +164,160 @@ export class SocketIOAPI {
                 this.socket = this.api._initSocketV0(this.identity, query);
                 break;
         }
-        // create emit
-        (this.socket.emit)[require('util').promisify.custom] = (event:string, ...args:any[]) => {
-            const timeoutPromise = new Promise((_, reject) => {
-                setTimeout(() => {
-                    reject('timeout');
-                }, 5000);
-            });
-            const waitPromise = new Promise((resolve, reject) => {
-                this.socket.emit(event, ...args, (err:any, ...data:any[]) => {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve(data);
-                    }
-                });
-            });
-            return Promise.race([waitPromise, timeoutPromise]);
-        };
-        this.emit = require('util').promisify(this.socket.emit).bind(this.socket);
+        const socketAtInit = this.socket;
         // resume handlers
-        this.initInternalHandlers();
+        this.initInternalHandlers(socketAtInit);
         // Re-register existing event handlers on the new socket
         this.resumeEventHandlers(this._handlers);
         // Track which scheme this socket was created with
         this._socketInitScheme = this.scheme;
+        // socket.io can connect synchronously in tests or alternative transports.
+        if (socketAtInit.connected === true) {
+            this.markTransportConnected(socketAtInit);
+        }
     }
 
     /** Returns true if the socket needs re-initialization (scheme changed, or socket was never init'd) */
     get needsReinit(): boolean {
         return this._socketInitScheme !== this.scheme || !this.socket;
+    }
+
+    get isConnected(): boolean {
+        return this.transportConnected;
+    }
+
+    get generation(): number {
+        return this.socketGeneration;
+    }
+
+    invalidateCurrentTransport() {
+        this._socketInitScheme = undefined;
+    }
+
+    private resetTransportState() {
+        this.transportConnectedSignal.reject(new SocketRequestError(
+            'stale_connection',
+            'Socket transport was replaced',
+            true,
+        ));
+        this.socketGeneration += 1;
+        this.transportConnected = false;
+        this.transportConnectedSignal = deferred<number>();
+        this.connectionAcceptedSignal.reject(new SocketRequestError(
+            'stale_connection',
+            'Socket transport was replaced before session acceptance',
+            true,
+        ));
+        this.connectionAcceptedSignal = deferred<{generation: number, publicId: string}>();
+        this.rejectV2ProjectResponse(new SocketRequestError(
+            'stale_connection',
+            'Socket transport was replaced',
+            true,
+        ));
+    }
+
+    private markTransportConnected(socket: any) {
+        if (socket !== this.socket || this.transportConnected) { return; }
+        this.lastDisconnectedSocket = undefined;
+        this.transportConnected = true;
+        this.transportConnectedSignal.resolve(this.socketGeneration);
+        if (this.scheme === 'v2') {
+            this.ensureV2ProjectResponse();
+        }
+    }
+
+    private markTransportDisconnected(socket: any) {
+        if (socket !== this.socket || this.lastDisconnectedSocket === socket) { return; }
+        this.lastDisconnectedSocket = socket;
+        this.transportConnectedSignal.reject(new SocketRequestError(
+            'disconnected',
+            'Socket disconnected before the transport became ready',
+            true,
+        ));
+        this.socketGeneration += 1;
+        this.transportConnected = false;
+        this.transportConnectedSignal = deferred<number>();
+        this.connectionAcceptedSignal.reject(new SocketRequestError(
+            'disconnected',
+            'Socket disconnected before session acceptance',
+            true,
+        ));
+        this.connectionAcceptedSignal = deferred<{generation: number, publicId: string}>();
+        this.rejectV2ProjectResponse(new SocketRequestError(
+            'disconnected',
+            'Socket disconnected before the project session was ready',
+            true,
+        ));
+    }
+
+    private ensureV2ProjectResponse() {
+        if (!this.v2ProjectResponse || this.v2ProjectResponse.generation !== this.socketGeneration) {
+            this.v2ProjectResponse = {
+                ...deferred<ProjectEntity>(),
+                generation: this.socketGeneration,
+            };
+        }
+        return this.v2ProjectResponse;
+    }
+
+    private rejectV2ProjectResponse(error: unknown) {
+        this.v2ProjectResponse?.reject(error);
+        this.v2ProjectResponse = undefined;
+    }
+
+    async waitUntilConnected(timeoutMs: number = CONNECT_TIMEOUT_MS): Promise<number> {
+        if (this.transportConnected) {
+            return this.socketGeneration;
+        }
+        const signal = this.transportConnectedSignal;
+        const generation = await withTimeout(signal.promise, 'socket connection', timeoutMs);
+        if (!this.transportConnected || generation !== this.socketGeneration) {
+            throw new SocketRequestError(
+                'stale_connection',
+                'Socket connection changed while waiting for transport readiness',
+                false,
+            );
+        }
+        return generation;
+    }
+
+    private async waitUntilConnectionAccepted(generation: number): Promise<string> {
+        const accepted = await withTimeout(
+            this.connectionAcceptedSignal.promise,
+            'connection acceptance',
+            CONNECT_TIMEOUT_MS,
+        );
+        if (
+            accepted.generation !== generation ||
+            generation !== this.socketGeneration ||
+            !this.transportConnected
+        ) {
+            throw new SocketRequestError(
+                'stale_connection',
+                'Socket connection changed before session acceptance',
+                false,
+            );
+        }
+        return accepted.publicId;
+    }
+
+    private async request<T extends any[]>(event: string, args: any[], timeoutMs: number = ACK_TIMEOUT_MS): Promise<T> {
+        const generation = await this.waitUntilConnected();
+        const socketAtEmit = this.socket;
+        return requestWithAck<T>(
+            socketAtEmit,
+            event,
+            args,
+            timeoutMs,
+            generation,
+            (candidate) => candidate === this.socketGeneration && socketAtEmit === this.socket,
+        );
+    }
+
+    private queueDocumentMembership<T>(operation: () => Promise<T>): Promise<T> {
+        const queued = this.documentMembershipQueue.catch(() => {}).then(operation);
+        this.documentMembershipQueue = queued.then(() => {}, () => {});
+        return queued;
     }
 
     /** Clean up any accumulated EventBus listeners */
@@ -173,43 +328,65 @@ export class SocketIOAPI {
         this._eventBusCleanups = [];
     }
 
-    private initInternalHandlers() {
-        this.socket.on('connect', () => {
+    private initInternalHandlers(socketAtInit: any) {
+        socketAtInit.on('connect', () => {
+            this.markTransportConnected(socketAtInit);
             console.log('SocketIOAPI: connected');
         });
-        this.socket.on('connect_failed', () => {
+        socketAtInit.on('disconnect', () => {
+            this.markTransportDisconnected(socketAtInit);
+        });
+        socketAtInit.on('connectionAccepted', (_:any, publicId:any) => {
+            if (socketAtInit !== this.socket) { return; }
+            this.connectionAcceptedSignal.resolve({
+                generation: this.socketGeneration,
+                publicId: String(publicId ?? ''),
+            });
+        });
+        socketAtInit.on('connect_failed', () => {
             console.log('SocketIOAPI: connect_failed');
         });
-        this.socket.on('forceDisconnect', (message:string, delay=10) => {
+        socketAtInit.on('forceDisconnect', (message:string, delay=10) => {
             console.log('SocketIOAPI: forceDisconnect', message);
         });
-        this.socket.on('connectionRejected', (err:any) => {
+        socketAtInit.on('connectionRejected', (err:any) => {
             console.log('SocketIOAPI: connectionRejected.', err?.message || err);
+            const rejection = new SocketRequestError(
+                'server_error',
+                `Project connection rejected: ${err?.message || err}`,
+                false,
+                err,
+            );
+            this.rejectV2ProjectResponse(rejection);
             // If v2 also gets rejected, fall back to v1 rather than staying stuck
             if (this.scheme === 'v2') {
                 console.log('SocketIOAPI: v2 rejected, falling back to v1');
                 this.scheme = 'v1';
+            } else if (this.scheme === 'v1') {
+                this.scheme = 'v2';
             }
             // Disable auto-reconnect on this socket: the server explicitly rejected
             // our connection parameters. Reconnecting would just get rejected again,
             // creating unnecessary TCP connection churn (and RST packets).
-            if (this.socket.io && typeof this.socket.io.reconnect === 'function') {
-                this.socket.io.reconnect(false);
+            if (socketAtInit.socket?.options) {
+                socketAtInit.socket.options.reconnect = false;
+            } else if (socketAtInit.io && typeof socketAtInit.io.reconnect === 'function') {
+                socketAtInit.io.reconnect(false);
             }
+            setTimeout(() => socketAtInit.disconnect?.(), 0);
         });
-        this.socket.on('error', (err:any) => {
+        socketAtInit.on('error', (err:any) => {
             // Log error instead of throwing to avoid crashing the extension
             console.error('SocketIOAPI: socket error', err?.message || err);
         });
 
         if (this.scheme==='v2') {
-            this.record = new Promise(resolve => {
-                this.socket.on('joinProjectResponse', (res:any) => {
-                    const publicId = res.publicId as string;
-                    const project = res.project as ProjectEntity;
-                    EventBus.fire('socketioConnectedEvent', {publicId});
-                    resolve(project);
-                });
+            socketAtInit.on('joinProjectResponse', (res:any) => {
+                if (socketAtInit !== this.socket) { return; }
+                const publicId = res.publicId as string;
+                const project = res.project as ProjectEntity;
+                this.ensureV2ProjectResponse().resolve(project);
+                EventBus.fire('socketioConnectedEvent', {publicId});
             });
         }
     }
@@ -346,32 +523,53 @@ export class SocketIOAPI {
      * @returns {Promise}
      */
     async joinProject(project_id:string): Promise<ProjectEntity> {
-        const timeoutPromise: Promise<ProjectEntity> = new Promise((_, reject) => {
-            setTimeout(() => {
-                reject('timeout');
-            }, 5000);
-        });
-
-        switch(this.scheme) {
+        const generation = await this.waitUntilConnected();
+        const activeScheme = this._socketInitScheme ?? this.scheme;
+        switch(activeScheme) {
             case 'Alt':
-            case 'v1':
-                const joinPromise = this.emit('joinProject', {project_id})
-                .then((returns:[ProjectEntity, string, number]) => {
-                    const [project, permissionsLevel, protocolVersion] = returns;
+            case 'v1': {
+                await this.waitUntilConnectionAccepted(generation);
+                const socketAtJoin = this.socket;
+                const response = await requestWithAck<[ProjectEntity, string, number]>(
+                    socketAtJoin,
+                    'joinProject',
+                    [{project_id}],
+                    ACK_TIMEOUT_MS,
+                    generation,
+                    (candidate) => candidate === this.socketGeneration && socketAtJoin === this.socket,
+                    {
+                        event: 'connectionRejected',
+                        toError: (err:any) => new SocketRequestError(
+                            'server_error',
+                            `Project connection rejected: ${err?.message || err}`,
+                            false,
+                            err,
+                        ),
+                    },
+                );
+                this.record = Promise.resolve(response[0]);
+                return response[0];
+            }
+            case 'v2': {
+                const response = this.ensureV2ProjectResponse();
+                if (response.generation !== generation) {
+                    throw new SocketRequestError(
+                        'stale_connection',
+                        'Project response belongs to an older socket connection',
+                        false,
+                    );
+                }
+                try {
+                    const project = await withTimeout(response.promise, 'joinProjectResponse', ACK_TIMEOUT_MS);
                     this.record = Promise.resolve(project);
                     return project;
-                });
-                const rejectPromise = new Promise((_, reject) => {
-                    this.socket.on('connectionRejected', (err:any) => {
-                        // Only fall back to v2 if we haven't already tried it;
-                        // otherwise let the outer retry logic handle backoff
-                        this.scheme = 'v2';
-                        reject(err.message);
-                    });
-                });
-                return Promise.race([joinPromise, rejectPromise, timeoutPromise]);
-            case 'v2':
-                return Promise.race([this.record!, timeoutPromise]);
+                } catch (error) {
+                    // A connected transport without a project response is not a
+                    // reusable project session. Force the next retry to replace it.
+                    this.invalidateCurrentTransport();
+                    throw error;
+                }
+            }
         }
     }
 
@@ -381,7 +579,9 @@ export class SocketIOAPI {
      * @returns {Promise}
      */
     async joinDoc(docId:string) {
-        return this.emit('joinDoc', docId, { encodeRanges: true })
+        return this.queueDocumentMembership(() =>
+            this.request<[Array<string>, number, Array<any>, any]>('joinDoc', [docId, { encodeRanges: true }])
+        )
             .then((returns: [Array<string>, number, Array<any>, any]) => {
                 const [docLinesAscii, version, updates, ranges] = returns;
                 const docLines = docLinesAscii.map((line) => decodePackedUtf8(line));
@@ -395,7 +595,7 @@ export class SocketIOAPI {
      * @returns {Promise}
      */
     async leaveDoc(docId:string) {
-        return this.emit('leaveDoc', docId)
+        return this.queueDocumentMembership(() => this.request<any[]>('leaveDoc', [docId]))
             .then(() => {
                 return;
             });
@@ -408,7 +608,7 @@ export class SocketIOAPI {
      * @returns {Promise}
      */
     async applyOtUpdate(docId:string, update:UpdateSchema) {
-        return this.emit('applyOtUpdate', docId, update)
+        return this.request<any[]>('applyOtUpdate', [docId, update])
             .then(() => {
                 return;
             });
@@ -419,7 +619,7 @@ export class SocketIOAPI {
      * @returns {Promise}
      */
     async getConnectedUsers(): Promise<OnlineUserSchema[]> {
-        return this.emit('clientTracking.getConnectedUsers')
+        return this.request<[OnlineUserSchema[]]>('clientTracking.getConnectedUsers', [])
             .then((returns:[OnlineUserSchema[]]) => {
                 const [connectedUsers] = returns;
                 return connectedUsers;
@@ -432,9 +632,19 @@ export class SocketIOAPI {
      * @returns {Promise}
      */
     async updatePosition(doc_id:string, row:number, column:number) {
-        return this.emit('clientTracking.updatePosition', {row, column, doc_id})
-            .then(() => {
-                return;
-            });
+        if (this.socket instanceof SocketIOAlt) {
+            await this.request<any[]>('clientTracking.updatePosition', [{row, column, doc_id}]);
+            return;
+        }
+        const generation = await this.waitUntilConnected();
+        if (generation !== this.socketGeneration) {
+            throw new SocketRequestError(
+                'stale_connection',
+                'Socket connection changed before updating the cursor position',
+                false,
+            );
+        }
+        // Overleaf does not acknowledge this fire-and-forget presence update.
+        this.socket.emit('clientTracking.updatePosition', {row, column, doc_id});
     }
 }

@@ -52,16 +52,21 @@ type ListenEventsSupport = {
 
 class SyncTimer {
     private timer?: NodeJS.Timeout;
+    private stopped = false;
 
     constructor(
         private _interval: number,
         private readonly _callback: () => Promise<void>,
     ) {
-        this._callback().then(() => this.trigger());
+        this._callback().then(() => {
+            if (!this.stopped) { this.trigger(); }
+        });
     }
 
     private trigger() {
+        if (this.stopped) { return; }
         this.timer = setTimeout(async () => {
+            if (this.stopped) { return; }
             await this._callback();
             this.trigger();
         }, this._interval);
@@ -72,6 +77,7 @@ class SyncTimer {
     }
 
     stop() {
+        this.stopped = true;
         this.timer && clearTimeout(this.timer);
     }
 }
@@ -408,5 +414,13 @@ export class SocketIOAlt {
 
     on<T extends keyof ListenEventsSupport>(event: T, handler: (arg: ListenEventsSupport[T]) => void): void {
         this._eventEmitter.on(event, handler);
+    }
+
+    removeListener(event: string, handler: (...args:any[]) => void): void {
+        this._eventEmitter.removeListener(event, handler);
+    }
+
+    removeAllListeners(): void {
+        this._eventEmitter.removeAllListeners();
     }
 }

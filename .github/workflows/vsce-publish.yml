@@ -56,6 +56,10 @@ jobs:
       if: steps.pkg_changed.outputs.changed == 'true'
       run: npm install -g vsce
 
+    - name: Test
+      if: steps.pkg_changed.outputs.changed == 'true'
+      run: npm test
+
     - name: Package extension (.vsix)
       if: steps.pkg_changed.outputs.changed == 'true'
       run: |

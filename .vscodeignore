@@ -22,3 +22,5 @@ views/pdf-viewer/vendor/web/standard_fonts
 
 views/chat-view/**
 !views/chat-view/dist/**
+
+out/test/**

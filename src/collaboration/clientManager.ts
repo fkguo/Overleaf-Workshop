@@ -67,7 +67,7 @@ export class ClientManager {
     constructor(
         private readonly vfs: VirtualFileSystem,
         private readonly context: vscode.ExtensionContext,
-        private readonly publicId: string,
+        private publicId: string,
         private readonly socket: SocketIOAPI,
     ) {
         this.socket.updateEventHandlers({
@@ -83,8 +83,9 @@ export class ClientManager {
                 this.disconnectedAt = Date.now();
             },
             onConnectionAccepted: (publicId:string) => {
-                this.connectedFlag = true;
-                this.disconnectedAt = 0;
+                // Transport acceptance is not sufficient: the project/doc session
+                // may still be recovering. updateStatus reads vfs.isReady.
+                this.updatePublicId(publicId);
             }
         });
         this.socket.getConnectedUsers().then(users => {
@@ -104,11 +105,16 @@ export class ClientManager {
                     this.updatePosition(user.client_id, onlineUser.doc_id, onlineUser.row, onlineUser.column, onlineUser);
                 }
             });
-        });
+        }).catch(() => {});
 
         this.chatViewer = new ChatViewProvider(this.vfs, this.publicId, this.context.extensionUri, this.socket);
         this.status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
         this.updateStatus();
+    }
+
+    updatePublicId(publicId: string) {
+        this.publicId = publicId;
+        this.chatViewer?.updatePublicId(publicId);
     }
 
     private async jumpToUser(id?: string) {
@@ -246,6 +252,7 @@ export class ClientManager {
     }
 
     private updateStatus() {
+        this.connectedFlag = this.vfs.isReady;
         const count = Object.keys(this.onlineUsers).length;
         if (!this.connectedFlag) {
             const disconnectedDuration = Date.now() - this.disconnectedAt;
@@ -413,7 +420,7 @@ export class ClientManager {
                 const doc = uri && await this.vfs._resolveUri(uri);
                 const docId = doc?.fileEntity?._id;
                 if (docId) {
-                    this.socket.updatePosition(docId, e.selections[0].active.line, e.selections[0].active.character);
+                    void this.socket.updatePosition(docId, e.selections[0].active.line, e.selections[0].active.character).catch(() => {});
                 }
             }),
             // refresh decorations when editor is switched
