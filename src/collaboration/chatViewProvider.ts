@@ -5,9 +5,12 @@ import { VirtualFileSystem, parseUri } from '../core/remoteFileSystemProvider';
 import { ROOT_NAME } from '../consts';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
 
-export class ChatViewProvider implements vscode.WebviewViewProvider {
+export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
     private hasUnreadMessages = 0;
     private webviewView?: vscode.WebviewView;
+    private webviewMessageTrigger?: vscode.Disposable;
+    private pendingInsertTasks = new Set<NodeJS.Timeout>();
+    private disposed = false;
 
     constructor(
         private readonly vfs: VirtualFileSystem,
@@ -36,11 +39,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     resolveWebviewView(webviewView: vscode.WebviewView, context: vscode.WebviewViewResolveContext<unknown>, token: vscode.CancellationToken): Thenable<void> {
+        if (this.disposed) { return Promise.resolve(); }
         this.webviewView = webviewView;
         return this.loadWebviewHtml(webviewView.webview).then((html) => {
+            if (this.disposed) { return; }
             webviewView.webview.options = {enableScripts:true};
             webviewView.webview.html = html;
-            webviewView.webview.onDidReceiveMessage((e) => {
+            this.webviewMessageTrigger?.dispose();
+            this.webviewMessageTrigger = webviewView.webview.onDidReceiveMessage((e) => {
                 switch (e.type) {
                     case 'get-messages': this.getMessages(); break;
                     case 'send-message': this.sendMessage(e.content); break;
@@ -75,6 +81,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     private onReceivedMessage(message: ProjectMessageResponseSchema) {
+        if (this.disposed) { return; }
         if (this.webviewView !== undefined) {
             this.webviewView.webview.postMessage({
                 type: 'new-message',
@@ -96,15 +103,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     revealChatView() {
+        if (this.disposed) { return; }
         // this.webviewView?.show(true);
         vscode.commands.executeCommand(`${ROOT_NAME}.chatWebview.focus`);
         this.hasUnreadMessages = 0;
     }
 
-    insertText(text: string='') {
+    insertText(text: string='', attempt = 0) {
+        if (this.disposed) { return; }
         this.revealChatView();
         if (this.webviewView === undefined) {
-            setTimeout(() => this.insertText(text), 100);
+            if (attempt >= 50) {
+                void vscode.window.showErrorMessage(
+                    vscode.l10n.t('Unable to open the collaboration chat view.'),
+                );
+                return;
+            }
+            const task = setTimeout(() => {
+                this.pendingInsertTasks.delete(task);
+                this.insertText(text, attempt + 1);
+            }, 100);
+            this.pendingInsertTasks.add(task);
             return;
         }
 
@@ -135,8 +154,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         });
     }
 
-    get triggers() {
+    dispose(): void {
+        if (this.disposed) { return; }
+        this.disposed = true;
+        this.pendingInsertTasks.forEach(task => clearTimeout(task));
+        this.pendingInsertTasks.clear();
+        this.webviewMessageTrigger?.dispose();
+        this.webviewMessageTrigger = undefined;
+        this.webviewView = undefined;
+    }
+
+    get triggers(): vscode.Disposable[] {
         return [
+            this,
             // register commands
             vscode.commands.registerCommand(`${ROOT_NAME}.collaboration.copyLineRef`, () => {
                 const ref = this.getLineRef();

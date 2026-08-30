@@ -149,6 +149,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     private documentVersionWaiters = new Map<string, Set<DocumentVersionWaiter>>();
     private pendingDocumentUpdates = new Map<string, PendingDocumentUpdate>();
     private freshConnectionRequested = false;
+    private disposed = false;
     private outputBuildId?: string;
     private compileGroup?: string;
     private clsiServerId?: string;
@@ -162,9 +163,15 @@ export class VirtualFileSystem extends vscode.Disposable {
     public readonly serverName: string;
     public readonly projectId: string;
 
-    constructor(context: vscode.ExtensionContext, uri: vscode.Uri, notify: (events:vscode.FileChangeEvent[])=>void) {
+    constructor(
+        context: vscode.ExtensionContext,
+        uri: vscode.Uri,
+        notify: (events:vscode.FileChangeEvent[])=>void,
+        onDispose?: () => void,
+    ) {
         // define the dispose behavior
         super(() => {
+            this.disposed = true;
             // dispose all triggers of clientManager
             this.clientManagerItem?.triggers.forEach((trigger) => trigger.dispose());
             this.clientManagerItem = undefined;
@@ -172,7 +179,13 @@ export class VirtualFileSystem extends vscode.Disposable {
             this.scmCollectionItem?.triggers.forEach((trigger) => trigger.dispose());
             this.scmCollectionItem = undefined;
             // disconnect socketio
-            // this.socket.disconnect();
+            try {
+                this.socket.dispose();
+            } catch (error) {
+                console.warn('Unable to disconnect disposed Overleaf socket', error);
+            } finally {
+                onDispose?.();
+            }
         });
 
         const {userId,projectId,serverName,projectName} = parseUri(uri);
@@ -201,10 +214,13 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     get isReady() {
-        return this.root !== undefined && this.socket.isConnected;
+        return !this.disposed && this.root !== undefined && this.socket.isConnected;
     }
 
     async init() : Promise<ProjectEntity> {
+        if (this.disposed) {
+            throw vscode.FileSystemError.Unavailable('The Overleaf project is closed');
+        }
         if (this.root) {
             return Promise.resolve(this.root);
         }
@@ -213,6 +229,9 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     private startInitialization(showProgress: boolean): Promise<ProjectEntity> {
+        if (this.disposed) {
+            return Promise.reject(vscode.FileSystemError.Unavailable('The Overleaf project is closed'));
+        }
         if (this.root) {
             return Promise.resolve(this.root);
         }
@@ -259,9 +278,15 @@ export class VirtualFileSystem extends vscode.Disposable {
         let lastError: unknown;
 
         for (let attempt = 0; attempt < MAX_RETRIES; attempt += 1) {
+            if (this.disposed) {
+                throw vscode.FileSystemError.Unavailable('The Overleaf project is closed');
+            }
             const delayMs = attempt > 0 ? Math.min(BASE_DELAY_MS * Math.pow(2, attempt - 1), 16000) : 0;
             if (delayMs > 0) {
                 await new Promise(resolve => setTimeout(resolve, delayMs));
+            }
+            if (this.disposed) {
+                throw vscode.FileSystemError.Unavailable('The Overleaf project is closed');
             }
 
             if (this.socket.needsReinit) {
@@ -300,6 +325,9 @@ export class VirtualFileSystem extends vscode.Disposable {
                     this.socket.generation,
                     this.socket.isConnected,
                 );
+                if (this.disposed) {
+                    throw vscode.FileSystemError.Unavailable('The Overleaf project is closed');
+                }
                 this.restoreDocumentRuntime(this.previousRoot, project);
                 this.root = project;
                 this.joiningProject = undefined;
@@ -325,6 +353,9 @@ export class VirtualFileSystem extends vscode.Disposable {
                 }
                 return project;
             } catch (error) {
+                if (this.disposed) {
+                    throw error;
+                }
                 lastError = error;
                 this.root = undefined;
                 this.joiningProject = undefined;
@@ -577,6 +608,137 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
+    private mutationError(action: string, message?: string): vscode.FileSystemError {
+        const detail = message?.trim();
+        return vscode.FileSystemError.Unavailable(detail ? `${action}: ${detail}` : `${action} failed`);
+    }
+
+    private isCreatedEntity(
+        entity: FileEntity | undefined,
+        allowedTypes: FileType[],
+    ): entity is FileEntity & {_type: FileType} {
+        return Boolean(
+            entity &&
+            typeof entity._id === 'string' &&
+            entity._id.length > 0 &&
+            entity._type &&
+            allowedTypes.includes(entity._type),
+        );
+    }
+
+    private resolveCachedEntity(entityId: string, root?: FolderEntity, path = '/'):{
+        parentFolder: FolderEntity,
+        fileEntity: FileEntity,
+        fileType: FileType,
+        path: string,
+    } | undefined {
+        const projectRoot = root ?? (this.root ?? this.joiningProject)?.rootFolder[0];
+        if (!projectRoot) { return undefined; }
+        if (projectRoot._id === entityId) {
+            return {
+                parentFolder: projectRoot,
+                fileEntity: projectRoot,
+                fileType: 'folder',
+                path,
+            };
+        }
+
+        for (const [type, key] of Object.entries(FolderKeys)) {
+            const entity = projectRoot[key]?.find(candidate => candidate._id === entityId);
+            if (entity) {
+                return {
+                    parentFolder: projectRoot,
+                    fileEntity: entity,
+                    fileType: type as FileType,
+                    path: path + entity.name,
+                };
+            }
+        }
+        for (const folder of projectRoot.folders) {
+            const resolved = this.resolveCachedEntity(entityId, folder, path + folder.name + '/');
+            if (resolved) { return resolved; }
+        }
+        return undefined;
+    }
+
+    private cachedEntityIsAt(entityId: string, parentFolderId: string, name: string): boolean {
+        const current = this.resolveCachedEntity(entityId);
+        return Boolean(
+            current &&
+            current.parentFolder._id === parentFolderId &&
+            current.fileEntity.name === name,
+        );
+    }
+
+    private cachedChildAt(parentFolderId: string, name: string, allowedTypes: FileType[]) {
+        const parent = this.resolveCachedEntity(parentFolderId);
+        if (parent?.fileType !== 'folder') { return undefined; }
+        const folder = parent.fileEntity as FolderEntity;
+        for (const fileType of allowedTypes) {
+            const entity = folder[FolderKeys[fileType]]?.find(candidate => candidate.name === name);
+            if (entity) { return {fileType, entity}; }
+        }
+        return undefined;
+    }
+
+    private async cachedFileMatches(
+        uri: vscode.Uri,
+        parentFolderId: string,
+        name: string,
+        allowedTypes: FileType[],
+        expectedContent: Uint8Array,
+    ): Promise<boolean> {
+        if (!this.isReady || !this.cachedChildAt(parentFolderId, name, allowedTypes)) {
+            return false;
+        }
+        try {
+            const actualContent = await this.openFile(uri);
+            return Buffer.from(actualContent).equals(Buffer.from(expectedContent));
+        } catch {
+            return false;
+        }
+    }
+
+    private async currentFolder(folderId: string, action: string): Promise<FolderEntity> {
+        await this.init();
+        const current = this.resolveCachedEntity(folderId);
+        if (current?.fileType !== 'folder') {
+            throw this.mutationError(action, 'The destination folder is no longer available');
+        }
+        return current.fileEntity as FolderEntity;
+    }
+
+    private reconcileEntityLocation(
+        fileType: FileType,
+        fallbackEntity: FileEntity,
+        targetFolder: FolderEntity,
+        name: string,
+        fallbackUri: vscode.Uri,
+    ): vscode.FileChangeEvent[] {
+        const current = this.resolveCachedEntity(fallbackEntity._id);
+        const currentUri = current ? this.pathToUri(current.path) : undefined;
+        const entity = current?.fileEntity ?? fallbackEntity;
+        if (current) {
+            this.removeEntity(current.parentFolder, current.fileType, entity);
+        }
+
+        const currentTarget = this._resolveById(targetFolder._id);
+        const resolvedTarget = currentTarget?.fileType === 'folder' ?
+            currentTarget.fileEntity as FolderEntity : targetFolder;
+        entity.name = name;
+        this.insertEntity(resolvedTarget, fileType, entity);
+
+        const updated = this.resolveCachedEntity(entity._id);
+        const updatedUri = updated ? this.pathToUri(updated.path) : fallbackUri;
+        if (currentUri?.toString() === updatedUri.toString()) {
+            return [];
+        }
+        return [
+            ...(currentUri ? [{type: vscode.FileChangeType.Deleted, uri: currentUri}] : []),
+            {type: vscode.FileChangeType.Created, uri: updatedUri},
+        ];
+    }
+
     private applyDocumentUpdate(update: UpdateSchema) {
         const res = this._resolveById(update.doc);
         if (res===undefined) { return; }
@@ -634,6 +796,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         this.socket.updateEventHandlers({
             onDisconnected: () => {
                 console.log("Disconnected");
+                if (this.disposed) { return; }
                 if (this.root) {
                     this.previousRoot = this.root;
                 }
@@ -646,6 +809,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 void this.startInitialization(true).catch(() => {});
             },
             onConnectionAccepted: (publicId:string) => {
+                if (this.disposed) { return; }
                 // connectionAccepted is transport-level only. Project readiness is
                 // established exclusively by connectWithRetry after joinProject.
                 this.publicId = publicId;
@@ -667,6 +831,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 if (res) {
                     const {fileEntity} = res;
                     const oldName = fileEntity.name;
+                    if (oldName === newName) { return; }
                     fileEntity.name = newName;
                     this.notify([
                         {type: vscode.FileChangeType.Deleted, uri: this.pathToUri(res.path)},
@@ -689,8 +854,9 @@ export class VirtualFileSystem extends vscode.Disposable {
                 const newPath = this._resolveById(folderId);
                 if (oldPath && newPath) {
                     const newParentFolder = newPath.fileEntity as FolderEntity;
-                    this.insertEntity(newParentFolder, oldPath.fileType, oldPath.fileEntity);
+                    if (oldPath.parentFolder._id === newParentFolder._id) { return; }
                     this.removeEntity(oldPath.parentFolder, oldPath.fileType, oldPath.fileEntity);
+                    this.insertEntity(newParentFolder, oldPath.fileType, oldPath.fileEntity);
                     this.notify([
                         {type: vscode.FileChangeType.Deleted, uri: this.pathToUri(oldPath.path)},
                         {type: vscode.FileChangeType.Created, uri: this.pathToUri(newPath.path, oldPath.fileEntity.name)}
@@ -811,35 +977,60 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     async createFile(uri: vscode.Uri, content:Uint8Array, overwrite?:boolean) {
         const {parentFolder, fileName, fileEntity} = await this._resolveUri(uri);
-        if (fileEntity && !overwrite) {
-            throw vscode.FileSystemError.FileExists(uri);
+        if (fileEntity) {
+            if (!overwrite) {
+                throw vscode.FileSystemError.FileExists(uri);
+            }
+            throw this.mutationError(
+                `Unable to overwrite ${fileName}`,
+                'Safe overwrite is not supported for remote file uploads',
+            );
         }
 
-        let res = undefined;
+        const parentFolderId = parentFolder._id;
         const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-
         if (content.length===0) {
-            const _res = await this.api.addDoc(identity, this.projectId, parentFolder._id, fileName);
-            if (_res.type==='success') {
-                res = _res.entity;
+            const response = await this.api.addDoc(identity, this.projectId, parentFolderId, fileName);
+            if (response.type !== 'success') {
+                if (await this.cachedFileMatches(uri, parentFolderId, fileName, ['doc'], content)) { return; }
+                throw this.mutationError(`Unable to create ${fileName}`, response.message);
             }
+            if (!this.isCreatedEntity(response.entity, ['doc'])) {
+                throw this.mutationError(`Unable to create ${fileName}`, 'The server returned no document');
+            }
+            const liveParent = await this.currentFolder(parentFolderId, `Unable to create ${fileName}`);
+            const alreadyCached = Boolean(this.resolveCachedEntity(response.entity._id));
+            this.insertEntity(liveParent, response.entity._type, response.entity);
+            if (alreadyCached) { return; }
         } else {
-            const parentFolderId = parentFolder._id;
-            const _res = await this.api.uploadFile(identity, this.projectId, parentFolderId, fileName, content);
-            if (_res.type==='success' && _res.entity!==undefined) {
-                res = _res.entity;
-            } else {
-                if (_res.message!==undefined) {
-                    vscode.window.showErrorMessage(_res.message);
-                }
+            const response = await this.api.uploadFile(
+                identity,
+                this.projectId,
+                parentFolderId,
+                fileName,
+                content,
+            );
+            if (response.type !== 'success') {
+                if (await this.cachedFileMatches(
+                    uri,
+                    parentFolderId,
+                    fileName,
+                    ['doc', 'file'],
+                    content,
+                )) { return; }
+                throw this.mutationError(`Unable to upload ${fileName}`, response.message);
             }
+            if (!this.isCreatedEntity(response.entity, ['doc', 'file'])) {
+                throw this.mutationError(`Unable to upload ${fileName}`, 'The server returned no file');
+            }
+            const liveParent = await this.currentFolder(parentFolderId, `Unable to upload ${fileName}`);
+            const alreadyCached = Boolean(this.resolveCachedEntity(response.entity._id));
+            this.insertEntity(liveParent, response.entity._type, response.entity);
+            if (alreadyCached) { return; }
         }
-        if (res && res._type) {
-            this.insertEntity(parentFolder, res._type, res);
-            this.notify([
-                {type: vscode.FileChangeType.Created, uri: uri},
-            ]);
-        }
+        this.notify([
+            {type: vscode.FileChangeType.Created, uri: uri},
+        ]);
     }
 
     async refreshLinkedFile(uri: vscode.Uri) {
@@ -1274,78 +1465,161 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async mkdir(uri: vscode.Uri) {
-        const {parentFolder, fileName} = await this._resolveUri(uri);
+        const {parentFolder, fileName, fileEntity} = await this._resolveUri(uri);
+        if (fileEntity) {
+            throw vscode.FileSystemError.FileExists(uri);
+        }
         const [folderName, parentFolderId] = [fileName, parentFolder._id];
         const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
         const res = await this.api.addFolder(identity, this.projectId, folderName, parentFolderId);
 
-        if (res.type==='success' && res.entity!==undefined) {
-            this.insertEntity(parentFolder, 'folder', res.entity as FolderEntity);
-            this.notify([
-                {type: vscode.FileChangeType.Created, uri: uri},
-            ]);
-        } else {
-            if (res.message!==undefined) {
-                vscode.window.showErrorMessage(res.message);
-            }
+        if (res.type !== 'success') {
+            if (this.isReady && this.cachedChildAt(parentFolderId, folderName, ['folder'])) { return; }
+            throw this.mutationError(`Unable to create folder ${folderName}`, res.message);
         }
+        if (!res.entity || typeof res.entity._id !== 'string' || res.entity._id.length === 0) {
+            throw this.mutationError(`Unable to create folder ${folderName}`, 'The server returned no folder');
+        }
+        const liveParent = await this.currentFolder(parentFolderId, `Unable to create folder ${folderName}`);
+        const alreadyCached = Boolean(this.resolveCachedEntity(res.entity._id));
+        this.insertEntity(liveParent, 'folder', res.entity as FolderEntity);
+        if (alreadyCached) { return; }
+        this.notify([
+            {type: vscode.FileChangeType.Created, uri: uri},
+        ]);
     }
 
     async remove(uri: vscode.Uri, recursive: boolean) {
         const {parentFolder, fileType, fileEntity} = await this._resolveUri(uri);
-        if (fileType && fileEntity) {
-            const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-            const res = await this.api.deleteEntity(identity, this.projectId, fileType, fileEntity._id);
-            if (res.type==='success') {
-                this.removeEntityById(parentFolder, fileType, fileEntity._id, recursive);
-                this.notify([
-                    {type: vscode.FileChangeType.Deleted, uri: uri},
-                ]);
-            } else {
-                if (res.message!==undefined) {
-                    vscode.window.showErrorMessage(res.message);
-                }
-            }
+        if (!fileType || !fileEntity) {
+            throw vscode.FileSystemError.FileNotFound(uri);
         }
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const res = await this.api.deleteEntity(identity, this.projectId, fileType, fileEntity._id);
+        if (res.type !== 'success') {
+            if (!this.isReady || this.resolveCachedEntity(fileEntity._id)) {
+                throw this.mutationError(`Unable to delete ${fileEntity.name}`, res.message);
+            }
+            return;
+        }
+        this.removeEntityById(parentFolder, fileType, fileEntity._id, recursive);
+        this.notify([
+            {type: vscode.FileChangeType.Deleted, uri: uri},
+        ]);
     }
 
     async rename(oldUri: vscode.Uri, newUri: vscode.Uri, force: boolean) {
         const oldPath = await this._resolveUri(oldUri);
         const newPath = await this._resolveUri(newUri);
 
-        if (oldPath.fileType && oldPath.fileEntity && oldPath.fileEntity) {
-            // delete existence firstly
-            if (newPath.fileType && newPath.fileEntity) {
-                if (!force) { return; }
-                await this.remove(newUri, true);
-                this.removeEntity(newPath.parentFolder, newPath.fileType, newPath.fileEntity);
+        if (!oldPath.fileType || !oldPath.fileEntity) {
+            throw vscode.FileSystemError.FileNotFound(oldUri);
+        }
+        if (oldUri.toString() === newUri.toString() || oldPath.fileEntity._id === newPath.fileEntity?._id) {
+            return;
+        }
+        if (newPath.fileType && newPath.fileEntity) {
+            if (!force) {
+                throw vscode.FileSystemError.FileExists(newUri);
             }
-            // rename or move
-            let res = undefined;
-            const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-            if (oldPath.parentFolder===newPath.parentFolder) {
-                const [entityType, entityId, newName] = [oldPath.fileType, oldPath.fileEntity._id, newPath.fileName];
-                res = await this.api.renameEntity(identity, this.projectId, entityType, entityId, newName);
-            } else {
-                const [entityType, entityId, newParentFolderId] = [oldPath.fileType, oldPath.fileEntity._id, newPath.parentFolder._id];
-                res = await this.api.moveEntity(identity, this.projectId, entityType, entityId, newParentFolderId);
-            }
-            // update local cache
-            if (res?.type==='success') {
-                const newEntity = Object.assign(oldPath.fileEntity);
-                newEntity.name = newPath.fileName;
-                this.removeEntity(oldPath.parentFolder, oldPath.fileType, oldPath.fileEntity);
-                this.insertEntity(newPath.parentFolder, oldPath.fileType, newEntity);
-                this.notify([
-                    {type: vscode.FileChangeType.Deleted, uri: oldUri},
-                    {type: vscode.FileChangeType.Created, uri: newUri},
-                ]);
-            } else {
-                if (res?.message!==undefined) {
-                    vscode.window.showErrorMessage(res.message);
+            // Overleaf has no atomic replace/move endpoint. Deleting the target
+            // first would irreversibly lose it if the following request failed.
+            throw this.mutationError(
+                `Unable to replace ${newPath.fileName}`,
+                'Safe overwrite is not supported for remote rename operations',
+            );
+        }
+
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const entityType = oldPath.fileType;
+        const entity = oldPath.fileEntity;
+        const entityId = entity._id;
+        const originalName = entity.name;
+        const targetName = newPath.fileName;
+        const sameParent = oldPath.parentFolder._id === newPath.parentFolder._id;
+
+        if (sameParent) {
+            if (originalName === targetName) { return; }
+            const res = await this.api.renameEntity(
+                identity,
+                this.projectId,
+                entityType,
+                entityId,
+                targetName,
+            );
+            if (res.type !== 'success') {
+                if (!this.cachedEntityIsAt(entityId, newPath.parentFolder._id, targetName)) {
+                    throw this.mutationError(`Unable to rename ${originalName}`, res.message);
                 }
             }
+            const events = this.reconcileEntityLocation(
+                entityType,
+                entity,
+                newPath.parentFolder,
+                targetName,
+                newUri,
+            );
+            if (events.length > 0) { this.notify(events); }
+            return;
         }
+
+        const moveRes = await this.api.moveEntity(
+            identity,
+            this.projectId,
+            entityType,
+            entityId,
+            newPath.parentFolder._id,
+        );
+        if (moveRes.type !== 'success') {
+            const moveConfirmed = this.cachedEntityIsAt(
+                entityId,
+                newPath.parentFolder._id,
+                originalName,
+            ) || this.cachedEntityIsAt(entityId, newPath.parentFolder._id, targetName);
+            if (!moveConfirmed) {
+                throw this.mutationError(`Unable to move ${originalName}`, moveRes.message);
+            }
+        }
+
+        if (originalName !== targetName &&
+            !this.cachedEntityIsAt(entityId, newPath.parentFolder._id, targetName)) {
+            const renameRes = await this.api.renameEntity(
+                identity,
+                this.projectId,
+                entityType,
+                entityId,
+                targetName,
+            );
+            if (renameRes.type !== 'success') {
+                // The move is confirmed but the rename is not. Keep the cache at
+                // the last confirmed remote state and surface the partial failure.
+                if (this.cachedEntityIsAt(entityId, newPath.parentFolder._id, targetName)) {
+                    return;
+                }
+                const intermediateUri = vscode.Uri.joinPath(newUri, '..', originalName);
+                const events = this.reconcileEntityLocation(
+                    entityType,
+                    entity,
+                    newPath.parentFolder,
+                    originalName,
+                    intermediateUri,
+                );
+                if (events.length > 0) { this.notify(events); }
+                throw this.mutationError(
+                    `Moved ${originalName}, but could not rename it to ${targetName}`,
+                    renameRes.message,
+                );
+            }
+        }
+
+        const events = this.reconcileEntityLocation(
+            entityType,
+            entity,
+            newPath.parentFolder,
+            targetName,
+            newUri,
+        );
+        if (events.length > 0) { this.notify(events); }
     }
 
     async compile(force:boolean=false, draft:boolean=false, stopOnFirstError:boolean=false, rootDocId?:string) {
@@ -1693,7 +1967,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 }
 
-export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
+export class RemoteFileSystemProvider implements vscode.FileSystemProvider, vscode.Disposable {
     private _emitter = new vscode.EventEmitter<vscode.FileChangeEvent[]>();
     readonly onDidChangeFile: vscode.Event<vscode.FileChangeEvent[]> = this._emitter.event;
 
@@ -1704,15 +1978,31 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
         this.vfss = {};
     }
 
+    private vfsKey(uri: vscode.Uri): string {
+        return `${uri.authority}\0${uri.query}`;
+    }
+
     private getVFS(uri: vscode.Uri): Promise<VirtualFileSystem> {
-        const vfs = this.vfss[ uri.query ];
+        const key = this.vfsKey(uri);
+        const vfs = this.vfss[key];
         if (vfs) {
             return Promise.resolve(vfs);
         } else {
-            const vfs = new VirtualFileSystem(this.context, uri, this.notify.bind(this));
-            this.vfss[ uri.query ] = vfs;
+            const vfs = new VirtualFileSystem(this.context, uri, this.notify.bind(this), () => {
+                if (this.vfss[key] === vfs) {
+                    delete this.vfss[key];
+                }
+            });
+            this.vfss[key] = vfs;
             return Promise.resolve(vfs);
         }
+    }
+
+    dispose() {
+        const vfss = Object.values(this.vfss);
+        this.vfss = {};
+        vfss.forEach(vfs => vfs.dispose());
+        this._emitter.dispose();
     }
 
     prefetch(uri: vscode.Uri): Promise<VirtualFileSystem> {
@@ -1752,9 +2042,10 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
     }
 
     rename(oldUri: vscode.Uri, newUri: vscode.Uri, options: { overwrite: boolean; }) {
-        if (oldUri.authority !== newUri.authority) {
-            vscode.window.showErrorMessage( vscode.l10n.t('Cannot rename across servers') );
-            return;
+        if (oldUri.authority !== newUri.authority || oldUri.query !== newUri.query) {
+            return Promise.reject(vscode.FileSystemError.Unavailable(
+                vscode.l10n.t('Cannot rename across Overleaf projects'),
+            ));
         } else {
             return this.getVFS(oldUri).then( vfs => vfs.rename(oldUri, newUri, options.overwrite) );
         }
@@ -1777,6 +2068,7 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
             vscode.commands.registerCommand('remoteFileSystem.prefetch', (uri: vscode.Uri) => {
                 return this.prefetch(uri);
             }),
+            new vscode.Disposable(() => this.dispose()),
         ];
     }
 }

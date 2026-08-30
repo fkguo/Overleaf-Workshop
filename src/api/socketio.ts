@@ -1,7 +1,6 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import { Identity, BaseAPI, ProjectMessageResponseSchema } from './base';
 import { FileEntity, DocumentEntity, FileRefEntity, FileType, FolderEntity, ProjectEntity } from '../core/remoteFileSystemProvider';
-import { EventBus } from '../utils/eventBus';
 import {
     isRecoverableTransportInterruption,
     requestWithAck,
@@ -109,8 +108,6 @@ export class SocketIOAPI {
     private scheme: ConnectionScheme = 'v2';
     private record?: Promise<ProjectEntity>;
     private _handlers: Array<EventsHandler> = [];
-    /** Track EventBus listeners for cleanup to prevent MaxListenersExceededWarning */
-    private _eventBusCleanups: Array<()=>void> = [];
 
     private socket?: any;
     /** Track the scheme used when the socket was last initialized */
@@ -123,6 +120,7 @@ export class SocketIOAPI {
     private v2ProjectResponse?: Deferred<ProjectEntity> & {generation: number};
     private documentMembershipQueue: Promise<void> = Promise.resolve();
     private legacyV1Rejected = false;
+    private disposed = false;
 
     constructor(private url:string,
                 private readonly api:BaseAPI,
@@ -133,9 +131,10 @@ export class SocketIOAPI {
     }
 
     init() {
+        if (this.disposed) {
+            throw new SocketRequestError('stale_connection', 'Socket session is disposed', false);
+        }
         this.resetTransportState();
-        // Clean up old EventBus listeners before creating new socket
-        this._cleanupEventBusListeners();
 
         // CRITICAL: Properly disconnect old socket before creating a new one.
         // Without this, the old TCP connection is abandoned but still alive. When the
@@ -278,6 +277,9 @@ export class SocketIOAPI {
     }
 
     async waitUntilConnected(timeoutMs: number = CONNECT_TIMEOUT_MS): Promise<number> {
+        if (this.disposed) {
+            throw new SocketRequestError('stale_connection', 'Socket session is disposed', false);
+        }
         if (this.transportConnected) {
             return this.socketGeneration;
         }
@@ -330,14 +332,6 @@ export class SocketIOAPI {
         const queued = this.documentMembershipQueue.catch(() => {}).then(operation);
         this.documentMembershipQueue = queued.then(() => {}, () => {});
         return queued;
-    }
-
-    /** Clean up any accumulated EventBus listeners */
-    private _cleanupEventBusListeners() {
-        for (const cleanup of this._eventBusCleanups) {
-            try { cleanup(); } catch {}
-        }
-        this._eventBusCleanups = [];
     }
 
     private initInternalHandlers(socketAtInit: any) {
@@ -401,13 +395,39 @@ export class SocketIOAPI {
                 const publicId = res.publicId as string;
                 const project = res.project as ProjectEntity;
                 this.ensureV2ProjectResponse().resolve(project);
-                EventBus.fire('socketioConnectedEvent', {publicId});
+                this._handlers.forEach(handler => handler.onConnectionAccepted?.(publicId));
             });
         }
     }
 
     disconnect() {
-        this.socket.disconnect();
+        this.socket?.disconnect();
+    }
+
+    dispose() {
+        if (this.disposed) { return; }
+        this.disposed = true;
+        this._handlers = [];
+
+        const socket = this.socket;
+        try {
+            socket?.disconnect?.();
+        } finally {
+            socket?.removeAllListeners?.();
+        }
+
+        const error = new SocketRequestError(
+            'stale_connection',
+            'Socket session is disposed',
+            false,
+        );
+        this.transportConnectedSignal.reject(error);
+        this.connectionAcceptedSignal.reject(error);
+        this.rejectV2ProjectResponse(error);
+        this.transportConnected = false;
+        this.lastDisconnectedSocket = undefined;
+        this._socketInitScheme = undefined;
+        this.socket = undefined;
     }
 
     get handlers() {
@@ -434,6 +454,7 @@ export class SocketIOAPI {
     }
 
     updateEventHandlers(handlers: EventsHandler) {
+        if (this.disposed) { return; }
         this._handlers.push(handlers);
         Object.values(handlers).forEach((handler) => {
             switch (handler) {
@@ -477,11 +498,6 @@ export class SocketIOAPI {
                     this.socket.on('connectionAccepted', (_:any, publicId:any) => {
                         handler(publicId);
                     });
-                    // Track EventBus listener via Disposable for cleanup to prevent MaxListenersExceededWarning
-                    const eventBusDisposable = EventBus.on('socketioConnectedEvent', (arg:{publicId:string}) => {
-                        handler(arg.publicId);
-                    });
-                    this._eventBusCleanups.push(() => eventBusDisposable.dispose());
                     break;
                 case handlers.onClientUpdated:
                     this.socket.on('clientTracking.clientUpdated', (user:UpdateUserSchema) => {

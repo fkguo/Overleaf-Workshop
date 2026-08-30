@@ -196,4 +196,46 @@ describe('SocketIOAPI project protocol', () => {
         assert.strictEqual(await joined, project);
         assert.equal(socket.needsReinit, false);
     });
+
+    it('keeps v2 public ids isolated between socket sessions', async () => {
+        const first = createAPI();
+        const second = createAPI();
+        const accepted: string[] = [];
+        first.socket.updateEventHandlers({
+            onConnectionAccepted: publicId => accepted.push(`first:${publicId}`),
+        });
+        second.socket.updateEventHandlers({
+            onConnectionAccepted: publicId => accepted.push(`second:${publicId}`),
+        });
+
+        first.base.sockets[0].serverEmit('connect');
+        const joined = first.socket.joinProject('project-id');
+        first.base.sockets[0].serverEmit('joinProjectResponse', {publicId: 'P.first', project});
+
+        assert.strictEqual(await joined, project);
+        assert.deepEqual(accepted, ['first:P.first']);
+    });
+
+    it('removes physical handlers when the socket session is disposed', () => {
+        const {base, socket} = createAPI();
+        const transport = base.sockets[0];
+        let acceptedEvents = 0;
+        let clientEvents = 0;
+        socket.updateEventHandlers({
+            onConnectionAccepted: () => { acceptedEvents += 1; },
+            onClientUpdated: () => { clientEvents += 1; },
+        });
+
+        socket.dispose();
+        transport.serverEmit('connectionAccepted', undefined, 'P.late');
+        transport.serverEmit('clientTracking.clientUpdated', {});
+
+        assert.equal(acceptedEvents, 0);
+        assert.equal(clientEvents, 0);
+        assert.equal(socket.handlers.length, 0);
+        assert.throws(
+            () => socket.init(),
+            (error: unknown) => error instanceof SocketRequestError && error.code === 'stale_connection',
+        );
+    });
 });

@@ -72,12 +72,14 @@ class HistoryItem extends vscode.TreeItem {
     }
 }
 
-class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscode.TextDocumentContentProvider {
+class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscode.TextDocumentContentProvider, vscode.Disposable {
     private _path?: string;
     private _history?: HistoryRecord;
+    private readonly refreshTask: NodeJS.Timeout;
+    private disposed = false;
 
     constructor(private readonly vfs: VirtualFileSystem) {
-        setInterval(this.refresh.bind(this), 30*1000);
+        this.refreshTask = setInterval(() => this.refresh(), 30*1000);
     }
 
     private _onDidChangeTreeData: vscode.EventEmitter<HistoryItem | undefined | void> = new vscode.EventEmitter<HistoryItem | undefined | void>();
@@ -85,15 +87,25 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
     readonly onDidChangeTreeData: vscode.Event<HistoryItem | undefined | void> = this._onDidChangeTreeData.event;
 
     refresh(): void {
+        if (this.disposed) { return; }
         this._onDidChangeTreeData.fire();
     }
 
+    dispose(): void {
+        if (this.disposed) { return; }
+        this.disposed = true;
+        clearInterval(this.refreshTask);
+        this._onDidChangeTreeData.dispose();
+    }
+
     async refreshData(path?:string, force:boolean=false) {
+        if (this.disposed) { return; }
         this._path = path;
         if (force) {
             this._history = undefined;
         }
         await this.getHistory();
+        if (this.disposed) { return; }
         this.refresh();
     }
 
@@ -199,8 +211,9 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
         });
     }
 
-    get triggers() {
+    get triggers(): vscode.Disposable[] {
         return [
+            this,
             vscode.workspace.registerTextDocumentContentProvider(`${ROOT_NAME}-diff`, this),
             // register commands
             vscode.commands.registerCommand(`${ROOT_NAME}.projectHistory.refresh`, async () => {
@@ -346,9 +359,11 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
     }
 }
 
-export class HistoryViewProvider {
+export class HistoryViewProvider implements vscode.Disposable {
     private treeDataProvider: HistoryDataProvider;
     private historyView: vscode.TreeView<HistoryItem>;
+    private pendingFileOpenTasks = new Set<NodeJS.Timeout>();
+    private disposed = false;
 
     constructor(vfs: VirtualFileSystem) {
         const treeDataProvider = new HistoryDataProvider(vfs);
@@ -358,13 +373,23 @@ export class HistoryViewProvider {
     }
 
     updateView(pathParts?: string[]) {
+        if (this.disposed) { return; }
         this.historyView.description = pathParts?.at(-1);
         this.treeDataProvider.refreshData( pathParts?.join('/') );
     }
 
-    get triggers() {
+    dispose(): void {
+        if (this.disposed) { return; }
+        this.disposed = true;
+        this.pendingFileOpenTasks.forEach(task => clearTimeout(task));
+        this.pendingFileOpenTasks.clear();
+    }
+
+    get triggers(): vscode.Disposable[] {
         return [
+            this,
             // register tree view
+            this.historyView,
             ...this.treeDataProvider.triggers,
             // register commands
             vscode.commands.registerCommand(`${ROOT_NAME}.projectHistory.clearSelection`, async() => {
@@ -375,7 +400,10 @@ export class HistoryViewProvider {
             }),
             // on vfs file open
             EventBus.on('fileWillOpenEvent', async ({uri}) => {
-                setTimeout(() => {
+                if (this.disposed) { return; }
+                const task = setTimeout(() => {
+                    this.pendingFileOpenTasks.delete(task);
+                    if (this.disposed) { return; }
                     // filter noise read events
                     const activeTextUri = vscode.window.activeTextEditor?.document.uri;
                     if (activeTextUri && activeTextUri.path!==uri.path) { return; }
@@ -387,6 +415,7 @@ export class HistoryViewProvider {
 
                     this.updateView( pathParts );
                 }, 100);
+                this.pendingFileOpenTasks.add(task);
             }),
             //FIXME: on "file://" uri open
         ];

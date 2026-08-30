@@ -81,7 +81,7 @@ class ProjectItem extends DataItem {
     }
 }
 
-export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem> {
+export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>, vscode.Disposable {
     constructor(
         private context:vscode.ExtensionContext) {
         this.context = context;
@@ -93,6 +93,10 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
 
     refresh(): void {
         this._onDidChangeTreeData.fire();
+    }
+
+    dispose(): void {
+        this._onDidChangeTreeData.dispose();
     }
 
     getTreeItem(element: DataItem): vscode.TreeItem {
@@ -645,8 +649,9 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
         });
     }
 
-    get triggers() {
+    get triggers(): vscode.Disposable[] {
         return [
+            this,
             // register tree data provider
             vscode.window.registerTreeDataProvider(`${ROOT_NAME}.projectManager`, this),
             // register server-related commands
