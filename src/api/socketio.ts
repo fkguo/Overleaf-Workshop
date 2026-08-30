@@ -2,7 +2,6 @@
 import { Identity, BaseAPI, ProjectMessageResponseSchema } from './base';
 import { FileEntity, DocumentEntity, FileRefEntity, FileType, FolderEntity, ProjectEntity } from '../core/remoteFileSystemProvider';
 import { EventBus } from '../utils/eventBus';
-import { SocketIOAlt } from './socketioAlt';
 import {
     isRecoverableTransportInterruption,
     requestWithAck,
@@ -161,6 +160,10 @@ export class SocketIOAPI {
         // connect
         switch(this.scheme) {
             case 'Alt':
+                // Keep the VS Code-dependent HTTP fallback out of the normal
+                // realtime module graph. This also lets the socket state machine
+                // run in isolation in unit tests.
+                const {SocketIOAlt} = require('./socketioAlt') as typeof import('./socketioAlt');
                 this.socket = new SocketIOAlt(this.url, this.api, this.identity, this.projectId, this.record!);
                 break;
             case 'v1':
@@ -517,14 +520,14 @@ export class SocketIOAPI {
     }
 
     get unSyncFileChanges(): number {
-        if (this.socket instanceof SocketIOAlt) {
+        if (this._socketInitScheme === 'Alt') {
             return this.socket.unSyncedChanges;
         }
         return 0;
     }
 
     async syncFileChanges() {
-        if (this.socket instanceof SocketIOAlt) {
+        if (this._socketInitScheme === 'Alt') {
             return await this.socket.uploadToVFS();
         }
     }
@@ -672,7 +675,7 @@ export class SocketIOAPI {
      * @returns {Promise}
      */
     async updatePosition(doc_id:string, row:number, column:number) {
-        if (this.socket instanceof SocketIOAlt) {
+        if (this._socketInitScheme === 'Alt') {
             await this.request<any[]>('clientTracking.updatePosition', [{row, column, doc_id}]);
             return;
         }
