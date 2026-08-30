@@ -13,7 +13,7 @@ function* sRange(start:number, end:number) {
 export class MisspellingCheckProvider extends IntellisenseProvider implements vscode.CodeActionProvider {
     private learnedWords?: Set<string>;
     private suggestionCache: Map<string, string[]> = new Map();
-    private diagnosticCollection = vscode.languages.createDiagnosticCollection(ROOT_NAME);
+    private diagnosticCollection = vscode.languages.createDiagnosticCollection(`${ROOT_NAME}.spelling`);
     protected readonly contextPrefix = [];
 
     private splitText(text: string) {

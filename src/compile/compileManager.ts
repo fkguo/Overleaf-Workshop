@@ -23,7 +23,7 @@ const pdfViewRecord: {
 } = {};
 
 class CompileDiagnosticProvider {
-    private diagnosticCollection = vscode.languages.createDiagnosticCollection(ROOT_NAME);
+    private diagnosticCollection = vscode.languages.createDiagnosticCollection(`${ROOT_NAME}.compile`);
     constructor(private readonly vfsm: RemoteFileSystemProvider) {};
 
     private async getRange(log: ErrorSchema, path: string, vfs: any) {
@@ -117,6 +117,7 @@ export class CompileManager {
     readonly status: vscode.StatusBarItem;
     public inCompiling: boolean = false;
     private diagnosticProvider: CompileDiagnosticProvider;
+    private readonly pdfWillOpenTrigger: vscode.Disposable;
     private compileAsDraft: boolean = false;
     private compileStopOnFirstError: boolean = false;
 
@@ -128,7 +129,7 @@ export class CompileManager {
         this.status.command = `${ROOT_NAME}.compilerManager.settings`;
         this.diagnosticProvider = new CompileDiagnosticProvider(vfsm);
         // listen pdf open event
-        EventBus.on('pdfWillOpenEvent', ({uri, doc, webviewPanel}) => {
+        this.pdfWillOpenTrigger = EventBus.on('pdfWillOpenEvent', ({uri, doc, webviewPanel}) => {
             const {identifier,pathParts} = parseUri(uri);
             const filePath = pathParts.join('/');
             if (pdfViewRecord[identifier]) {
@@ -448,6 +449,7 @@ export class CompileManager {
         return [
             // register status bar
             this.status,
+            this.pdfWillOpenTrigger,
             // register compile commands
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.compile`, () => this.compile(true)),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.viewPdf`, () =>  this.openPdf()),
