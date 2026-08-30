@@ -1131,15 +1131,11 @@ export class VirtualFileSystem extends vscode.Disposable {
             doc.localCache = pending.desiredContent;
             doc.remoteCache = pending.mergedContent;
         } else {
+            // The sender-only version event above is Overleaf's commit
+            // confirmation. Concurrent OT may transform the resulting text, so
+            // this fresh snapshot is for reconciliation, not a second proof that
+            // can revoke an already-confirmed save.
             const authoritative = await this.joinFreshDocumentSession(docId);
-            if (!desiredChangesArePresent(
-                pending.localBase,
-                authoritative.content,
-                pending.desiredContent,
-            )) {
-                this.pendingDocumentUpdates.delete(docId);
-                throw new Error('The recovered update was not present in the authoritative document');
-            }
             authoritative.doc.localCache = pending.desiredContent;
         }
         this.pendingDocumentUpdates.delete(docId);
@@ -1253,11 +1249,10 @@ export class VirtualFileSystem extends vscode.Disposable {
                 doc.localCache = _content;
                 doc.remoteCache = mergeRes;
             } else {
+                // The sender-only version event above is the commit boundary.
+                // Rejoin to reconcile transformed concurrent edits without
+                // comparing them byte-for-byte with the pre-transform intent.
                 const authoritative = await this.joinFreshDocumentSession(doc._id);
-                if (!desiredChangesArePresent(localBase, authoritative.content, _content)) {
-                    this.pendingDocumentUpdates.delete(doc._id);
-                    throw new Error('The server did not confirm all local document changes; the document remains unsaved');
-                }
                 authoritative.doc.localCache = _content;
             }
             this.pendingDocumentUpdates.delete(doc._id);
