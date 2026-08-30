@@ -4,6 +4,8 @@ import * as FormData from 'form-data';
 import { v4 as uuidv4 } from 'uuid';
 import { fetch } from 'undici';
 import { FileEntity, FileType, FolderEntity, OutputFileEntity } from '../core/remoteFileSystemProvider';
+import { downloadWithRanges } from './httpDownload';
+import { HttpMethod, shouldRetryHttpRequest } from './httpRequestPolicy';
 
 /** Extract set-cookie headers from an undici/Response object. */
 function getSetCookie(res: any): string[] {
@@ -11,7 +13,7 @@ function getSetCookie(res: any): string[] {
         return res.headers.getSetCookie();
     }
     const raw = res.headers?.raw?.()?.['set-cookie'];
-    if (raw) return raw;
+    if (raw) { return raw; }
     return [];
 }
 
@@ -349,33 +351,7 @@ export class BaseAPI {
         return this;
     }
 
-    /**
-     * Check if an HTTP error is transient (worth retrying).
-     * Retries on: 5xx server errors, network errors (fetch failures), and 429 rate limiting.
-     */
-    private isTransientError(statusCode: number | undefined, errorMessage?: string): boolean {
-        if (statusCode === undefined) {
-            // Network-level error (DNS, connection refused, reset, timeout)
-            return true;
-        }
-        // Server errors and rate limiting
-        if (statusCode >= 500 || statusCode === 429) {
-            return true;
-        }
-        // Common transient network error messages
-        if (errorMessage && (
-            errorMessage.includes('ECONNRESET') ||
-            errorMessage.includes('ETIMEDOUT') ||
-            errorMessage.includes('ECONNREFUSED') ||
-            errorMessage.includes('ENOTFOUND') ||
-            errorMessage.includes('socket hang up')
-        )) {
-            return true;
-        }
-        return false;
-    }
-
-    protected async request(type:'GET'|'POST'|'PUT'|'DELETE', route:string, body?:FormData|object, callback?: (res?:string)=>object|undefined, extraHeaders?:object ): Promise<ResponseSchema> {
+    protected async request(type:HttpMethod, route:string, body?:FormData|object, callback?: (res?:string)=>object|undefined, extraHeaders?:object ): Promise<ResponseSchema> {
         if (this.identity===undefined) { return Promise.reject(); }
 
         const MAX_HTTP_RETRIES = 2;
@@ -434,7 +410,7 @@ export class BaseAPI {
                         type: 'success',
                         ...response
                     } as ResponseSchema;
-                } else if (res && this.isTransientError(res.status) && attempt < MAX_HTTP_RETRIES) {
+                } else if (res && shouldRetryHttpRequest(type, res.status) && attempt < MAX_HTTP_RETRIES) {
                     // Transient error: retry with backoff
                     const delayMs = Math.min(1000 * Math.pow(2, attempt), 4000);
                     console.log(`HTTP ${res.status} on ${route}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_HTTP_RETRIES})`);
@@ -451,8 +427,10 @@ export class BaseAPI {
                     };
                 }
             } catch (err: any) {
-                const errMsg = err?.message || String(err);
-                if (this.isTransientError(undefined, errMsg) && attempt < MAX_HTTP_RETRIES) {
+                const errMsg = [err?.message, err?.cause?.code, err?.cause?.message]
+                    .filter(Boolean)
+                    .join(': ') || String(err);
+                if (shouldRetryHttpRequest(type, undefined, errMsg) && attempt < MAX_HTTP_RETRIES) {
                     const delayMs = Math.min(1000 * Math.pow(2, attempt), 4000);
                     console.log(`HTTP fetch error on ${route}: ${errMsg}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_HTTP_RETRIES})`);
                     await new Promise(r => setTimeout(r, delayMs));
@@ -474,28 +452,14 @@ export class BaseAPI {
 
     protected async download(route:string) {
         if (this.identity===undefined) { return Promise.reject(); }
-
-        let content: Buffer[] = [];
-        while(true) {
-            const res = await fetch(this.url+route, {
-                method: 'GET', redirect: 'manual',
-                headers: {
-                    'Connection': 'keep-alive',
-                    'Cookie': this.identity.cookies,
-                }
-            });
-            if (res.status===200) {
-                content.push(Buffer.from(await res.arrayBuffer()));
-                break;
-            }
-            else if (res.status===206) {
-                content.push(Buffer.from(await res.arrayBuffer()));
-            } else {
-                break;
-            }
-        };
-
-        return Buffer.concat(content);
+        return downloadWithRanges(
+            this.url + route,
+            {
+                'Connection': 'keep-alive',
+                'Cookie': this.identity.cookies,
+            },
+            (url, init) => fetch(url, init),
+        );
     }
 
     async logout(identity:Identity): Promise<ResponseSchema> {
@@ -583,8 +547,8 @@ export class BaseAPI {
         this.setIdentity(identity);
         const content = await this.download(`project/${projectId}/file/${fileId}`);
         return {
-            type: 'success',
-            content: new Uint8Array( content )
+            type: 'success' as const,
+            content: new Uint8Array(content),
         };
     }
 
@@ -763,7 +727,7 @@ export class BaseAPI {
                 `&clsiserverid=${encodeURIComponent(clsiServerId)}` +
                 `&enable_pdf_caching=true`;
             const content = await this._downloadAbsolute(cdnUrl, false);
-            return { type: 'success', content: new Uint8Array(content) };
+            return {type: 'success' as const, content: new Uint8Array(content)};
         }
 
         // Fallback: download from web frontend (legacy path)
@@ -771,8 +735,8 @@ export class BaseAPI {
         this.setIdentity(identity);
         const content = await this.download(url);
         return {
-            type: 'success',
-            content: new Uint8Array( content )
+            type: 'success' as const,
+            content: new Uint8Array(content),
         };
     }
 
@@ -784,22 +748,7 @@ export class BaseAPI {
         if (includeCookies && this.identity) {
             headers['Cookie'] = this.identity.cookies;
         }
-        let content: Buffer[] = [];
-        while (true) {
-            const res = await fetch(absoluteUrl, {
-                method: 'GET', redirect: 'manual',
-                headers
-            });
-            if (res.status === 200) {
-                content.push(Buffer.from(await res.arrayBuffer()));
-                break;
-            } else if (res.status === 206) {
-                content.push(Buffer.from(await res.arrayBuffer()));
-            } else {
-                break;
-            }
-        }
-        return Buffer.concat(content);
+        return downloadWithRanges(absoluteUrl, headers, (url, init) => fetch(url, init));
     }
 
     async proxySyncPdf(identity:Identity, projectId:string, page:number, h:number, v:number, buildId:string) {
@@ -887,8 +836,8 @@ export class BaseAPI {
         this.setIdentity(identity);
         const content = await this.download(`project/${projectId}/version/${version}/zip`);
         return {
-            type: 'success',
-            content: new Uint8Array(content)
+            type: 'success' as const,
+            content: new Uint8Array(content),
         };
     }
 
