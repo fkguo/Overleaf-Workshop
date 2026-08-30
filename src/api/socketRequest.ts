@@ -26,6 +26,14 @@ export class SocketRequestError extends Error {
     }
 }
 
+export function isRecoverableTransportInterruption(error: unknown): boolean {
+    return error instanceof SocketRequestError && (
+        error.code === 'disconnected' ||
+        error.code === 'not_connected' ||
+        error.code === 'stale_connection'
+    );
+}
+
 export function assertCurrentConnection(
     expectedGeneration: number,
     currentGeneration: number,

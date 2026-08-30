@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.15.12] - 2026-08-30
 ### Fixed
+- Start realtime connections with Overleaf's project-query auto-join protocol.
+- Preserve Socket.IO automatic reconnects and avoid falling back to a server-rejected legacy handshake.
 - Avoid false save failures after Overleaf confirms an update transformed alongside concurrent edits.
 
 ## [0.15.10] - 2026-07-11

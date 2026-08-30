@@ -328,7 +328,15 @@ export class VirtualFileSystem extends vscode.Disposable {
                 lastError = error;
                 this.root = undefined;
                 this.joiningProject = undefined;
-                if (error instanceof SocketRequestError) {
+                // Let socket.io exhaust its automatic reconnect first. If the
+                // connection waiter itself times out while still offline, the
+                // physical socket is no longer making progress and must be
+                // replaced for the next outer attempt.
+                if (
+                    error instanceof SocketRequestError &&
+                    error.code === 'timeout' &&
+                    !this.socket.isConnected
+                ) {
                     this.socket.invalidateCurrentTransport();
                 }
             }

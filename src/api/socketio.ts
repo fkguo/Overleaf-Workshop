@@ -3,7 +3,12 @@ import { Identity, BaseAPI, ProjectMessageResponseSchema } from './base';
 import { FileEntity, DocumentEntity, FileRefEntity, FileType, FolderEntity, ProjectEntity } from '../core/remoteFileSystemProvider';
 import { EventBus } from '../utils/eventBus';
 import { SocketIOAlt } from './socketioAlt';
-import { requestWithAck, SocketRequestError, withTimeout } from './socketRequest';
+import {
+    isRecoverableTransportInterruption,
+    requestWithAck,
+    SocketRequestError,
+    withTimeout,
+} from './socketRequest';
 
 function decodePackedUtf8(text: string): string {
     return Buffer.from(text, 'latin1').toString('utf-8');
@@ -99,7 +104,10 @@ const CONNECT_TIMEOUT_MS = 15000;
 const ACK_TIMEOUT_MS = 15000;
 
 export class SocketIOAPI {
-    private scheme: ConnectionScheme = 'v1';
+    // Current Overleaf real-time servers require projectId on the socket
+    // handshake and auto-join the project via joinProjectResponse. Keep the v1
+    // path as a compatibility fallback for older self-hosted deployments.
+    private scheme: ConnectionScheme = 'v2';
     private record?: Promise<ProjectEntity>;
     private _handlers: Array<EventsHandler> = [];
     /** Track EventBus listeners for cleanup to prevent MaxListenersExceededWarning */
@@ -115,6 +123,7 @@ export class SocketIOAPI {
     private connectionAcceptedSignal = deferred<{generation: number, publicId: string}>();
     private v2ProjectResponse?: Deferred<ProjectEntity> & {generation: number};
     private documentMembershipQueue: Promise<void> = Promise.resolve();
+    private legacyV1Rejected = false;
 
     constructor(private url:string,
                 private readonly api:BaseAPI,
@@ -350,21 +359,24 @@ export class SocketIOAPI {
             console.log('SocketIOAPI: forceDisconnect', message);
         });
         socketAtInit.on('connectionRejected', (err:any) => {
-            console.log('SocketIOAPI: connectionRejected.', err?.message || err);
+            const message = String(err?.message || err);
+            console.log('SocketIOAPI: connectionRejected.', message);
             const rejection = new SocketRequestError(
                 'server_error',
-                `Project connection rejected: ${err?.message || err}`,
+                `Project connection rejected: ${message}`,
                 false,
                 err,
             );
             this.rejectV2ProjectResponse(rejection);
-            // If v2 also gets rejected, fall back to v1 rather than staying stuck
-            if (this.scheme === 'v2') {
-                console.log('SocketIOAPI: v2 rejected, falling back to v1');
-                this.scheme = 'v1';
-            } else if (this.scheme === 'v1') {
+            const activeScheme = this._socketInitScheme ?? this.scheme;
+            // Modern servers explicitly reject legacy handshakes which omit the
+            // project id. Once observed, never bounce back to that known-bad
+            // protocol because a later v2 attempt has a transient failure.
+            if (activeScheme === 'v1' && /missing\/bad.*projectId/i.test(message)) {
+                this.legacyV1Rejected = true;
                 this.scheme = 'v2';
             }
+            this.invalidateCurrentTransport();
             // Disable auto-reconnect on this socket: the server explicitly rejected
             // our connection parameters. Reconnecting would just get rejected again,
             // creating unnecessary TCP connection churn (and RST packets).
@@ -404,7 +416,7 @@ export class SocketIOAPI {
     }
 
     toggleAlternativeConnectionScheme(url: string, updatedRecord?: ProjectEntity) {
-        this.scheme = this.scheme==='Alt' ? 'v1' : 'Alt';
+        this.scheme = this.scheme==='Alt' ? 'v2' : 'Alt';
         if (updatedRecord) {
             this.url = url;
             this.record = Promise.resolve(updatedRecord);
@@ -528,27 +540,34 @@ export class SocketIOAPI {
         switch(activeScheme) {
             case 'Alt':
             case 'v1': {
-                await this.waitUntilConnectionAccepted(generation);
-                const socketAtJoin = this.socket;
-                const response = await requestWithAck<[ProjectEntity, string, number]>(
-                    socketAtJoin,
-                    'joinProject',
-                    [{project_id}],
-                    ACK_TIMEOUT_MS,
-                    generation,
-                    (candidate) => candidate === this.socketGeneration && socketAtJoin === this.socket,
-                    {
-                        event: 'connectionRejected',
-                        toError: (err:any) => new SocketRequestError(
-                            'server_error',
-                            `Project connection rejected: ${err?.message || err}`,
-                            false,
-                            err,
-                        ),
-                    },
-                );
-                this.record = Promise.resolve(response[0]);
-                return response[0];
+                try {
+                    await this.waitUntilConnectionAccepted(generation);
+                    const socketAtJoin = this.socket;
+                    const response = await requestWithAck<[ProjectEntity, string, number]>(
+                        socketAtJoin,
+                        'joinProject',
+                        [{project_id}],
+                        ACK_TIMEOUT_MS,
+                        generation,
+                        (candidate) => candidate === this.socketGeneration && socketAtJoin === this.socket,
+                        {
+                            event: 'connectionRejected',
+                            toError: (err:any) => new SocketRequestError(
+                                'server_error',
+                                `Project connection rejected: ${err?.message || err}`,
+                                false,
+                                err,
+                            ),
+                        },
+                    );
+                    this.record = Promise.resolve(response[0]);
+                    return response[0];
+                } catch (error) {
+                    if (!isRecoverableTransportInterruption(error)) {
+                        this.invalidateCurrentTransport();
+                    }
+                    throw error;
+                }
             }
             case 'v2': {
                 const response = this.ensureV2ProjectResponse();
@@ -560,13 +579,34 @@ export class SocketIOAPI {
                     );
                 }
                 try {
-                    const project = await withTimeout(response.promise, 'joinProjectResponse', ACK_TIMEOUT_MS);
-                    this.record = Promise.resolve(project);
-                    return project;
+                    const projectResponse = response.promise.then(
+                        project => ({kind: 'project' as const, project}),
+                    );
+                    const handshake = this.legacyV1Rejected ? projectResponse : Promise.race([
+                        projectResponse,
+                        this.waitUntilConnectionAccepted(generation).then(() => ({kind: 'legacy' as const})),
+                    ]);
+                    const result = await withTimeout(handshake, 'project handshake', ACK_TIMEOUT_MS);
+                    if (result.kind === 'legacy') {
+                        // Older self-hosted servers accept the transport first and
+                        // require an explicit joinProject request on a v1 socket.
+                        this.scheme = 'v1';
+                        this.invalidateCurrentTransport();
+                        throw new SocketRequestError(
+                            'stale_connection',
+                            'Server selected the legacy project join protocol',
+                            false,
+                        );
+                    }
+                    this.record = Promise.resolve(result.project);
+                    return result.project;
                 } catch (error) {
-                    // A connected transport without a project response is not a
-                    // reusable project session. Force the next retry to replace it.
-                    this.invalidateCurrentTransport();
+                    // A connected transport which times out or is explicitly
+                    // rejected is not reusable. A normal disconnect is left to
+                    // socket.io's automatic reconnect on the same socket.
+                    if (!isRecoverableTransportInterruption(error)) {
+                        this.invalidateCurrentTransport();
+                    }
                     throw error;
                 }
             }

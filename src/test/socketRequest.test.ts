@@ -1,5 +1,12 @@
 import { strict as assert } from 'assert';
-import { AckSocket, assertCurrentConnection, requestWithAck, SocketRequestError, withTimeout } from '../api/socketRequest';
+import {
+    AckSocket,
+    assertCurrentConnection,
+    isRecoverableTransportInterruption,
+    requestWithAck,
+    SocketRequestError,
+    withTimeout,
+} from '../api/socketRequest';
 
 /* eslint-disable @typescript-eslint/naming-convention */
 
@@ -223,5 +230,24 @@ describe('assertCurrentConnection', () => {
             () => assertCurrentConnection(7, 7, false),
             (error: unknown) => error instanceof SocketRequestError && error.code === 'stale_connection',
         );
+    });
+});
+
+describe('isRecoverableTransportInterruption', () => {
+    it('keeps the same socket for automatic reconnect interruptions', () => {
+        for (const code of ['disconnected', 'not_connected', 'stale_connection'] as const) {
+            assert.equal(isRecoverableTransportInterruption(
+                new SocketRequestError(code, code, true),
+            ), true);
+        }
+    });
+
+    it('replaces a socket after a connected handshake timeout or server rejection', () => {
+        assert.equal(isRecoverableTransportInterruption(
+            new SocketRequestError('timeout', 'timeout', false),
+        ), false);
+        assert.equal(isRecoverableTransportInterruption(
+            new SocketRequestError('server_error', 'rejected', false),
+        ), false);
     });
 });
