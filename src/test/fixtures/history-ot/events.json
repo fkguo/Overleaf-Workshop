@@ -80,6 +80,14 @@
           "lineStart": 55,
           "lineEnd": 79,
           "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/document-updater/app/js/HistoryOTUpdateManager.js#L55-L79"
+        },
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "services/real-time/app/js/DocumentUpdaterController.js",
+          "lineStart": 147,
+          "lineEnd": 159,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/real-time/app/js/DocumentUpdaterController.js#L147-L159"
         }
       ],
       "firstUpdate": {

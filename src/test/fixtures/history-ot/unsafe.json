@@ -1,6 +1,11 @@
 {
   "fixtureFormat": "history-ot-fixture-v1",
   "surface": "realtime-history-ot",
+  "policy": {
+    "name": "adapter-safety-policy",
+    "description": "The adapter preserves raw inputs but permits semantic use only for its closed History OT schema.",
+    "officialBehaviorNotice": "The pinned official runtime is not uniformly fail-closed here: it may accept or ignore extra fields, inspect only update.op[0], and discard unknown snapshot fields during fromRaw/toRaw."
+  },
   "cases": [
     {
       "id": "non-bmp-insert",
@@ -17,6 +22,8 @@
       ],
       "inputKind": "operations",
       "raw": [{"textOperation": ["😀"]}],
+      "expectationBasis": "official-runtime-rejection",
+      "upstreamObservation": "InsertOp rejects non-BMP insertion strings.",
       "expectedFailure": "protocol-error"
     },
     {
@@ -35,6 +42,8 @@
       "inputKind": "apply",
       "baseSnapshot": {"content": "short"},
       "raw": [{"textOperation": [99, -1]}],
+      "expectationBasis": "official-runtime-rejection",
+      "upstreamObservation": "Applying a text operation that overruns its base length fails.",
       "expectedFailure": "protocol-error"
     },
     {
@@ -52,6 +61,8 @@
       ],
       "inputKind": "operations",
       "raw": [{"opaqueOperation": {"payload": "must-not-become-text"}}],
+      "expectationBasis": "official-runtime-rejection",
+      "upstreamObservation": "EditOperationBuilder rejects an unsupported first operation.",
       "expectedFailure": "protocol-error"
     },
     {
@@ -61,10 +72,10 @@
         {
           "repository": "https://github.com/overleaf/overleaf",
           "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
-          "path": "libraries/overleaf-editor-core/lib/types.ts",
-          "lineStart": 115,
-          "lineEnd": 163,
-          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/types.ts#L115-L163"
+          "path": "services/document-updater/app/js/HistoryOTUpdateManager.js",
+          "lineStart": 26,
+          "lineEnd": 79,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/document-updater/app/js/HistoryOTUpdateManager.js#L26-L79"
         }
       ],
       "inputKind": "operations",
@@ -72,6 +83,9 @@
         {"textOperation": [3]},
         {"opaqueOperation": {"payload": "later-members-must-also-be-validated"}}
       ],
+      "expectationBasis": "adapter-safety-policy",
+      "upstreamObservation": "The document-updater validates and applies update.op[0], so later array members are not a whole-batch validation oracle.",
+      "adapterPolicy": "Validate every operation-array member before semantic use.",
       "expectedFailure": "protocol-error"
     },
     {
@@ -81,14 +95,17 @@
         {
           "repository": "https://github.com/overleaf/overleaf",
           "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
-          "path": "libraries/overleaf-editor-core/lib/types.ts",
-          "lineStart": 115,
-          "lineEnd": 163,
-          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/types.ts#L115-L163"
+          "path": "libraries/overleaf-editor-core/lib/operation/scan_op.js",
+          "lineStart": 444,
+          "lineEnd": 448,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/operation/scan_op.js#L444-L448"
         }
       ],
       "inputKind": "operations",
       "raw": [{"textOperation": [{"p": 0, "i": "legacy"}]}],
+      "expectationBasis": "adapter-safety-policy",
+      "upstreamObservation": "The official insert predicate accepts any object with a string i field and does not inspect p.",
+      "adapterPolicy": "Reject positioned REST-style scan objects on the realtime History OT surface.",
       "expectedFailure": "protocol-error"
     },
     {
@@ -98,10 +115,18 @@
         {
           "repository": "https://github.com/overleaf/overleaf",
           "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
-          "path": "libraries/overleaf-editor-core/lib/types.ts",
-          "lineStart": 31,
-          "lineEnd": 46,
-          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/types.ts#L31-L46"
+          "path": "libraries/overleaf-editor-core/lib/operation/scan_op.js",
+          "lineStart": 269,
+          "lineEnd": 284,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/operation/scan_op.js#L269-L284"
+        },
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "libraries/overleaf-editor-core/lib/file_data/tracking_props.js",
+          "lineStart": 36,
+          "lineEnd": 48,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/file_data/tracking_props.js#L36-L48"
         }
       ],
       "inputKind": "operations",
@@ -112,6 +137,9 @@
           ]
         }
       ],
+      "expectationBasis": "adapter-safety-policy",
+      "upstreamObservation": "TrackingProps.fromRaw accepts the raw type and retain parsing only special-cases type none.",
+      "adapterPolicy": "Require tracking.type to be insert, delete, or none as appropriate before semantic use.",
       "expectedFailure": "protocol-error"
     },
     {
@@ -121,10 +149,10 @@
         {
           "repository": "https://github.com/overleaf/overleaf",
           "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
-          "path": "libraries/overleaf-editor-core/lib/types.ts",
-          "lineStart": 20,
-          "lineEnd": 52,
-          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/types.ts#L20-L52"
+          "path": "libraries/overleaf-editor-core/lib/range.js",
+          "lineStart": 9,
+          "lineEnd": 22,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/range.js#L9-L22"
         }
       ],
       "inputKind": "snapshot",
@@ -141,6 +169,9 @@
           }
         ]
       },
+      "expectationBasis": "adapter-safety-policy",
+      "upstreamObservation": "Range construction rejects negative values but does not check the range against snapshot content length.",
+      "adapterPolicy": "Reject tracked ranges that extend beyond snapshot content before semantic use.",
       "expectedFailure": "protocol-error"
     },
     {
@@ -154,6 +185,14 @@
           "lineStart": 20,
           "lineEnd": 52,
           "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/types.ts#L20-L52"
+        },
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "libraries/overleaf-editor-core/lib/file_data/string_file_data.js",
+          "lineStart": 34,
+          "lineEnd": 58,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/file_data/string_file_data.js#L34-L58"
         }
       ],
       "inputKind": "snapshot",
@@ -179,6 +218,9 @@
         "$.comments[0].thread",
         "$.comments[0].ranges[0].futureAnchor"
       ],
+      "expectationBasis": "adapter-safety-policy",
+      "upstreamObservation": "StringFileData.fromRaw/toRaw reconstructs only known fields and therefore discards unknown snapshot metadata.",
+      "adapterPolicy": "Preserve the raw snapshot losslessly but reject unknown fields before semantic use.",
       "expectedFailure": "protocol-error"
     }
   ]

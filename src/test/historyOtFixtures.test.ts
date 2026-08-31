@@ -297,11 +297,24 @@ describe('History OT fixture corpus', () => {
         }
     });
 
-    it('labels unknown snapshot metadata as opaque rather than extending the official schema', () => {
+    it('separates adapter safety policy from upstream runtime observations', () => {
         const unsafe = fixtures.get('unsafe.json')!;
-        const rawCase = asArray(unsafe.cases, 'unsafe.cases')
-            .map((item, index) => asObject(item, `unsafe.cases[${index}]`))
-            .find(item => item.id === 'opaque-snapshot-fields-preserved-but-unsafe')!;
+        const cases = asArray(unsafe.cases, 'unsafe.cases')
+            .map((item, index) => asObject(item, `unsafe.cases[${index}]`));
+        const adapterPolicyIds = [
+            'opaque-later-operation',
+            'legacy-positioned-insert-is-not-history-ot-scan-op',
+            'invalid-tracking-directive',
+            'out-of-bounds-tracked-range',
+            'opaque-snapshot-fields-preserved-but-unsafe',
+        ];
+        for (const id of adapterPolicyIds) {
+            const fixtureCase = cases.find(item => item.id === id)!;
+            assert.equal(fixtureCase.expectationBasis, 'adapter-safety-policy', id);
+            assert.ok(asString(fixtureCase.upstreamObservation, `${id}.upstreamObservation`).length > 0);
+            assert.ok(asString(fixtureCase.adapterPolicy, `${id}.adapterPolicy`).length > 0);
+        }
+        const rawCase = cases.find(item => item.id === 'opaque-snapshot-fields-preserved-but-unsafe')!;
         assert.deepEqual(rawCase.opaquePaths, [
             '$.futureSnapshotMeta',
             '$.comments[0].thread',
@@ -322,6 +335,13 @@ describe('History OT fixture corpus', () => {
         for (const [index, rawCase] of cases.entries()) {
             const fixtureCase = asObject(rawCase, `unsafe.cases[${index}]`);
             assert.equal(fixtureCase.expectedFailure, 'protocol-error');
+            assert.ok(['official-runtime-rejection', 'adapter-safety-policy'].includes(
+                asString(fixtureCase.expectationBasis, `unsafe.cases[${index}].expectationBasis`),
+            ));
+            assert.ok(asString(
+                fixtureCase.upstreamObservation,
+                `unsafe.cases[${index}].upstreamObservation`,
+            ).length > 0);
             assert.ok(['operations', 'snapshot', 'apply'].includes(
                 asString(fixtureCase.inputKind, `unsafe.cases[${index}].inputKind`),
             ));

@@ -232,6 +232,54 @@ function generateTrackedDeleteSnapshot(random: SeededRandom): JsonObject {
     return {content, trackedChanges};
 }
 
+function rawTrackedDeleteRanges(snapshot: JsonObject): Range[] {
+    const rawChanges = snapshot.trackedChanges === undefined
+        ? []
+        : asArray(snapshot.trackedChanges, 'raw tracked changes');
+    return rawChanges.flatMap((rawChange, index) => {
+        const change = asObject(rawChange, `raw tracked change ${index}`);
+        const tracking = asObject(change.tracking, `raw tracked change ${index}.tracking`);
+        if (tracking.type !== 'delete') {
+            return [];
+        }
+        const range = asObject(change.range, `raw tracked change ${index}.range`);
+        return [{
+            pos: asNumber(range.pos, 'raw range.pos'),
+            length: asNumber(range.length, 'raw range.length'),
+        }];
+    }).sort((left, right) => left.pos - right.pos);
+}
+
+function rawSnapshotOffsetToVisible(snapshot: JsonObject, offset: number): number {
+    let hiddenLength = 0;
+    for (const range of rawTrackedDeleteRanges(snapshot)) {
+        if (offset < range.pos) {
+            break;
+        }
+        if (offset <= range.pos + range.length) {
+            return range.pos - hiddenLength;
+        }
+        hiddenLength += range.length;
+    }
+    return offset - hiddenLength;
+}
+
+function rawVisibleOffsetToSnapshot(
+    snapshot: JsonObject,
+    offset: number,
+    affinity: 'left' | 'right',
+): number {
+    let hiddenLength = 0;
+    for (const range of rawTrackedDeleteRanges(snapshot)) {
+        const boundary = range.pos - hiddenLength;
+        if (affinity === 'left' ? offset <= boundary : offset < boundary) {
+            return offset + hiddenLength;
+        }
+        hiddenLength += range.length;
+    }
+    return offset + hiddenLength;
+}
+
 describe('source-derived History OT behavior', () => {
     const snapshotsFixture = loadFixture('snapshots.json');
     const operationsFixture = loadFixture('operations.json');
@@ -360,9 +408,14 @@ describe('source-derived History OT behavior', () => {
         assert.equal(historyOt.getVisibleHistoryOtText(result), fixtureCase.desiredVisibleText);
     });
 
-    it('fails closed on malformed, opaque, non-BMP, and wrong-surface inputs', () => {
+    it('enforces official rejections and the stricter adapter safety policy', () => {
         for (const [index, rawCase] of asArray(unsafeFixture.cases, 'unsafe cases').entries()) {
             const fixtureCase = asObject(rawCase, `unsafe case ${index}`);
+            const expectationBasis = asString(fixtureCase.expectationBasis, 'expectationBasis');
+            assert.ok(['official-runtime-rejection', 'adapter-safety-policy'].includes(expectationBasis));
+            if (expectationBasis === 'adapter-safety-policy') {
+                assert.ok(asString(fixtureCase.adapterPolicy, 'adapterPolicy').length > 0);
+            }
             const kind = asString(fixtureCase.inputKind, 'inputKind');
             if (kind === 'operations') {
                 assertProtocolError(() => {
@@ -394,10 +447,11 @@ describe('source-derived History OT behavior', () => {
         }, 'non-BMP text-update builder');
     });
 
-    it('preserves unknown snapshot fields exactly but fails closed before semantic use', () => {
+    it('preserves opaque fields losslessly under the adapter safety policy', () => {
         const rawCase = asArray(unsafeFixture.cases, 'unsafe cases')
             .map((item, index) => asObject(item, `unsafe case ${index}`))
             .find(item => item.id === 'opaque-snapshot-fields-preserved-but-unsafe')!;
+        assert.equal(rawCase.expectationBasis, 'adapter-safety-policy');
         const original = asJson(rawCase.raw, 'opaque snapshot');
         const parsed = historyOt.parseHistoryOtSnapshot(original);
         assert.deepEqual(rawSnapshot(parsed), original);
@@ -412,36 +466,39 @@ describe('source-derived History OT behavior', () => {
 });
 
 describe('deterministic History OT algebraic properties', () => {
-    it('converges for same-position inserts and an insert concurrent with deletion', () => {
-        const cases: Array<{content: string, left: JsonValue[], right: JsonValue[]}> = [
-            {
-                content: 'abcdef',
-                left: [{textOperation: [2, 'L', 4]}],
-                right: [{textOperation: [2, 'R', 4]}],
-            },
-            {
-                content: 'abcdef',
-                left: [{textOperation: [1, -3, 2]}],
-                right: [{textOperation: [2, 'X', 4]}],
-            },
-        ];
-        for (const [caseIndex, fixtureCase] of cases.entries()) {
-            const snapshot = parsedSnapshot({content: fixtureCase.content});
-            const left = parsedOperations(fixtureCase.left);
-            const right = parsedOperations(fixtureCase.right);
-            const [leftPrime, rightPrime] = historyOt.transformHistoryOtOperations(left, right);
-            const leftThenRight = historyOt.applyHistoryOtOperations(
-                historyOt.applyHistoryOtOperations(snapshot, left), rightPrime,
-            );
-            const rightThenLeft = historyOt.applyHistoryOtOperations(
-                historyOt.applyHistoryOtOperations(snapshot, right), leftPrime,
-            );
-            assert.deepEqual(
-                rawSnapshot(leftThenRight),
-                rawSnapshot(rightThenLeft),
-                diagnostic(0, caseIndex, fixtureCase),
-            );
-        }
+    const operationsFixture = loadFixture('operations.json');
+
+    it('uses the official operation1 tie-break and converges with concurrent deletion', () => {
+        const tieBreak = asObject(operationsFixture.samePositionInsertTransform, 'insert tie-break');
+        const snapshot = parsedSnapshot(asJson(tieBreak.baseSnapshot, 'tie-break snapshot'));
+        const operation1 = parsedOperations(asJson(tieBreak.operation1, 'operation1'));
+        const operation2 = parsedOperations(asJson(tieBreak.operation2, 'operation2'));
+        const [operation1Prime, operation2Prime] = historyOt.transformHistoryOtOperations(
+            operation1, operation2,
+        );
+        assert.deepEqual(rawOperations(operation1Prime), tieBreak.expectedOperation1Prime);
+        assert.deepEqual(rawOperations(operation2Prime), tieBreak.expectedOperation2Prime);
+        const operation1Then2Prime = historyOt.applyHistoryOtOperations(
+            historyOt.applyHistoryOtOperations(snapshot, operation1), operation2Prime,
+        );
+        const operation2Then1Prime = historyOt.applyHistoryOtOperations(
+            historyOt.applyHistoryOtOperations(snapshot, operation2), operation1Prime,
+        );
+        assert.deepEqual(rawSnapshot(operation1Then2Prime), tieBreak.expectedSnapshot);
+        assert.deepEqual(rawSnapshot(operation2Then1Prime), tieBreak.expectedSnapshot);
+
+        const concurrentSnapshot = parsedSnapshot({content: 'abcdef'});
+        const left = parsedOperations([{textOperation: [1, -3, 2]}]);
+        const right = parsedOperations([{textOperation: [2, 'X', 4]}]);
+        const [leftPrime, rightPrime] = historyOt.transformHistoryOtOperations(left, right);
+        assert.deepEqual(
+            rawSnapshot(historyOt.applyHistoryOtOperations(
+                historyOt.applyHistoryOtOperations(concurrentSnapshot, left), rightPrime,
+            )),
+            rawSnapshot(historyOt.applyHistoryOtOperations(
+                historyOt.applyHistoryOtOperations(concurrentSnapshot, right), leftPrime,
+            )),
+        );
     });
 
     it('round-trips generated BMP, CRLF, and combining-mark operations', () => {
@@ -553,24 +610,53 @@ describe('deterministic History OT algebraic properties', () => {
         for (let caseIndex = 0; caseIndex < propertyCaseCount; caseIndex += 1) {
             const raw = generateTrackedDeleteSnapshot(random);
             const snapshot = parsedSnapshot(raw);
-            const visibleLength = historyOt.getVisibleHistoryOtText(snapshot).length;
+            const contentLength = asString(raw.content, 'content').length;
+            const hiddenLength = rawTrackedDeleteRanges(raw)
+                .reduce((total, range) => total + range.length, 0);
+            const visibleLength = contentLength - hiddenLength;
             let previous = -1;
-            for (let offset = 0; offset <= asString(raw.content, 'content').length; offset += 1) {
+            for (let offset = 0; offset <= contentLength; offset += 1) {
                 const mapped = historyOt.snapshotOffsetToVisible(snapshot, offset);
                 const message = diagnostic(seed, caseIndex, {snapshot: raw, offset, mapped});
+                assert.equal(mapped, rawSnapshotOffsetToVisible(raw, offset), message);
                 assert.ok(mapped >= previous, message);
                 assert.ok(mapped >= 0 && mapped <= visibleLength, message);
                 previous = mapped;
             }
             for (let offset = 0; offset <= visibleLength; offset += 1) {
-                const snapshotOffset = historyOt.visibleOffsetToSnapshot(snapshot, offset);
+                const snapshotOffset = historyOt.visibleOffsetToSnapshot(snapshot, offset, 'left');
+                const rightSnapshotOffset = historyOt.visibleOffsetToSnapshot(snapshot, offset, 'right');
+                const message = diagnostic(seed, caseIndex, {snapshot: raw, offset, snapshotOffset});
+                assert.equal(snapshotOffset, rawVisibleOffsetToSnapshot(raw, offset, 'left'), message);
+                assert.equal(rightSnapshotOffset, rawVisibleOffsetToSnapshot(raw, offset, 'right'), message);
                 assert.equal(
-                    historyOt.snapshotOffsetToVisible(snapshot, snapshotOffset),
+                    rawSnapshotOffsetToVisible(raw, snapshotOffset),
                     offset,
-                    diagnostic(seed, caseIndex, {snapshot: raw, offset, snapshotOffset}),
+                    message,
                 );
             }
         }
+    });
+
+    it('preserves tracked insert/delete metadata in builder wire and snapshot output', () => {
+        const fixtureCase = asObject(operationsFixture.trackedTextUpdate, 'tracked text update');
+        const rawEdit = asObject(fixtureCase.edit, 'tracked edit');
+        const rawTracking = asObject(rawEdit.tracking, 'tracked edit tracking');
+        const edit: TextEdit = {
+            pos: asNumber(rawEdit.pos, 'tracked edit.pos'),
+            deleteLength: asNumber(rawEdit.deleteLength, 'tracked edit.deleteLength'),
+            insertText: asString(rawEdit.insertText, 'tracked edit.insertText'),
+            tracking: {
+                userId: asString(rawTracking.userId, 'tracked edit userId'),
+                ts: asString(rawTracking.ts, 'tracked edit timestamp'),
+            },
+        };
+        const snapshot = parsedSnapshot(asJson(fixtureCase.baseSnapshot, 'tracked builder snapshot'));
+        const operations = historyOt.buildHistoryOtTextUpdate(snapshot, [edit]);
+        assert.deepEqual(rawOperations(operations), fixtureCase.expectedOperations);
+        const result = historyOt.applyHistoryOtOperations(snapshot, operations);
+        assert.deepEqual(rawSnapshot(result), fixtureCase.expectedSnapshot);
+        assert.equal(historyOt.getVisibleHistoryOtText(result), fixtureCase.expectedVisibleText);
     });
 
     it('builds plain and tracked source-coordinate edits with the requested visible result', () => {
