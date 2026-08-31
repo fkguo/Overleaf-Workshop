@@ -1,9 +1,11 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import * as stream from 'stream';
 import * as FormData from 'form-data';
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'crypto';
 import { fetch } from 'undici';
-import { FileEntity, FileType, FolderEntity, OutputFileEntity } from '../core/remoteFileSystemProvider';
+import { FileEntity, FileType, FolderEntity } from '../core/remoteFileSystemProvider';
+import { downloadWithRanges } from './httpDownload';
+import { HttpMethod, shouldRetryHttpRequest } from './httpRequestPolicy';
 
 /** Extract set-cookie headers from an undici/Response object. */
 function getSetCookie(res: any): string[] {
@@ -11,7 +13,7 @@ function getSetCookie(res: any): string[] {
         return res.headers.getSetCookie();
     }
     const raw = res.headers?.raw?.()?.['set-cookie'];
-    if (raw) return raw;
+    if (raw) { return raw; }
     return [];
 }
 
@@ -20,27 +22,76 @@ export interface Identity {
     cookies: string;
 }
 
+interface RequestOptions {
+    timeoutMs?: number;
+    maxRetries?: number;
+}
+
 export interface NewProjectResponseSchema {
     project_id: string,
     owner_ref: string,
     owner: MemberEntity
 }
 
+export type CompileStatus =
+    | 'success'
+    | 'failure'
+    | 'error'
+    | 'stopped-on-first-error'
+    | 'clsi-maintenance'
+    | 'clsi-unavailable'
+    | 'compile-in-progress'
+    | 'conflict'
+    | 'exited'
+    | 'missing-updates'
+    | 'project-too-large'
+    | 'rate-limited'
+    | 'terminated'
+    | 'too-recently-compiled'
+    | 'timedout'
+    | 'autocompile-backoff'
+    | 'autocompile-disabled'
+    | 'unavailable'
+    | 'validation-problems'
+    | 'validation-fail'
+    | 'validation-pass';
+
+export interface CompileOutputFileSchema {
+    url: string;
+    downloadURL?: string;
+    build: string;
+    path: string;
+    type: string;
+    size?: number;
+    editorId?: string;
+    ranges?: unknown;
+    contentId?: string;
+}
+
 export interface CompileResponseSchema {
-    status: 'success' | 'failure' | 'error';
-    compileGroup: string;
+    status: CompileStatus;
+    compileGroup?: string;
     clsiServerId?: string;
+    clsiCacheShard?: string;
     pdfDownloadDomain?: string;
-    outputFiles: Array<OutputFileEntity>;
-    stats: {
+    pdfCachingMinChunkSize?: number;
+    outputFiles: Array<CompileOutputFileSchema>;
+    stats?: {
         "latexmk-errors":number, "pdf-size":number,
         "latex-runs":number, "latex-runs-with-errors":number,
         "latex-runs-0":number, "latex-runs-with-error-0s":number,
     };
-    timings: {
+    timings?: {
         "sync":number, "compile":number, "output":number, "compileE2E":number,
     };
-    enableHybridPdfDownload: boolean;
+    validationProblems?: unknown;
+    enableHybridPdfDownload?: boolean;
+    fromCache?: boolean;
+    options?: {
+        rootResourcePath?: string | null,
+        draft?: boolean,
+        stopOnFirstError?: boolean,
+    };
 }
 
 export interface SyncPdfResponseSchema {
@@ -49,15 +100,13 @@ export interface SyncPdfResponseSchema {
     column: number
 }
 
-export interface SyncCodeResponseSchema {
-    pdf: Array<{
-        page: number,
-        h: number,
-        v: number,
-        width: number,
-        height: number,
-    }>
-}
+export type SyncCodeResponseSchema = Array<{
+    page: number,
+    h: number,
+    v: number,
+    width: number,
+    height: number,
+}>;
 
 export interface SnippetItemSchema {
     meta: string,
@@ -114,16 +163,24 @@ export interface ProjectTagsResponseSchema {
 export interface ProjectLabelResponseSchema {
     id: string,
     comment: string,
-    version: string,
+    version: number | string,
     user_id: string,
-    created_at: number,
+    created_at: number | string,
     user_display_name?: string,
 }
 
 export interface ProjectUpdateMeta {
-    users: {id:string, first_name:string, last_name?:string, email:string}[],
+    users: ({id:string, first_name:string, last_name?:string, email:string} | null)[],
     start_ts: number,
     end_ts: number,
+    type?: string,
+    source?: string,
+    origin?: string | {
+        kind: string,
+        path?: string,
+        timestamp?: string | number,
+        version?: number,
+    },
 }
 
 export interface ProjectHistoryResponseSchema {
@@ -135,20 +192,23 @@ export interface ProjectHistoryResponseSchema {
     project_ops:{
         add?: {pathname:string},
         remove?: {pathname:string},
+        rename?: {pathname:string, newPathname:string},
         atV: number,
     }[],
 }
 
 export interface ProjectUpdateResponseSchema {
     updates: ProjectHistoryResponseSchema[],
-    nextBeforeTimestamp: number,
+    nextBeforeTimestamp?: number,
+}
+
+export interface ProjectFileDiffChunkSchema {
+        u?: string, d?: string, i?: string,
+        meta?: ProjectUpdateMeta,
 }
 
 export interface ProjectFileDiffResponseSchema {
-    diff: {
-        u?: string, d?: string, i?: string,
-        meta?: ProjectUpdateMeta,
-    }[]
+    diff?: ProjectFileDiffChunkSchema[] | {binary: true},
 }
 
 export interface ProjectFileTreeDiffResponseSchema {
@@ -247,19 +307,23 @@ export class BaseAPI {
 
     // Reference: "github:overleaf/overleaf/services/web/frontend/js/ide/connection/ConnectionManager.js#L137"
     _initSocketV0(identity:Identity, query?:string) {
-        const url = new URL(this.url).origin + (query ?? '');
-        return (require('socket.io-client').connect as any)(url, {
-            // Enable auto-reconnect to avoid creating new TCP connections on transient failures.
-            // Creating new connections without proper teardown of old ones causes TCP RST packets
-            // when the server sends data on abandoned connections (see issue #309).
-            // Note: socket.io-client 0.9.x uses space-separated option names.
-            reconnect: true,
-            'reconnection delay': 1000,
-            'reconnection limit': 16000,
-            'max reconnection attempts': 10,
+        const origin = new URL(this.url).origin;
+        // socket.io-client 0.9.x builds each handshake from options.query.
+        // Keep the project identity there explicitly, matching Overleaf's client.
+        const socketQuery = (query ?? '').replace(/^\?/, '');
+        console.log(
+            'SocketIOAPI: opening realtime transport',
+            socketQuery ? '(project query configured)' : '(legacy queryless mode)',
+        );
+        return (require('socket.io-client').connect as any)(origin, {
+            // Overleaf drives reconnects explicitly. The legacy client's automatic
+            // reconnect path can reuse a failed transport after a proxy 502.
+            reconnect: false,
+            'auto connect': false,
             'force new connection': true,
+            query: socketQuery,
             extraHeaders: {
-                'Origin': new URL(this.url).origin,
+                'Origin': origin,
                 'Cookie': identity.cookies,
             }
         });
@@ -349,45 +413,32 @@ export class BaseAPI {
         return this;
     }
 
-    /**
-     * Check if an HTTP error is transient (worth retrying).
-     * Retries on: 5xx server errors, network errors (fetch failures), and 429 rate limiting.
-     */
-    private isTransientError(statusCode: number | undefined, errorMessage?: string): boolean {
-        if (statusCode === undefined) {
-            // Network-level error (DNS, connection refused, reset, timeout)
-            return true;
-        }
-        // Server errors and rate limiting
-        if (statusCode >= 500 || statusCode === 429) {
-            return true;
-        }
-        // Common transient network error messages
-        if (errorMessage && (
-            errorMessage.includes('ECONNRESET') ||
-            errorMessage.includes('ETIMEDOUT') ||
-            errorMessage.includes('ECONNREFUSED') ||
-            errorMessage.includes('ENOTFOUND') ||
-            errorMessage.includes('socket hang up')
-        )) {
-            return true;
-        }
-        return false;
-    }
-
-    protected async request(type:'GET'|'POST'|'PUT'|'DELETE', route:string, body?:FormData|object, callback?: (res?:string)=>object|undefined, extraHeaders?:object ): Promise<ResponseSchema> {
+    protected async request(
+        type:HttpMethod,
+        route:string,
+        body?:FormData|object,
+        callback?: (res?:string)=>object|undefined,
+        extraHeaders?:object,
+        options?:RequestOptions,
+    ): Promise<ResponseSchema> {
         if (this.identity===undefined) { return Promise.reject(); }
 
-        const MAX_HTTP_RETRIES = 2;
+        const maxHttpRetries = options?.maxRetries ?? 2;
         let lastError: {statusCode?: number, message?: string} = {};
 
-        for (let attempt = 0; attempt <= MAX_HTTP_RETRIES; attempt++) {
+        for (let attempt = 0; attempt <= maxHttpRetries; attempt++) {
+            const abortController = options?.timeoutMs ? new AbortController() : undefined;
+            const abortTimer = abortController ? setTimeout(
+                () => abortController.abort(),
+                options!.timeoutMs,
+            ) : undefined;
             try {
                 let res = undefined;
                 switch(type) {
                     case 'GET':
                         res = await fetch(this.url+route, {
                             method: 'GET', redirect: 'manual',
+                            signal: abortController?.signal,
                             headers: {
                                 'Connection': 'keep-alive',
                                 'Cookie': this.identity!.cookies,
@@ -403,6 +454,7 @@ export class BaseAPI {
                         });
                         res = await fetch(this.url+route, {
                             method: 'POST', redirect: 'manual',
+                            signal: abortController?.signal,
                             headers: {
                                 'Connection': 'keep-alive',
                                 'Cookie': this.identity!.cookies,
@@ -417,6 +469,7 @@ export class BaseAPI {
                     case 'DELETE':
                         res = await fetch(this.url+route, {
                             method: 'DELETE', redirect: 'manual',
+                            signal: abortController?.signal,
                             headers: {
                                 'Connection': 'keep-alive',
                                 'Cookie': this.identity!.cookies,
@@ -434,10 +487,10 @@ export class BaseAPI {
                         type: 'success',
                         ...response
                     } as ResponseSchema;
-                } else if (res && this.isTransientError(res.status) && attempt < MAX_HTTP_RETRIES) {
+                } else if (res && shouldRetryHttpRequest(type, res.status) && attempt < maxHttpRetries) {
                     // Transient error: retry with backoff
                     const delayMs = Math.min(1000 * Math.pow(2, attempt), 4000);
-                    console.log(`HTTP ${res.status} on ${route}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_HTTP_RETRIES})`);
+                    console.log(`HTTP ${res.status} on ${route}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${maxHttpRetries})`);
                     lastError = {statusCode: res.status, message: await res.text().catch(() => '')};
                     await new Promise(r => setTimeout(r, delayMs));
                     continue;
@@ -451,10 +504,12 @@ export class BaseAPI {
                     };
                 }
             } catch (err: any) {
-                const errMsg = err?.message || String(err);
-                if (this.isTransientError(undefined, errMsg) && attempt < MAX_HTTP_RETRIES) {
+                const errMsg = [err?.message, err?.cause?.code, err?.cause?.message]
+                    .filter(Boolean)
+                    .join(': ') || String(err);
+                if (shouldRetryHttpRequest(type, undefined, errMsg) && attempt < maxHttpRetries) {
                     const delayMs = Math.min(1000 * Math.pow(2, attempt), 4000);
-                    console.log(`HTTP fetch error on ${route}: ${errMsg}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_HTTP_RETRIES})`);
+                    console.log(`HTTP fetch error on ${route}: ${errMsg}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${maxHttpRetries})`);
                     await new Promise(r => setTimeout(r, delayMs));
                     continue;
                 }
@@ -462,40 +517,28 @@ export class BaseAPI {
                     type: 'error',
                     message: errMsg
                 };
+            } finally {
+                if (abortTimer) { clearTimeout(abortTimer); }
             }
         }
 
         // All retries exhausted
         return {
             type: 'error',
-            message: lastError.message || `Request failed after ${MAX_HTTP_RETRIES + 1} attempts`
+            message: lastError.message || `Request failed after ${maxHttpRetries + 1} attempts`
         };
     }
 
     protected async download(route:string) {
         if (this.identity===undefined) { return Promise.reject(); }
-
-        let content: Buffer[] = [];
-        while(true) {
-            const res = await fetch(this.url+route, {
-                method: 'GET', redirect: 'manual',
-                headers: {
-                    'Connection': 'keep-alive',
-                    'Cookie': this.identity.cookies,
-                }
-            });
-            if (res.status===200) {
-                content.push(Buffer.from(await res.arrayBuffer()));
-                break;
-            }
-            else if (res.status===206) {
-                content.push(Buffer.from(await res.arrayBuffer()));
-            } else {
-                break;
-            }
-        };
-
-        return Buffer.concat(content);
+        return downloadWithRanges(
+            this.url + route,
+            {
+                'Connection': 'keep-alive',
+                'Cookie': this.identity.cookies,
+            },
+            (url, init) => fetch(url, init),
+        );
     }
 
     async logout(identity:Identity): Promise<ResponseSchema> {
@@ -583,8 +626,8 @@ export class BaseAPI {
         this.setIdentity(identity);
         const content = await this.download(`project/${projectId}/file/${fileId}`);
         return {
-            type: 'success',
-            content: new Uint8Array( content )
+            type: 'success' as const,
+            content: new Uint8Array(content),
         };
     }
 
@@ -615,7 +658,7 @@ export class BaseAPI {
     }
 
     async uploadProject(identity:Identity, filename:string, fileContent:Uint8Array) {
-        const uuid = uuidv4();
+        const uuid = randomUUID();
         const fileStream = stream.Readable.from(fileContent);
         const formData = new FormData();
         formData.append('qqfile', fileStream, {filename});
@@ -660,21 +703,32 @@ export class BaseAPI {
     }
 
     async compile(identity:Identity, projectId:string, rootResourcePath:string|null,
-        draft:boolean=false, stopOnFirstError:boolean=false
+        draft:boolean=false, stopOnFirstError:boolean=false, editorId?: string,
+        isAutoCompile:boolean=false,
     ) {
         const body = {
             check: 'silent',
             draft,
             incrementalCompilesEnabled: true,
             rootResourcePath,   // file path e.g. "main.tex"
-            stopOnFirstError
+            stopOnFirstError,
+            editorId,
         };
 
         this.setIdentity(identity);
-        return this.request('POST', `project/${projectId}/compile?auto_compile=true`, body, (res) => {
+        const query = isAutoCompile ? '?auto_compile=true' : '';
+        return this.request('POST', `project/${projectId}/compile${query}`, body, (res) => {
             const compile = JSON.parse(res!) as CompileResponseSchema;
             return {compile};
         }, {'X-Csrf-Token': identity.csrfToken});
+    }
+
+    async getCachedCompile(identity:Identity, projectId:string) {
+        this.setIdentity(identity);
+        return this.request('GET', `project/${projectId}/output/cached/output.overleaf.json`, undefined, (res) => {
+            const compile = JSON.parse(res!) as CompileResponseSchema;
+            return {compile};
+        }, undefined, {timeoutMs: 5000, maxRetries: 0});
     }
 
     async stopCompile(identity:Identity, projectId:string) {
@@ -763,7 +817,7 @@ export class BaseAPI {
                 `&clsiserverid=${encodeURIComponent(clsiServerId)}` +
                 `&enable_pdf_caching=true`;
             const content = await this._downloadAbsolute(cdnUrl, false);
-            return { type: 'success', content: new Uint8Array(content) };
+            return {type: 'success' as const, content: new Uint8Array(content)};
         }
 
         // Fallback: download from web frontend (legacy path)
@@ -771,8 +825,8 @@ export class BaseAPI {
         this.setIdentity(identity);
         const content = await this.download(url);
         return {
-            type: 'success',
-            content: new Uint8Array( content )
+            type: 'success' as const,
+            content: new Uint8Array(content),
         };
     }
 
@@ -784,37 +838,37 @@ export class BaseAPI {
         if (includeCookies && this.identity) {
             headers['Cookie'] = this.identity.cookies;
         }
-        let content: Buffer[] = [];
-        while (true) {
-            const res = await fetch(absoluteUrl, {
-                method: 'GET', redirect: 'manual',
-                headers
-            });
-            if (res.status === 200) {
-                content.push(Buffer.from(await res.arrayBuffer()));
-                break;
-            } else if (res.status === 206) {
-                content.push(Buffer.from(await res.arrayBuffer()));
-            } else {
-                break;
-            }
-        }
-        return Buffer.concat(content);
+        return downloadWithRanges(absoluteUrl, headers, (url, init) => fetch(url, init));
     }
 
-    async proxySyncPdf(identity:Identity, projectId:string, page:number, h:number, v:number, buildId:string) {
+    async proxySyncPdf(identity:Identity, projectId:string, page:number, h:number, v:number, editorId:string, buildId:string, clsiServerId?: string) {
         this.setIdentity(identity);
-        const request = `project/${projectId}/sync/pdf?page=${page}&h=${h.toFixed(2)}&v=${v.toFixed(2)}&editorId=${uuidv4()}&buildId=${buildId}`;
-        return this.request('GET', `project/${projectId}/sync/pdf?page=${page}&h=${h.toFixed(2)}&v=${v.toFixed(2)}&editorId=${uuidv4()}&buildId=${buildId}`,
+        const params = new URLSearchParams({
+            page: String(page),
+            h: h.toFixed(2),
+            v: v.toFixed(2),
+            editorId,
+        });
+        params.set('buildId', buildId);
+        if (clsiServerId) { params.set('clsiserverid', clsiServerId); }
+        return this.request('GET', `project/${projectId}/sync/pdf?${params.toString()}`,
                             undefined, (res) => {
                                 const syncPdf = (JSON.parse(res!) as any).code[0] as SyncPdfResponseSchema;
                                 return {syncPdf};
                             });
     }
 
-    async proxySyncCode(identity:Identity, projectId:string, file:string, line:number, column:number, buildId:string) {
+    async proxySyncCode(identity:Identity, projectId:string, file:string, line:number, column:number, editorId:string, buildId:string, clsiServerId?: string) {
         this.setIdentity(identity);
-        return this.request('GET', `project/${projectId}/sync/code?file=${file}&line=${line}&column=${column}&editorId=${uuidv4()}&buildId=${buildId}`,
+        const params = new URLSearchParams({
+            file,
+            line: String(line),
+            column: String(column),
+            editorId,
+        });
+        params.set('buildId', buildId);
+        if (clsiServerId) { params.set('clsiserverid', clsiServerId); }
+        return this.request('GET', `project/${projectId}/sync/code?${params.toString()}`,
                             undefined, (res) => {
                                 const syncCode = (JSON.parse(res!) as any).pdf as SyncCodeResponseSchema;
                                 return {syncCode};
@@ -858,7 +912,7 @@ export class BaseAPI {
     }
 
     async proxyToHistoryApiAndGetUpdates(identity:Identity, projectId:string, before?:number) {
-        const beforeQuery = before? `&before=${before}` : '';
+        const beforeQuery = before !== undefined ? `&before=${before}` : '';
 
         this.setIdentity(identity);
         return this.request('GET', `project/${projectId}/updates?min_count=10${beforeQuery}`, undefined, (res) => {
@@ -868,8 +922,13 @@ export class BaseAPI {
     }
 
     async proxyToHistoryApiAndGetFileDiff(identity:Identity, projectId:string, pathname:string, from:number, to:number) {
+        const params = new URLSearchParams({
+            pathname,
+            from: String(from),
+            to: String(to),
+        });
         this.setIdentity(identity);
-        return this.request('GET', `project/${projectId}/diff?pathname=${pathname}&from=${from}&to=${to}`, undefined, (res) => {
+        return this.request('GET', `project/${projectId}/diff?${params.toString()}`, undefined, (res) => {
             const diff = JSON.parse(res!) as ProjectFileDiffResponseSchema;
             return {diff};
         });
@@ -887,8 +946,8 @@ export class BaseAPI {
         this.setIdentity(identity);
         const content = await this.download(`project/${projectId}/version/${version}/zip`);
         return {
-            type: 'success',
-            content: new Uint8Array(content)
+            type: 'success' as const,
+            content: new Uint8Array(content),
         };
     }
 

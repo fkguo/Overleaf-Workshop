@@ -4,6 +4,7 @@ import { ProjectTagsResponseSchema } from '../api/base';
 import { GlobalStateManager } from '../utils/globalStateManager';
 import { VirtualFileSystem, parseUri } from './remoteFileSystemProvider';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
+import { openProjectFolder } from './projectNavigation';
 
 class DataItem extends vscode.TreeItem {
     constructor(
@@ -81,7 +82,7 @@ class ProjectItem extends DataItem {
     }
 }
 
-export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem> {
+export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>, vscode.Disposable {
     constructor(
         private context:vscode.ExtensionContext) {
         this.context = context;
@@ -93,6 +94,10 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
 
     refresh(): void {
         this._onDidChangeTreeData.fire();
+    }
+
+    dispose(): void {
+        this._onDidChangeTreeData.dispose();
     }
 
     getTreeItem(element: DataItem): vscode.TreeItem {
@@ -549,21 +554,20 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
 
     openProjectInCurrentWindow(project: ProjectItem) {
         const uri = vscode.Uri.parse(project.uri);
-        vscode.commands.executeCommand('remoteFileSystem.prefetch', uri)
-        .then(() => {
-            vscode.commands.executeCommand('vscode.openFolder', uri, false);
-            vscode.commands.executeCommand('workbench.view.explorer');
-        });
+        return openProjectFolder(
+            (command, ...args) => vscode.commands.executeCommand(command, ...args),
+            uri,
+            false,
+        );
     }
 
     openProjectInNewWindow(project: ProjectItem) {
         const uri = vscode.Uri.parse(project.uri);
-        vscode.commands.executeCommand('remoteFileSystem.prefetch', uri)
-        .then(() => {
-            vscode.commands.executeCommand('vscode.openFolder', uri, true);
-            vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
-            vscode.commands.executeCommand('workbench.view.explorer');
-        });
+        return openProjectFolder(
+            (command, ...args) => vscode.commands.executeCommand(command, ...args),
+            uri,
+            true,
+        );
     }
 
     async openProjectLocalReplica(project: ProjectItem) {
@@ -645,8 +649,9 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
         });
     }
 
-    get triggers() {
+    get triggers(): vscode.Disposable[] {
         return [
+            this,
             // register tree data provider
             vscode.window.registerTreeDataProvider(`${ROOT_NAME}.projectManager`, this),
             // register server-related commands
@@ -708,10 +713,10 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
             }),
             // register open project commands
             vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.openProjectInCurrentWindow`, (item) => {
-                this.openProjectInCurrentWindow(item);
+                return this.openProjectInCurrentWindow(item);
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.openProjectInNewWindow`, (item) => {
-                this.openProjectInNewWindow(item);
+                return this.openProjectInNewWindow(item);
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.openProjectLocalReplica`, (item) => {
                 this.openProjectLocalReplica(item);

@@ -1,8 +1,8 @@
 import * as vscode from 'vscode';
-import * as DiffMatchPatch from 'diff-match-patch';
 import { minimatch } from 'minimatch';
 import { BaseSCM, CommitItem, SettingItem } from ".";
 import { VirtualFileSystem, parseUri } from '../core/remoteFileSystemProvider';
+import { reconcileReplicaContents } from './localReplicaSafety';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
 
@@ -38,6 +38,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private bypassCache: Map<string, [FileCache,FileCache]> = new Map();
     private baseCache: {[key:string]: Uint8Array} = {};
+    private blockedConflictPaths = new Set<string>();
     private vfsWatcher?: vscode.FileSystemWatcher;
     private localWatcher?: vscode.FileSystemWatcher;
     private ignorePatterns: string[] = [
@@ -206,74 +207,158 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return true;
     }
 
+    private async collectEntries(source: 'remote' | 'local', root: string='/') {
+        const entries = new Map<string, vscode.FileType>();
+        const queue: string[] = [root];
+        while (queue.length > 0) {
+            const nextRoot = queue.shift()!;
+            const uri = source === 'remote' ?
+                this.vfs.pathToUri(nextRoot) : vscode.Uri.joinPath(this.baseUri, nextRoot);
+            for (const [name, type] of await vscode.workspace.fs.readDirectory(uri)) {
+                const relPath = nextRoot + name;
+                if (this.matchIgnorePatterns(relPath)) { continue; }
+                entries.set(relPath, type);
+                if (type === vscode.FileType.Directory) {
+                    queue.push(relPath + '/');
+                }
+            }
+        }
+        return entries;
+    }
+
+    private async readCurrentFile(uri: vscode.Uri): Promise<Uint8Array | undefined> {
+        try {
+            const stat = await vscode.workspace.fs.stat(uri);
+            if (stat.type !== vscode.FileType.File) {
+                throw new Error(`Replica path changed type while synchronizing: ${uri.toString()}`);
+            }
+            return await vscode.workspace.fs.readFile(uri);
+        } catch (error: any) {
+            if (error?.code === 'FileNotFound') { return undefined; }
+            throw error;
+        }
+    }
+
     private async overwrite(root: string='/'): Promise<boolean|undefined> {
         return await vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
             title: vscode.l10n.t('Sync Files'),
             cancellable: true,
         }, async (progress, token) => {
-            // breadth-first search for the files
-            const files: [string,string][] = [];
-            const queue: string[] = [root];
-            while (queue.length!==0) {
-                const nextRoot = queue.shift();
-                const vfsUri = this.vfs.pathToUri(nextRoot!);
-                const items = await vscode.workspace.fs.readDirectory(vfsUri);
-                if (token.isCancellationRequested) { return undefined; }
-                //
-                for (const [name, type] of items) {
-                    const relPath = nextRoot + name;
-                    if (this.matchIgnorePatterns(relPath)) {
-                        continue;
-                    }
-                    if (type === vscode.FileType.Directory) {
-                        queue.push(relPath+'/');
-                    } else {
-                        files.push([name, relPath]);
-                    }
+            const [remoteEntries, localEntries] = await Promise.all([
+                this.collectEntries('remote', root),
+                this.collectEntries('local', root),
+            ]);
+            if (token.isCancellationRequested) { return undefined; }
+
+            const conflicts: string[] = [];
+            const allPaths = new Set([...remoteEntries.keys(), ...localEntries.keys()]);
+            const directories = [...allPaths]
+                .filter(path => remoteEntries.get(path) === vscode.FileType.Directory ||
+                    localEntries.get(path) === vscode.FileType.Directory)
+                .sort((left, right) => left.split('/').length - right.split('/').length);
+            for (const relPath of directories) {
+                const remoteType = remoteEntries.get(relPath);
+                const localType = localEntries.get(relPath);
+                if (remoteType !== undefined && localType !== undefined && remoteType !== localType) {
+                    this.blockedConflictPaths.add(relPath);
+                    conflicts.push(relPath);
+                    continue;
+                }
+                if (remoteType === undefined) {
+                    await vscode.workspace.fs.createDirectory(this.vfs.pathToUri(relPath));
+                    this.setBypassCache(relPath, new Uint8Array());
+                } else if (localType === undefined) {
+                    await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(this.baseUri, relPath));
+                    this.setBypassCache(relPath, new Uint8Array());
                 }
             }
 
-            // sync the files
+            const hasBlockedAncestor = (path: string) => conflicts.some(conflict =>
+                path === conflict || path.startsWith(conflict + '/')
+            );
+            const files = [...allPaths].filter(path =>
+                !hasBlockedAncestor(path) &&
+                (remoteEntries.get(path) !== vscode.FileType.Directory) &&
+                (localEntries.get(path) !== vscode.FileType.Directory)
+            );
             const total = files.length;
             for (let i=0; i<total; i++) {
-                const [name, relPath] = files[i];
+                const relPath = files[i];
                 const vfsUri = this.vfs.pathToUri(relPath);
                 if (token.isCancellationRequested) { return false; }
                 progress.report({increment: 100/total, message: relPath});
                 //
                 const baseContent = this.baseCache[relPath];
-                const localContent = await this.readFile(relPath);
-                const remoteContent = await vscode.workspace.fs.readFile(vfsUri);
-                if (baseContent===undefined || localContent===undefined) {
-                    this.setBypassCache(relPath, remoteContent);
-                    await this.writeFile(relPath, remoteContent);
+                // Re-read both sides instead of trusting the directory snapshots.
+                // A file may have appeared after enumeration; read errors other
+                // than confirmed FileNotFound abort rather than imply deletion.
+                const localContent = await this.readCurrentFile(
+                    vscode.Uri.joinPath(this.baseUri, relPath),
+                );
+                const remoteContent = await this.readCurrentFile(vfsUri);
+                const reconciliation = reconcileReplicaContents(baseContent, localContent, remoteContent);
+                if (reconciliation.kind === 'conflict') {
+                    this.blockedConflictPaths.add(relPath);
+                    conflicts.push(relPath);
+                    continue;
+                }
+
+                switch (reconciliation.kind) {
+                    case 'write-local':
+                        await this.writeFile(relPath, reconciliation.content);
+                        break;
+                    case 'write-remote':
+                        await vscode.workspace.fs.writeFile(vfsUri, reconciliation.content);
+                        break;
+                    case 'write-both':
+                        await this.writeFile(relPath, reconciliation.content);
+                        await vscode.workspace.fs.writeFile(vfsUri, reconciliation.content);
+                        break;
+                    case 'delete-local':
+                        await vscode.workspace.fs.delete(vscode.Uri.joinPath(this.baseUri, relPath));
+                        break;
+                    case 'delete-remote':
+                        await vscode.workspace.fs.delete(vfsUri);
+                        break;
+                    case 'absent':
+                    case 'unchanged':
+                        break;
+                }
+                this.blockedConflictPaths.delete(relPath);
+                if ('content' in reconciliation) {
+                    this.baseCache[relPath] = reconciliation.content;
+                    this.setBypassCache(relPath, reconciliation.content);
                 } else {
-                    const dmp = new DiffMatchPatch();
-                    const baseContentStr = new TextDecoder().decode(baseContent);
-                    const localContentStr = new TextDecoder().decode(localContent);
-                    const remoteContentStr = new TextDecoder().decode(remoteContent);
-                    // merge local and remote changes
-                    const localPatches = dmp.patch_make( baseContentStr, localContentStr );
-                    const remotePatches = dmp.patch_make( baseContentStr, remoteContentStr );
-                    const [mergedContentStr, _results] = dmp.patch_apply( remotePatches, localContentStr );
-                    // write the merged content to local
-                    const mergedContent = new TextEncoder().encode(mergedContentStr);
-                    await this.writeFile(relPath, mergedContent);
-                    // write the merged content to remote
-                    if (localPatches.length!==0) {
-                        await vscode.workspace.fs.writeFile(vfsUri, mergedContent);
-                    }
+                    delete this.baseCache[relPath];
+                    this.setBypassCache(relPath, undefined);
                 }
             }
 
-            return true;
+            if (conflicts.length > 0) {
+                const shownPaths = conflicts.slice(0, 5).join(', ');
+                const remaining = conflicts.length - Math.min(conflicts.length, 5);
+                const suffix = remaining > 0 ? ` (+${remaining})` : '';
+                void vscode.window.showErrorMessage(vscode.l10n.t(
+                    'Local replica conflicts were not synchronized: {paths}{suffix}. Make the local and remote copies identical, then reload the window.',
+                    {paths: shownPaths, suffix},
+                ));
+            }
+
+            return conflicts.length === 0;
         });
     }
 
     private bypassSync(action:'push'|'pull', type:'update'|'delete', relPath: string, content?: Uint8Array): boolean {
         // bypass ignore files
         if (this.matchIgnorePatterns(relPath)) {
+            return true;
+        }
+        // An initial conflict has no trustworthy ancestor. Block both directions
+        // until the user reconciles the copies and reloads the provider.
+        if ([...this.blockedConflictPaths].some(conflictPath =>
+            relPath === conflictPath || relPath.startsWith(conflictPath + '/')
+        )) {
             return true;
         }
         // synchronization propagation check
@@ -288,7 +373,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private async applySync(action:'push'|'pull', type: 'update'|'delete', relPath:string, fromUri: vscode.Uri, toUri: vscode.Uri) {
         this.status = {status: action, message: `${type}: ${relPath}`};
 
-        await (async () => {
+        try {
             if (type==='delete') {
                 const newContent = undefined;
                 if (this.bypassSync(action, type, relPath, newContent)) { return; }
@@ -302,23 +387,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     await vscode.workspace.fs.createDirectory(toUri);
                 }
                 else if (stat.type===vscode.FileType.File) {
-                    try {
-                        const newContent = await vscode.workspace.fs.readFile(fromUri);
-                        if (this.bypassSync(action, type, relPath, newContent)) { return; }
-                        await vscode.workspace.fs.writeFile(toUri, newContent);
-                        this.baseCache[relPath] = newContent;
-                        if (action==='push') { await vscode.workspace.fs.readFile(toUri); } // update remote cache
-                    } catch (error) {
-                        console.error(error);
-                    }
+                    const newContent = await vscode.workspace.fs.readFile(fromUri);
+                    if (this.bypassSync(action, type, relPath, newContent)) { return; }
+                    await vscode.workspace.fs.writeFile(toUri, newContent);
+                    this.baseCache[relPath] = newContent;
+                    if (action==='push') { await vscode.workspace.fs.readFile(toUri); } // update remote cache
                 }
                 else {
                     console.error(`Unknown file type: ${stat.type}`);
                 }
             }
-        })();
-
-        this.status = {status: 'idle', message: ''};
+        } finally {
+            this.status = {status: 'idle', message: ''};
+        }
     }
 
     private async syncFromVFS(vfsUri: vscode.Uri, type: 'update'|'delete') {
@@ -326,7 +407,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         pathParts.at(-1)==='' && pathParts.pop(); // remove the last empty string
         const relPath = ('/' + pathParts.join('/'));
         const localUri = vscode.Uri.joinPath(this.baseUri, relPath);
-        this.applySync('pull', type, relPath, vfsUri, localUri);
+        return this.applySync('pull', type, relPath, vfsUri, localUri);
     }
 
     private async syncToVFS(localUri: vscode.Uri, type: 'update'|'delete') {
@@ -334,7 +415,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const basePath = this.baseUri.path;
         const relPath = localUri.path.slice(basePath.length);
         const vfsUri = this.vfs.pathToUri(relPath);
-        this.applySync('push', type, relPath, localUri, vfsUri);
+        return this.applySync('push', type, relPath, localUri, vfsUri);
     }
 
     /**
@@ -343,12 +424,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
      * file modifications (git, compilation tools, etc.).
      * This is the general fix for issues #299 and #323.
      */
-    private onDocumentSaved(doc: vscode.TextDocument) {
+    private async onDocumentSaved(doc: vscode.TextDocument) {
         const docUri = doc.uri;
         // Only sync files within our baseUri (ensure path separator boundary)
         const basePath = this.baseUri.path.endsWith('/') ? this.baseUri.path : this.baseUri.path + '/';
         if (!docUri.path.startsWith(basePath)) { return; }
-        this.syncToVFS(docUri, 'update');
+        await this.syncToVFS(docUri, 'update');
     }
 
     private async initWatch() {
@@ -373,30 +454,53 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.localWatcher = vscode.workspace.createFileSystemWatcher(
             new vscode.RelativePattern( this.baseUri.path, '**/*' )
         );
-        await this.overwrite();
 
         const syncOnFileChange = vscode.workspace
             .getConfiguration('overleaf-workshop.localReplica.syncOnFileChange')
             .get<boolean>('enabled', false);
 
+        const queuedEvents: Array<() => Promise<void>> = [];
+        let initialSync = true;
+        const dispatch = (operation: () => Promise<void>) => {
+            if (initialSync) {
+                queuedEvents.push(operation);
+            } else {
+                void operation().catch(error => console.error('Local replica synchronization failed', error));
+            }
+        };
+
         // By default, only explicit editor saves push file modifications. Users who
         // rely on external tools can opt into file-system change events instead.
         // Keep these listeners mutually exclusive so an editor save is not pushed twice.
         const localChangeListener = syncOnFileChange
-            ? this.localWatcher.onDidChange(async uri => await this.syncToVFS(uri, 'update'))
-            : vscode.workspace.onDidSaveTextDocument(doc => this.onDocumentSaved(doc));
+            ? this.localWatcher.onDidChange(uri => dispatch(() => this.syncToVFS(uri, 'update')))
+            : vscode.workspace.onDidSaveTextDocument(doc => dispatch(() => this.onDocumentSaved(doc)));
 
-        return [
+        const watches = [
             // sync from vfs to local
-            this.vfsWatcher.onDidChange(async uri => await this.syncFromVFS(uri, 'update')),
-            this.vfsWatcher.onDidCreate(async uri => await this.syncFromVFS(uri, 'update')),
-            this.vfsWatcher.onDidDelete(async uri => await this.syncFromVFS(uri, 'delete')),
+            this.vfsWatcher.onDidChange(uri => dispatch(() => this.syncFromVFS(uri, 'update'))),
+            this.vfsWatcher.onDidCreate(uri => dispatch(() => this.syncFromVFS(uri, 'update'))),
+            this.vfsWatcher.onDidDelete(uri => dispatch(() => this.syncFromVFS(uri, 'delete'))),
             // sync from local to vfs: file updates use the configured listener above;
             // file creation and deletion still always use the file-system watcher
             localChangeListener,
-            this.localWatcher.onDidCreate(async uri => await this.syncToVFS(uri, 'update')),
-            this.localWatcher.onDidDelete(async uri => await this.syncToVFS(uri, 'delete')),
+            this.localWatcher.onDidCreate(uri => dispatch(() => this.syncToVFS(uri, 'update'))),
+            this.localWatcher.onDidDelete(uri => dispatch(() => this.syncToVFS(uri, 'delete'))),
         ];
+        try {
+            await this.overwrite();
+        } catch (error) {
+            watches.forEach(watch => watch.dispose());
+            this.vfsWatcher.dispose();
+            this.localWatcher.dispose();
+            throw error;
+        } finally {
+            initialSync = false;
+        }
+        for (const operation of queuedEvents) {
+            await operation().catch(error => console.error('Queued local replica synchronization failed', error));
+        }
+        return watches;
     }
 
     writeFile(relPath: string, content: Uint8Array): Thenable<void> {

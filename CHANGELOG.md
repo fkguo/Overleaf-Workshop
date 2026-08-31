@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.13] - 2026-08-31
+### Fixed
+- Normalize restored project URIs so the explorer, editors, and workspace history reuse one realtime project session.
+- Recover safely from interrupted realtime saves and reject stale or unconfirmed remote mutations.
+- Compile the configured main document during startup and release the compile state after failures or cancellation.
+- Prevent stopped or superseded compile requests from overwriting newer output, diagnostics, or PDF state.
+- Keep forward and inverse SyncTeX navigation aligned with the active source position and compiled output identity.
+- Open projects in another window without creating a short-lived duplicate session in the source window.
+
+## [0.15.12] - 2026-08-30
+### Fixed
+- Start realtime connections with Overleaf's project-query auto-join protocol.
+- Preserve Socket.IO automatic reconnects and avoid falling back to a server-rejected legacy handshake.
+- Avoid false save failures after Overleaf confirms an update transformed alongside concurrent edits.
+
 ## [0.15.10] - 2026-07-11
 ### Changed
 - fix: enhance connection resilience and fix TCP RST causing spurious connection lost (fixes #309)

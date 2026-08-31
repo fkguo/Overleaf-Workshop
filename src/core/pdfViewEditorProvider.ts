@@ -63,7 +63,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
             if (doc.cache.buffer.byteLength !== 0) {
                 webviewPanel.webview.postMessage({type:'update', content:doc.cache.buffer});
             }
-        }
+        };
 
         const docOnDidChangeListener = doc.onDidChange(() => {
             updateWebview();
@@ -71,6 +71,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
 
         webviewPanel.onDidDispose(() => {
             docOnDidChangeListener.dispose();
+            EventBus.fire('pdfViewDisposedEvent', {uri: doc.uri, webviewPanel});
         });
 
         webviewPanel.webview.options = {enableScripts:true};
@@ -85,7 +86,10 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         webviewPanel.webview.onDidReceiveMessage((e) => {
             switch (e.type) {
                 case 'syncPdf':
-                    vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.syncPdf`, e.content);
+                    vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.syncPdf`, {
+                        ...e.content,
+                        uri: doc.uri,
+                    });
                     break;
                 case 'saveState':
                     GlobalStateManager.updatePdfViewPersist(this.context, doc.uri.toString(), e.content);
@@ -100,6 +104,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                     };
                     webviewPanel.webview.postMessage({type:'initState', content:state, colorThemes, defaults});
                     updateWebview();
+                    EventBus.fire('pdfViewerReadyEvent', {uri: doc.uri, webviewPanel});
                     break;
                 default:
                     break;

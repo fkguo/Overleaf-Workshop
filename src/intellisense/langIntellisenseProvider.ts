@@ -8,9 +8,11 @@ import { TexDocumentFormatProvider } from './texDocumentFormatProvider';
 import { MisspellingCheckProvider } from './langMisspellingCheckProvider';
 import { CommandCompletionProvider, ConstantCompletionProvider, FilePathCompletionProvider, ReferenceCompletionProvider } from './langCompletionProvider';
 
-export class LangIntellisenseProvider {
+export class LangIntellisenseProvider implements vscode.Disposable {
     private status: vscode.StatusBarItem;
     private providers: IntellisenseProvider[];
+    private activationTask?: NodeJS.Timeout;
+    private disposed = false;
 
     constructor(context: vscode.ExtensionContext, private readonly vfsm: RemoteFileSystemProvider) {
         const texSymbolProvider = new TexDocumentSymbolProvider(vfsm);
@@ -38,10 +40,12 @@ export class LangIntellisenseProvider {
     }
 
     async activate() {
+        if (this.disposed) { return; }
         const uri = vscode.workspace.workspaceFolders?.[0].uri;
         if (uri?.scheme!==ROOT_NAME) { return; }
 
         const vfs = uri && await this.vfsm.prefetch(uri);
+        if (this.disposed) { return; }
         const languageItem = vfs?.getSpellCheckLanguage();
         if (languageItem) {
             const {name, code} = languageItem;
@@ -54,11 +58,22 @@ export class LangIntellisenseProvider {
         }
         this.status.command = 'langIntellisense.settings';
         this.status.show();
-        setTimeout(this.activate.bind(this), 200);
+        this.activationTask = setTimeout(() => this.activate(), 200);
     }
 
-    get triggers() {
+    dispose(): void {
+        if (this.disposed) { return; }
+        this.disposed = true;
+        if (this.activationTask) {
+            clearTimeout(this.activationTask);
+            this.activationTask = undefined;
+        }
+    }
+
+    get triggers(): vscode.Disposable[] {
         return [
+            this,
+            this.status,
             // register provider triggers
             ...this.providers.map(x => x.triggers).flat(),
         ];

@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import * as vscode from 'vscode';
 import { ELEGANT_NAME, ROOT_NAME } from '../consts';
-import { SocketIOAPI, UpdateUserSchema } from '../api/socketio';
+import { OnlineUserSchema, ProjectSessionSchema, SocketIOAPI, UpdateUserSchema } from '../api/socketio';
 import { VirtualFileSystem } from '../core/remoteFileSystemProvider';
 import { ChatViewProvider } from './chatViewProvider';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
@@ -52,13 +52,20 @@ function formatTime(timestamp:number) {
     return `${hoursStr}${minutesStr}${secondsStr}`;
 }
 
-export class ClientManager {
+export class ClientManager implements vscode.Disposable {
     private activeExists?: string;
     private inactivateTask?: NodeJS.Timeout;
+    private statusUpdateTask?: NodeJS.Timeout;
+    private disposed = false;
     private readonly status: vscode.StatusBarItem;
     private readonly onlineUsers: {[K:string]:ExtendedUpdateUserSchema} = {};
     private connectedFlag: boolean = true;
     private readonly chatViewer: ChatViewProvider;
+    /** Public ids previously owned by this window's socket across reconnects. */
+    private readonly localPublicIds = new Set<string>();
+    private connectedUsersRefresh = 0;
+    private presenceRevision = 0;
+    private readonly clientPresenceRevisions = new Map<string, number>();
     /** Timestamp when connection was lost; used for grace period before clearing user list */
     private disconnectedAt: number = 0;
     /** Grace period in ms before clearing online user list on disconnect */
@@ -67,48 +74,115 @@ export class ClientManager {
     constructor(
         private readonly vfs: VirtualFileSystem,
         private readonly context: vscode.ExtensionContext,
-        private readonly publicId: string,
+        private publicId: string,
         private readonly socket: SocketIOAPI,
     ) {
+        if (publicId) { this.localPublicIds.add(publicId); }
         this.socket.updateEventHandlers({
             onClientUpdated: (user:UpdateUserSchema) => {
-                if (user.id !== this.publicId) { this.setStatusActive(user.id); }
+                if (this.disposed) { return; }
+                this.presenceRevision += 1;
+                this.clientPresenceRevisions.set(user.id, this.presenceRevision);
+                if (!this.localPublicIds.has(user.id)) { this.setStatusActive(user.id); }
                 this.updatePosition(user.id, user.doc_id, user.row, user.column, user);
             },
             onClientDisconnected: (id:string) => {
+                if (this.disposed) { return; }
+                this.presenceRevision += 1;
+                this.clientPresenceRevisions.set(id, this.presenceRevision);
                 this.removePosition(id);
             },
             onDisconnected: () => {
+                if (this.disposed) { return; }
                 this.connectedFlag = false;
                 this.disconnectedAt = Date.now();
             },
             onConnectionAccepted: (publicId:string) => {
-                this.connectedFlag = true;
-                this.disconnectedAt = 0;
-            }
-        });
-        this.socket.getConnectedUsers().then(users => {
-            users.forEach(user => {
-                const onlineUser = {
-                    id: user.client_id,
-                    user_id: user.user_id,
-                    name: [user.first_name, user.last_name].filter(Boolean).join(' '),
-                    email: user.email,
-                    doc_id: user.cursorData?.doc_id || '',
-                    row: user.cursorData?.row || 0,
-                    column: user.cursorData?.column || 0,
-                    last_updated_at: Number(user.last_updated_at),
-                };
-                if (user.client_id !== this.publicId) {
-                    this.onlineUsers[user.client_id] = onlineUser;
-                    this.updatePosition(user.client_id, onlineUser.doc_id, onlineUser.row, onlineUser.column, onlineUser);
-                }
-            });
+                if (this.disposed) { return; }
+                // Transport acceptance is not sufficient: the project/doc session
+                // may still be recovering. updateStatus reads vfs.isReady.
+                this.updatePublicId(publicId);
+            },
+            onProjectJoined: (session:ProjectSessionSchema) => {
+                if (this.disposed) { return; }
+                this.updatePublicId(session.publicId);
+                void this.refreshConnectedUsers();
+            },
+            onFatalError: () => {
+                if (this.disposed) { return; }
+                this.connectedFlag = false;
+                this.disconnectedAt = Date.now() - ClientManager.DISCONNECT_GRACE_PERIOD_MS;
+            },
         });
 
         this.chatViewer = new ChatViewProvider(this.vfs, this.publicId, this.context.extensionUri, this.socket);
         this.status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
+        // ClientManager is created after the initial joinProject call, so it may
+        // have missed that generation's onProjectJoined event.
+        void this.refreshConnectedUsers();
         this.updateStatus();
+    }
+
+    updatePublicId(publicId: string) {
+        if (this.disposed) { return; }
+        if (this.publicId) { this.localPublicIds.add(this.publicId); }
+        this.publicId = publicId;
+        if (publicId) { this.localPublicIds.add(publicId); }
+        this.localPublicIds.forEach(id => {
+            if (this.onlineUsers[id]) { void this.removePosition(id); }
+        });
+        this.chatViewer?.updatePublicId(publicId);
+    }
+
+    private toUpdateUser(user: OnlineUserSchema): UpdateUserSchema {
+        return {
+            id: user.client_id,
+            user_id: user.user_id,
+            name: [user.first_name, user.last_name].filter(Boolean).join(' '),
+            email: user.email,
+            doc_id: user.cursorData?.doc_id || '',
+            row: user.cursorData?.row || 0,
+            column: user.cursorData?.column || 0,
+            last_updated_at: Number(user.last_updated_at),
+        };
+    }
+
+    private async refreshConnectedUsers() {
+        const refresh = ++this.connectedUsersRefresh;
+        const revision = this.presenceRevision;
+        try {
+            const users = await this.socket.getConnectedUsers();
+            if (this.disposed || refresh !== this.connectedUsersRefresh) { return; }
+
+            const seen = new Set<string>();
+            const updates: Promise<void>[] = [];
+            users.forEach(user => {
+                if (!user.connected || this.localPublicIds.has(user.client_id)) { return; }
+                const onlineUser = this.toUpdateUser(user);
+                seen.add(user.client_id);
+                // A live update/disconnect received after the request started is
+                // newer than this snapshot for that client and wins independently.
+                if ((this.clientPresenceRevisions.get(user.client_id) ?? 0) > revision) { return; }
+                updates.push(this.updatePosition(
+                    user.client_id,
+                    onlineUser.doc_id,
+                    onlineUser.row,
+                    onlineUser.column,
+                    onlineUser,
+                ));
+            });
+            Object.keys(this.onlineUsers).forEach(clientId => {
+                if (
+                    !seen.has(clientId) &&
+                    (this.clientPresenceRevisions.get(clientId) ?? 0) <= revision
+                ) {
+                    updates.push(this.removePosition(clientId));
+                }
+            });
+            await Promise.all(updates);
+        } catch {
+            // A failed snapshot must not erase the last known-good presence map.
+        }
     }
 
     private async jumpToUser(id?: string) {
@@ -155,11 +229,13 @@ export class ClientManager {
 
     private refreshDecorations(visibleTextEditors: readonly vscode.TextEditor[]) {
         Object.values(this.onlineUsers).forEach(async user => {
+            if (this.disposed) { return; }
             const docPath = this.vfs._resolveById(user.doc_id)?.path;
             if (docPath === undefined) { return; }
 
             const uri = (vscode.workspace.workspaceFolders?.[0].uri.scheme===ROOT_NAME) ?
                         this.vfs.pathToUri(docPath) : await LocalReplicaSCMProvider.pathToUri(docPath);
+            if (this.disposed) { return; }
             const editor = uri && vscode.window.visibleTextEditors.find(e => e.document.uri.toString() === uri.toString());
             const selection = user.selection;
             selection && editor?.setDecorations(selection.decoration, selection.ranges);
@@ -167,9 +243,10 @@ export class ClientManager {
     }
 
     private async updatePosition(clientId:string, docId: string, row: number, column: number, details?:UpdateUserSchema) {
-        if (clientId === this.publicId) { return; }
+        if (this.disposed || this.localPublicIds.has(clientId)) { return; }
 
         // update record
+        const previousDocId = this.onlineUsers[clientId]?.doc_id;
         if (this.onlineUsers[clientId]===undefined) {
             if (details === undefined) { return; }
             this.onlineUsers[clientId] = {
@@ -185,10 +262,11 @@ export class ClientManager {
 
         const selection = this.onlineUsers[clientId].selection;
         // remove decoration
-        const oldDoc = this.vfs._resolveById(this.onlineUsers[clientId]?.doc_id);
+        const oldDoc = previousDocId && this.vfs._resolveById(previousDocId);
         if (oldDoc && oldDoc.fileEntity._id !== docId && selection) {
             const oldUri = (vscode.workspace.workspaceFolders?.[0].uri.scheme===ROOT_NAME) ?
                         this.vfs.pathToUri(oldDoc.path) : await LocalReplicaSCMProvider.pathToUri(oldDoc.path);
+            if (this.disposed) { return; }
 
             const oldEditor = oldUri && vscode.window.visibleTextEditors.find(e => e.document.uri.toString() === oldUri.toString());
             oldEditor && oldEditor.setDecorations(selection.decoration, []);
@@ -199,6 +277,7 @@ export class ClientManager {
         if (newDoc === undefined) { return; }
         const newUri = (vscode.workspace.workspaceFolders?.[0].uri.scheme===ROOT_NAME) ?
                     this.vfs.pathToUri(newDoc.path) : await LocalReplicaSCMProvider.pathToUri(newDoc.path);
+        if (this.disposed) { return; }
         const newEditor = newUri && vscode.window.visibleTextEditors.find(e => e.document.uri.toString() === newUri.toString());
         if (selection===undefined) {
             const length = Object.keys(this.onlineUsers).length;
@@ -231,21 +310,31 @@ export class ClientManager {
     }
 
     private async removePosition(clientId:string) {
-        const doc = this.vfs._resolveById(this.onlineUsers[clientId]?.doc_id);
-        if (doc === undefined) { return; }
+        const user = this.onlineUsers[clientId];
+        if (user === undefined) { return; }
+        delete this.onlineUsers[clientId];
+        if (this.activeExists === clientId) {
+            this.activeExists = undefined;
+            if (this.inactivateTask) {
+                clearTimeout(this.inactivateTask);
+                this.inactivateTask = undefined;
+            }
+        }
+        const doc = this.vfs._resolveById(user.doc_id);
         // const uri = this.vfs.pathToUri(doc.path);
-        const uri = (vscode.workspace.workspaceFolders?.[0].uri.scheme===ROOT_NAME) ?
-                    this.vfs.pathToUri(doc.path) : await LocalReplicaSCMProvider.pathToUri(doc.path);
+        const uri = doc && (vscode.workspace.workspaceFolders?.[0].uri.scheme===ROOT_NAME ?
+                    this.vfs.pathToUri(doc.path) : await LocalReplicaSCMProvider.pathToUri(doc.path));
 
         const editor = uri && vscode.window.visibleTextEditors.find(e => e.document.uri.toString() === uri.toString());
         // delete decoration
-        const selection = this.onlineUsers[clientId].selection;
+        const selection = user.selection;
         selection && editor?.setDecorations(selection.decoration, []);
-        // delete record
-        delete this.onlineUsers[clientId];
+        selection?.decoration.dispose();
     }
 
     private updateStatus() {
+        if (this.disposed) { return; }
+        this.connectedFlag = this.vfs.isReady;
         const count = Object.keys(this.onlineUsers).length;
         if (!this.connectedFlag) {
             const disconnectedDuration = Date.now() - this.disconnectedAt;
@@ -295,10 +384,11 @@ export class ClientManager {
                     this.status.tooltip = `${ELEGANT_NAME}: ${vscode.l10n.t('Online')}`;
                     break;
                 default:
-                    this.status.color = this.activeExists ? this.onlineUsers[this.activeExists].selection?.color : undefined;
+                    const activeUser = this.activeExists ? this.onlineUsers[this.activeExists] : undefined;
+                    this.status.color = activeUser?.selection?.color;
                     this.status.text = prefixText + `${onlineIcon} ${count}`;
                     const tooltip = new vscode.MarkdownString();
-                    tooltip.appendMarkdown(`${ELEGANT_NAME}: ${this.activeExists? vscode.l10n.t('Active'): vscode.l10n.t('Idle') }\n\n`);
+                    tooltip.appendMarkdown(`${ELEGANT_NAME}: ${activeUser ? vscode.l10n.t('Active'): vscode.l10n.t('Idle') }\n\n`);
 
                     Object.values(this.onlineUsers).forEach(user => {
                         const userArgs = JSON.stringify([`@[[${user.name}#${user.user_id}]] `]);
@@ -322,15 +412,32 @@ export class ClientManager {
         }
         
         this.status.show();
-        setTimeout(this.updateStatus.bind(this), 500);
+        this.statusUpdateTask = setTimeout(() => this.updateStatus(), 500);
     }
 
     setStatusActive(clientId:string, timeout:number=10) {
+        if (this.disposed) { return; }
         this.inactivateTask && clearTimeout(this.inactivateTask);
         this.inactivateTask = setTimeout(() => {
             this.activeExists = undefined;
         }, timeout*1000);
         this.activeExists = clientId;
+    }
+
+    dispose() {
+        if (this.disposed) { return; }
+        this.disposed = true;
+        if (this.statusUpdateTask) {
+            clearTimeout(this.statusUpdateTask);
+            this.statusUpdateTask = undefined;
+        }
+        if (this.inactivateTask) {
+            clearTimeout(this.inactivateTask);
+            this.inactivateTask = undefined;
+        }
+        Object.values(this.onlineUsers).forEach(user => user.selection?.decoration.dispose());
+        Object.keys(this.onlineUsers).forEach(clientId => delete this.onlineUsers[clientId]);
+        this.clientPresenceRevisions.clear();
     }
 
     collaborationSettings() {
@@ -378,8 +485,9 @@ export class ClientManager {
         });
     }
 
-    get triggers() {
+    get triggers(): vscode.Disposable[] {
         return [
+            this,
             this.status,
             // register commands
             vscode.commands.registerCommand(`${ROOT_NAME}.collaboration.insertText`, (text) => {
@@ -413,7 +521,7 @@ export class ClientManager {
                 const doc = uri && await this.vfs._resolveUri(uri);
                 const docId = doc?.fileEntity?._id;
                 if (docId) {
-                    this.socket.updatePosition(docId, e.selections[0].active.line, e.selections[0].active.character);
+                    void this.socket.updatePosition(docId, e.selections[0].active.line, e.selections[0].active.character).catch(() => {});
                 }
             }),
             // refresh decorations when editor is switched

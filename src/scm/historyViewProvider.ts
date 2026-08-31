@@ -3,9 +3,17 @@ import * as vscode from 'vscode';
 import { EventBus } from '../utils/eventBus';
 import { VirtualFileSystem, parseUri } from '../core/remoteFileSystemProvider';
 import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
-import { ProjectLabelResponseSchema } from '../api/base';
+import {
+    ProjectFileDiffResponseSchema,
+    ProjectHistoryResponseSchema,
+    ProjectLabelResponseSchema,
+    ProjectUpdateMeta,
+    ProjectUpdateResponseSchema,
+} from '../api/base';
 
-interface HistoryRecord {
+type HistoryProjectOperation = ProjectHistoryResponseSchema['project_ops'][number];
+
+export interface HistoryRecord {
     before?: number,
     currentVersion?: number,
     keyVersions: number[], //array of all `toV` values
@@ -13,18 +21,296 @@ interface HistoryRecord {
         [toV:number]: {
             fromV: number,
             timestamp: number,
-            users: {
-                id: string,
-                first_name: string,
-                last_name?: string,
-                email: string,
-            }[]
+            users: ProjectUpdateMeta['users'],
+            origin?: ProjectUpdateMeta['origin'],
+            structuralChanges: HistoryProjectOperation[],
         }
     },
     labels: {[version:number]: ProjectLabelResponseSchema[]},
     diff: {
         [path:string] : number[] //array of version numbers
     }
+}
+
+export interface HistoryAttributionSpan {
+    start: number,
+    end: number,
+    kind: 'added' | 'removed',
+    meta: ProjectUpdateMeta,
+}
+
+export interface HistoricalDocument {
+    text: string,
+    attributions: HistoryAttributionSpan[],
+}
+
+type HistoricalDocumentSide = 'before' | 'after';
+
+interface HistoricalDocumentQuery {
+    version: number,
+    from: number,
+    to: number,
+    side: HistoricalDocumentSide,
+}
+
+function addUniqueVersion(versions: number[], version: number): void {
+    if (!versions.includes(version)) {
+        versions.push(version);
+    }
+}
+
+function recordPathVersion(history: HistoryRecord, pathname: string, version: number): void {
+    const versions = history.diff[pathname] ?? (history.diff[pathname] = []);
+    addUniqueVersion(versions, version);
+}
+
+/** Merge one history page without replacing the newest version with an older page. */
+export function mergeHistoryPage(history: HistoryRecord, page?: ProjectUpdateResponseSchema): HistoryRecord {
+    if (!page) { return history; }
+    history.before = page.nextBeforeTimestamp;
+    const updates = page.updates ?? [];
+    if (history.currentVersion === undefined && updates.length > 0) {
+        history.currentVersion = updates[0].toV;
+    }
+
+    for (const update of updates) {
+        const version = update.toV;
+        addUniqueVersion(history.keyVersions, version);
+        history.revisions[version] = {
+            fromV: update.fromV,
+            timestamp: update.meta.end_ts,
+            users: update.meta.users,
+            origin: update.meta.origin,
+            structuralChanges: update.project_ops ?? [],
+        };
+        history.labels[version] = update.labels ?? [];
+
+        for (const pathname of update.pathnames ?? []) {
+            recordPathVersion(history, pathname, version);
+        }
+        for (const operation of update.project_ops ?? []) {
+            if (operation.add) {
+                recordPathVersion(history, operation.add.pathname, operation.atV);
+            } else if (operation.remove) {
+                recordPathVersion(history, operation.remove.pathname, operation.atV);
+            } else if (operation.rename) {
+                recordPathVersion(history, operation.rename.pathname, operation.atV);
+                recordPathVersion(history, operation.rename.newPathname, operation.atV);
+            }
+        }
+    }
+    return history;
+}
+
+export function resolveRevisionVersion(history: HistoryRecord, version: number): number | undefined {
+    if (history.revisions[version]) { return version; }
+    return Object.keys(history.revisions)
+        .map(Number)
+        .filter(candidate => candidate >= version)
+        .sort((a, b) => a-b)[0];
+}
+
+export function resolveUniqueRevisionVersions(history: HistoryRecord, versions: number[]): number[] {
+    const resolved = new Set<number>();
+    for (const version of versions) {
+        const revisionVersion = resolveRevisionVersion(history, version);
+        if (revisionVersion !== undefined) { resolved.add(revisionVersion); }
+    }
+    return [...resolved];
+}
+
+function escapeMarkdown(value: string): string {
+    return value.replace(/[\\`*_{}[\]()<>#+\-.!|]/g, '\\$&');
+}
+
+export function describeHistoryOrigin(origin: unknown): string | undefined {
+    const record = typeof origin === 'object' && origin !== null
+        ? origin as Record<string, unknown>
+        : undefined;
+    const kind = typeof origin === 'string'
+        ? origin
+        : typeof record?.kind === 'string' ? record.kind : undefined;
+    if (!kind) { return undefined; }
+
+    switch (kind) {
+        case 'dropbox': return 'Dropbox sync';
+        case 'upload': return 'File upload';
+        case 'git-bridge': return 'Git bridge';
+        case 'github': return 'GitHub sync';
+        case 'history-resync': return 'History resync';
+        case 'history-migration': return 'History migration';
+        case 'file-restore': {
+            const pathname = typeof record?.path === 'string' ? ` ${record.path}` : '';
+            const version = typeof record?.version === 'number' ? ` from v${record.version}` : '';
+            return `File restore${pathname}${version}`;
+        }
+        case 'project-restore': {
+            const version = typeof record?.version === 'number' ? ` from v${record.version}` : '';
+            return `Project restore${version}`;
+        }
+        default:
+            return kind.split('-').map(word => word.charAt(0).toUpperCase()+word.slice(1)).join(' ');
+    }
+}
+
+export function describeProjectOperation(operation: HistoryProjectOperation): string | undefined {
+    if (operation.add) {
+        return `Added ${operation.add.pathname}`;
+    }
+    if (operation.remove) {
+        return `Removed ${operation.remove.pathname}`;
+    }
+    if (operation.rename) {
+        return `Renamed ${operation.rename.pathname} → ${operation.rename.newPathname}`;
+    }
+    return undefined;
+}
+
+export function formatHistoryParticipants(users: ProjectUpdateMeta['users']): string[] {
+    const participants: string[] = [];
+    let unknownCount = 0;
+    for (const user of users ?? []) {
+        if (!user) {
+            unknownCount++;
+            continue;
+        }
+        const name = [user.first_name, user.last_name].filter(Boolean).join(' ').trim();
+        const email = user.email?.trim();
+        participants.push(name && email ? `${name} (${email})` : name || email || 'Unknown participant');
+    }
+    if (unknownCount > 0) {
+        participants.push(unknownCount === 1
+            ? 'Unknown or deleted participant'
+            : `${unknownCount} unknown or deleted participants`);
+    }
+    return participants;
+}
+
+export function buildHistoryTooltipMarkdown(
+    revision: HistoryRecord['revisions'][number],
+    labels: ProjectLabelResponseSchema[],
+): string {
+    const lines = [
+        `$(history) ${new Date(revision.timestamp).toLocaleString()}`,
+        '',
+        '**Participants in this summarized update**',
+        '',
+    ];
+    const participants = formatHistoryParticipants(revision.users);
+    if (participants.length === 0) {
+        lines.push('- Participant information unavailable');
+    } else {
+        lines.push(...participants.map(participant => `- $(account) ${escapeMarkdown(participant)}`));
+    }
+
+    const origin = describeHistoryOrigin(revision.origin);
+    if (origin) {
+        lines.push('', '**Origin**', '', escapeMarkdown(origin));
+    }
+    const changes = revision.structuralChanges
+        .map(describeProjectOperation)
+        .filter((change): change is string => change !== undefined);
+    if (changes.length > 0) {
+        lines.push('', '**Structure changes**', '', ...changes.map(change => `- ${escapeMarkdown(change)}`));
+    }
+    if (labels.length > 0) {
+        lines.push('', '**Version labels**', '', ...labels.map(label => `- $(tag) ${escapeMarkdown(label.comment)}`));
+    }
+    return lines.join('\n');
+}
+
+export function buildHistoryAttributionTooltipMarkdown(attribution: HistoryAttributionSpan): string {
+    const participants = formatHistoryParticipants(attribution.meta.users);
+    const lines = [
+        attribution.kind === 'added' ? '**Added block**' : '**Removed block**',
+        '',
+        '**Participants for this changed block**',
+        '',
+        ...(participants.length > 0
+            ? participants.map(participant => `- $(account) ${escapeMarkdown(participant)}`)
+            : ['- Participant information unavailable']),
+    ];
+    const origin = describeHistoryOrigin(attribution.meta.origin);
+    if (origin) {
+        lines.push('', '**Origin**', '', escapeMarkdown(origin));
+    }
+    lines.push('', '**Change interval**', '',
+        `${new Date(attribution.meta.start_ts).toLocaleString()} – ${new Date(attribution.meta.end_ts).toLocaleString()}`);
+    return lines.join('\n');
+}
+
+export function buildHistoricalDocument(
+    response: ProjectFileDiffResponseSchema | undefined,
+    side: HistoricalDocumentSide,
+): HistoricalDocument {
+    if (!response) {
+        throw new Error('Unable to load this Overleaf history diff');
+    }
+    if (!Array.isArray(response.diff)) {
+        throw new Error('This Overleaf history diff is binary or unavailable');
+    }
+    let text = '';
+    const attributions: HistoryAttributionSpan[] = [];
+    for (const chunk of response.diff) {
+        if (chunk.u !== undefined) {
+            text += chunk.u;
+        }
+        const changedText = side === 'before' ? chunk.d : chunk.i;
+        if (changedText === undefined) { continue; }
+        const start = text.length;
+        text += changedText;
+        if (chunk.meta && changedText.length > 0) {
+            attributions.push({
+                start,
+                end: text.length,
+                kind: side === 'before' ? 'removed' : 'added',
+                meta: chunk.meta,
+            });
+        }
+    }
+    return {text, attributions};
+}
+
+export function encodeHistoricalDocumentQuery(query: HistoricalDocumentQuery): string {
+    return new URLSearchParams({
+        version: String(query.version),
+        from: String(query.from),
+        to: String(query.to),
+        side: query.side,
+    }).toString();
+}
+
+export function parseHistoricalDocumentQuery(query: string): HistoricalDocumentQuery | undefined {
+    if (/^\d+$/.test(query)) {
+        const version = Number(query);
+        return {version, from: version, to: version, side: 'after'};
+    }
+    const params = new URLSearchParams(query);
+    if (!params.has('version') || !params.has('from') || !params.has('to') || !params.has('side')) {
+        return undefined;
+    }
+    const version = Number(params.get('version'));
+    const from = Number(params.get('from'));
+    const to = Number(params.get('to'));
+    const side = params.get('side');
+    if (!Number.isSafeInteger(version) || !Number.isSafeInteger(from) || !Number.isSafeInteger(to) ||
+        version < 0 || from < 0 || to < 0 ||
+        from > to || (side !== 'before' && side !== 'after') ||
+        (side === 'before' && version !== from) || (side === 'after' && version !== to)) {
+        return undefined;
+    }
+    return {version, from, to, side};
+}
+
+export function createHistoricalDocumentUri(
+    pathname: string,
+    query: HistoricalDocumentQuery,
+): vscode.Uri {
+    return vscode.Uri.from({
+        scheme: `${ROOT_NAME}-diff`,
+        path: pathname,
+        query: encodeHistoricalDocumentQuery(query),
+    });
 }
 
 function formatTime(timestamp:number) {
@@ -72,12 +358,15 @@ class HistoryItem extends vscode.TreeItem {
     }
 }
 
-class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscode.TextDocumentContentProvider {
+class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscode.TextDocumentContentProvider, vscode.HoverProvider, vscode.Disposable {
     private _path?: string;
     private _history?: HistoryRecord;
+    private readonly refreshTask: NodeJS.Timeout;
+    private readonly documentAttributions = new Map<string, HistoryAttributionSpan[]>();
+    private disposed = false;
 
     constructor(private readonly vfs: VirtualFileSystem) {
-        setInterval(this.refresh.bind(this), 30*1000);
+        this.refreshTask = setInterval(() => this.refresh(), 30*1000);
     }
 
     private _onDidChangeTreeData: vscode.EventEmitter<HistoryItem | undefined | void> = new vscode.EventEmitter<HistoryItem | undefined | void>();
@@ -85,27 +374,50 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
     readonly onDidChangeTreeData: vscode.Event<HistoryItem | undefined | void> = this._onDidChangeTreeData.event;
 
     refresh(): void {
+        if (this.disposed) { return; }
         this._onDidChangeTreeData.fire();
     }
 
+    dispose(): void {
+        if (this.disposed) { return; }
+        this.disposed = true;
+        clearInterval(this.refreshTask);
+        this.documentAttributions.clear();
+        this._onDidChangeTreeData.dispose();
+    }
+
     async refreshData(path?:string, force:boolean=false) {
+        if (this.disposed) { return; }
         this._path = path;
         if (force) {
             this._history = undefined;
         }
         await this.getHistory();
+        if (this.disposed) { return; }
         this.refresh();
     }
 
     async openDiffEditor(originVersion:number, targetVersion:number) {
+        if (!Number.isSafeInteger(originVersion) || !Number.isSafeInteger(targetVersion) ||
+            originVersion < 0 || targetVersion < 0) {
+            return;
+        }
+        const fromVersion = Math.min(originVersion, targetVersion);
+        const toVersion = Math.max(originVersion, targetVersion);
         if (this._path===undefined) {
             const args: [vscode.Uri, vscode.Uri | undefined, vscode.Uri | undefined][] = [];
-            const {diff} = (await this.vfs.getFileTreeDiff(originVersion, targetVersion))!;
+            const treeDiff = await this.vfs.getFileTreeDiff(fromVersion, toVersion);
+            if (!treeDiff) { return; }
+            const {diff} = treeDiff;
             for (const change of diff) {
                 if (change.operation===undefined) { continue; }
                 const newPathname = change.newPathname || change.pathname;
-                let originUri: vscode.Uri | undefined = vscode.Uri.parse(`${ROOT_NAME}-diff:${change.pathname}?${originVersion}`);
-                let targetUri: vscode.Uri | undefined = vscode.Uri.parse(`${ROOT_NAME}-diff:${newPathname}?${targetVersion}`);
+                let originUri: vscode.Uri | undefined = createHistoricalDocumentUri(change.pathname, {
+                    version: fromVersion, from: fromVersion, to: toVersion, side: 'before',
+                });
+                let targetUri: vscode.Uri | undefined = createHistoricalDocumentUri(newPathname, {
+                    version: toVersion, from: fromVersion, to: toVersion, side: 'after',
+                });
                 let labelUri = targetUri;
                 // handle removed/added files
                 switch (change.operation) {
@@ -124,12 +436,16 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
                 }
                 args.push([labelUri, originUri, targetUri]);
             }
-            vscode.commands.executeCommand('vscode.changes', `v${originVersion} vs v${targetVersion}`, args);
+            vscode.commands.executeCommand('vscode.changes', `v${fromVersion} vs v${toVersion}`, args);
         } else {
             vscode.commands.executeCommand('vscode.diff',
-                vscode.Uri.parse(`${ROOT_NAME}-diff:${this._path}?${originVersion}`),
-                vscode.Uri.parse(`${ROOT_NAME}-diff:${this._path}?${targetVersion}`),
-                `${this._path} (v${originVersion} vs v${targetVersion})`,
+                createHistoricalDocumentUri(this._path, {
+                    version: fromVersion, from: fromVersion, to: toVersion, side: 'before',
+                }),
+                createHistoricalDocumentUri(this._path, {
+                    version: toVersion, from: fromVersion, to: toVersion, side: 'after',
+                }),
+                `${this._path} (v${fromVersion} vs v${toVersion})`,
             );
         }
     }
@@ -144,27 +460,22 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
 
         const _history = this._history;
         const versions = this._path? this._history.diff[this._path] : this._history.keyVersions;
-        const historyItems = versions?.map(v => {
-            const _version = Number( Object.keys(_history.revisions).find(fromV => v<=Number(fromV)) );
+        const historyItems = resolveUniqueRevisionVersions(_history, versions ?? []).map(_version => {
+            const revision = _history.revisions[_version];
 
             const item = new HistoryItem(
                 `Version ${_version}`,
                 _version,
                 //prevVersion
-                _history.revisions[_version].fromV || _version,
-                _history.labels[_version],
+                revision.fromV ?? _version,
+                _history.labels[_version] ?? [],
             );
-            const revision = _history.revisions[_version];
-            item.description = '\t'+formatTime(revision.timestamp);
-            item.tooltip = new vscode.MarkdownString(`$(history) ${new Date(revision.timestamp).toDateString()}\n\n`);
-            item.tooltip.appendMarkdown(`**Participants**\n\n`);
-            for (const user of revision.users) {
-                item.tooltip.appendMarkdown(`$(account) ${user.first_name} ${user.last_name?user.last_name:''} (${user.email})\n`);
-            }
-            _history.labels[_version].length && item.tooltip.appendMarkdown(`\n**Comments**\n\n`);
-            for (const label of _history.labels[_version]) {
-                item.tooltip.appendMarkdown(`\`$(tag) ${label.comment}\` \n`);
-            }
+            const origin = describeHistoryOrigin(revision.origin);
+            item.description = '\t'+formatTime(revision.timestamp)+(origin ? ` · ${origin}` : '');
+            item.tooltip = new vscode.MarkdownString(buildHistoryTooltipMarkdown(
+                revision,
+                _history.labels[_version] ?? [],
+            ));
             item.tooltip.supportThemeIcons = true;
             item.command = {
                 command: `projectHistory.comparePrevious`,
@@ -172,9 +483,9 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
                 arguments: [item],
             };
             return item;
-        }) || [];
+        });
 
-        if (this._history.before) {
+        if (this._history.before !== undefined) {
             const item = new HistoryItem(vscode.l10n.t('Load More ...'), NaN,NaN);
             item.iconPath = undefined;
             item.command = {
@@ -187,21 +498,52 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
         return Promise.resolve(historyItems);
     }
 
-    provideTextDocumentContent(uri: vscode.Uri, token: vscode.CancellationToken): vscode.ProviderResult<string> {
-        const [pathname, version] = [uri.path, uri.query];
+    async provideTextDocumentContent(uri: vscode.Uri, token: vscode.CancellationToken): Promise<string> {
+        const query = parseHistoricalDocumentQuery(uri.query);
+        if (!query) {
+            throw new Error('Invalid Overleaf history document query');
+        }
         const _uri = vscode.workspace.workspaceFolders?.[0].uri;
-        if (!_uri) { return Promise.reject(); }
+        if (!_uri) { throw new Error('No Overleaf workspace is open'); }
+        if (token.isCancellationRequested) { return ''; }
 
-        return this.vfs.getFileDiff(pathname, Number(version), Number(version))
-        .then(diff => {
-            const text = diff?.diff[0]?.u;
-            return Promise.resolve(text);
-        });
+        this.documentAttributions.delete(uri.toString());
+        const response = await this.vfs.getFileDiff(uri.path, query.from, query.to);
+        if (token.isCancellationRequested) { return ''; }
+        const document = buildHistoricalDocument(response, query.side);
+        this.documentAttributions.set(uri.toString(), document.attributions);
+        return document.text;
     }
 
-    get triggers() {
+    provideHover(
+        document: vscode.TextDocument,
+        position: vscode.Position,
+        token: vscode.CancellationToken,
+    ): vscode.ProviderResult<vscode.Hover> {
+        if (token.isCancellationRequested) { return undefined; }
+        const offset = document.offsetAt(position);
+        const attribution = this.documentAttributions.get(document.uri.toString())
+            ?.find(span => span.start <= offset && offset < span.end);
+        if (!attribution) { return undefined; }
+
+        const contents = new vscode.MarkdownString(buildHistoryAttributionTooltipMarkdown(attribution));
+        contents.supportThemeIcons = true;
+        return new vscode.Hover(
+            contents,
+            new vscode.Range(document.positionAt(attribution.start), document.positionAt(attribution.end)),
+        );
+    }
+
+    get triggers(): vscode.Disposable[] {
         return [
+            this,
             vscode.workspace.registerTextDocumentContentProvider(`${ROOT_NAME}-diff`, this),
+            vscode.languages.registerHoverProvider({scheme: `${ROOT_NAME}-diff`}, this),
+            vscode.workspace.onDidCloseTextDocument(document => {
+                if (document.uri.scheme === `${ROOT_NAME}-diff`) {
+                    this.documentAttributions.delete(document.uri.toString());
+                }
+            }),
             // register commands
             vscode.commands.registerCommand(`${ROOT_NAME}.projectHistory.refresh`, async () => {
                 await this.refreshData(this._path, true);
@@ -222,7 +564,10 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
 
                 const res = await this.vfs.createLabel(label, item.version);
                 if (res) {
-                    this._history?.labels[item.version].push(res);
+                    const labels = this._history?.labels[item.version];
+                    if (labels) {
+                        labels.push(res);
+                    }
                     this.refresh();
                 }
             }),
@@ -240,9 +585,11 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
                 const labelId = item.tags?.find(t=>t.comment===label)?.id;
                 const res = labelId && await this.vfs.deleteLabel(labelId);
                 if (res) {
-                    this._history?.labels[version].splice(
-                        this._history?.labels[version].findIndex(t=>t.id===labelId), 1
-                    );
+                    const labels = this._history?.labels[version];
+                    const index = labels?.findIndex(t=>t.id===labelId) ?? -1;
+                    if (labels && index >= 0) {
+                        labels.splice(index, 1);
+                    }
                     this.refresh();
                 }
             }),
@@ -253,7 +600,7 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
                 this.openDiffEditor(item.prevVersion, item.version);
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.projectHistory.compareCurrent`, async (item: HistoryItem) => {
-                this.openDiffEditor(item.version, this._history?.currentVersion || NaN);
+                this.openDiffEditor(item.version, this._history?.currentVersion ?? NaN);
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.projectHistory.compareOthers`, async (item: HistoryItem) => {
                 const otherVersions = this._history?.keyVersions.filter(v=>v!==item.version);
@@ -305,50 +652,17 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
         }
 
         const updates = await this.vfs.getUpdates(before);
-        this._history.before = updates?.nextBeforeTimestamp;
-        
-        // parse updates
-        if (updates?.updates) {
-            this._history.currentVersion = updates.updates[0].toV;
-            // iterate all `toV`
-            for (const update of updates.updates) {
-                const version = update.toV;
-                // update `keyVersions`, `revisions` and `labels`
-                this._history.keyVersions.push(version);
-                this._history.revisions[version] = {
-                    fromV: update.fromV,
-                    timestamp: update.meta.end_ts,
-                    users: update.meta.users,
-                };
-                this._history.labels[version] = update.labels;
-                // update path-related versions
-                for (const path of update.pathnames) {
-                    this._history.diff[path] ?
-                    this._history.diff[path].push(version)
-                    : this._history.diff[path] = [version];
-                }
-                // record updates
-                for (const op of update.project_ops) {
-                    if (op.add) {
-                        this._history.diff[op.add.pathname] ?
-                        this._history.diff[op.add.pathname].push(op.atV)
-                        : this._history.diff[op.add.pathname] = [op.atV];
-                    } else if (op.remove) {
-                        this._history.diff[op.remove.pathname] ?
-                        this._history.diff[op.remove.pathname].push(op.atV)
-                        : this._history.diff[op.remove.pathname] = [op.atV];
-                    }
-                }
-            }
-        }
+        mergeHistoryPage(this._history, updates);
 
         return Promise.resolve(this._history);
     }
 }
 
-export class HistoryViewProvider {
+export class HistoryViewProvider implements vscode.Disposable {
     private treeDataProvider: HistoryDataProvider;
     private historyView: vscode.TreeView<HistoryItem>;
+    private pendingFileOpenTasks = new Set<NodeJS.Timeout>();
+    private disposed = false;
 
     constructor(vfs: VirtualFileSystem) {
         const treeDataProvider = new HistoryDataProvider(vfs);
@@ -358,13 +672,23 @@ export class HistoryViewProvider {
     }
 
     updateView(pathParts?: string[]) {
+        if (this.disposed) { return; }
         this.historyView.description = pathParts?.at(-1);
         this.treeDataProvider.refreshData( pathParts?.join('/') );
     }
 
-    get triggers() {
+    dispose(): void {
+        if (this.disposed) { return; }
+        this.disposed = true;
+        this.pendingFileOpenTasks.forEach(task => clearTimeout(task));
+        this.pendingFileOpenTasks.clear();
+    }
+
+    get triggers(): vscode.Disposable[] {
         return [
+            this,
             // register tree view
+            this.historyView,
             ...this.treeDataProvider.triggers,
             // register commands
             vscode.commands.registerCommand(`${ROOT_NAME}.projectHistory.clearSelection`, async() => {
@@ -375,7 +699,10 @@ export class HistoryViewProvider {
             }),
             // on vfs file open
             EventBus.on('fileWillOpenEvent', async ({uri}) => {
-                setTimeout(() => {
+                if (this.disposed) { return; }
+                const task = setTimeout(() => {
+                    this.pendingFileOpenTasks.delete(task);
+                    if (this.disposed) { return; }
                     // filter noise read events
                     const activeTextUri = vscode.window.activeTextEditor?.document.uri;
                     if (activeTextUri && activeTextUri.path!==uri.path) { return; }
@@ -387,6 +714,7 @@ export class HistoryViewProvider {
 
                     this.updateView( pathParts );
                 }, 100);
+                this.pendingFileOpenTasks.add(task);
             }),
             //FIXME: on "file://" uri open
         ];

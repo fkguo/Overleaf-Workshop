@@ -52,16 +52,21 @@ type ListenEventsSupport = {
 
 class SyncTimer {
     private timer?: NodeJS.Timeout;
+    private stopped = false;
 
     constructor(
         private _interval: number,
         private readonly _callback: () => Promise<void>,
     ) {
-        this._callback().then(() => this.trigger());
+        this._callback().then(() => {
+            if (!this.stopped) { this.trigger(); }
+        });
     }
 
     private trigger() {
+        if (this.stopped) { return; }
         this.timer = setTimeout(async () => {
+            if (this.stopped) { return; }
             await this._callback();
             this.trigger();
         }, this._interval);
@@ -72,6 +77,7 @@ class SyncTimer {
     }
 
     stop() {
+        this.stopped = true;
         this.timer && clearTimeout(this.timer);
     }
 }
@@ -213,8 +219,10 @@ export class SocketIOAlt {
                     const vfsLocalVersion = this.vfsLocalVersion!;
                     const dmp = new DiffMatchPatch();
                     const localContent = new TextDecoder().decode( await vfs.openFile(_uri) );
-                    const baseRemoteContent = (await vfs.getFileDiff(pathname, vfsLocalVersion, vfsLocalVersion))?.diff[0].u;
-                    const latestRemoteContent = (await vfs.getFileDiff(pathname, latestVersion, latestVersion))?.diff[0].u;
+                    const baseDiff = (await vfs.getFileDiff(pathname, vfsLocalVersion, vfsLocalVersion))?.diff;
+                    const latestDiff = (await vfs.getFileDiff(pathname, latestVersion, latestVersion))?.diff;
+                    const baseRemoteContent = Array.isArray(baseDiff) ? baseDiff[0]?.u : undefined;
+                    const latestRemoteContent = Array.isArray(latestDiff) ? latestDiff[0]?.u : undefined;
                     if (baseRemoteContent!==undefined && latestRemoteContent!==undefined) {
                         const patch = dmp.patch_make(baseRemoteContent, latestRemoteContent);
                         const [localContentPatched, _] = dmp.patch_apply(patch, localContent);
@@ -230,12 +238,13 @@ export class SocketIOAlt {
                     // fetch active users
                     let row = 0, column = 0;
                     const remoteDiffs = (await vfs.getFileDiff(pathname, vfsLocalVersion, latestVersion))?.diff;
-                    for (const diff of remoteDiffs || []) {
+                    for (const diff of Array.isArray(remoteDiffs) ? remoteDiffs : []) {
                         const end_ts = diff.meta?.end_ts || Date.now();
                         const diffText = (diff?.i || diff?.u || '').split('\n');
                         row += diffText.length;
                         column = diffText.slice(-1)[0].length;
                         for (const user of diff.meta?.users || []) {
+                            if (!user) { continue; }
                             const index = this.connectedUsers.findIndex(u => u.user_id===user.id);
                             if (index===-1) {
                                 const userUpdate = {
@@ -367,7 +376,8 @@ export class SocketIOAlt {
                     await vfs.init();
                     const {path} = await vfs._resolveById(rDocId)!;
                     const version = this.vfsLocalVersion!;
-                    const content = (await vfs.getFileDiff(path.slice(1), version, version))?.diff[0].u;
+                    const diff = (await vfs.getFileDiff(path.slice(1), version, version))?.diff;
+                    const content = Array.isArray(diff) ? diff[0]?.u : undefined;
                     const docLines = content?.split('\n') || [];
                     const updates:any[]=[], ranges:any[]=[];
                     callback(undefined, docLines, version, updates, ranges);
@@ -408,5 +418,13 @@ export class SocketIOAlt {
 
     on<T extends keyof ListenEventsSupport>(event: T, handler: (arg: ListenEventsSupport[T]) => void): void {
         this._eventEmitter.on(event, handler);
+    }
+
+    removeListener(event: string, handler: (...args:any[]) => void): void {
+        this._eventEmitter.removeListener(event, handler);
+    }
+
+    removeAllListeners(): void {
+        this._eventEmitter.removeAllListeners();
     }
 }

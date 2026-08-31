@@ -2,7 +2,7 @@
   "name": "overleaf-workshop",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.15.10",
+  "version": "0.15.13",
   "icon": "resources/icons/app_icon.png",
   "author": {
     "name": "iamhyc",
@@ -47,13 +47,13 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/overleaf-workshop/overleaf-workshop"
+    "url": "https://github.com/fkguo/Overleaf-Workshop"
   },
   "bugs": {
-    "url": "https://github.com/overleaf-workshop/overleaf-workshop/issues"
+    "url": "https://github.com/fkguo/Overleaf-Workshop/issues"
   },
   "engines": {
-    "vscode": "^1.80.0"
+    "vscode": "^1.86.0"
   },
   "categories": [
     "Other"
@@ -789,7 +789,7 @@
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
-    "test": "node ./out/test/runTest.js",
+    "test": "mocha --ui bdd \"out/test/**/*.test.js\"",
     "prepare": "husky install"
   },
   "dependencies": {
@@ -803,8 +803,7 @@
     "minimatch": "^9.0.9",
     "prettier": "^3.1.1",
     "socket.io-client": "github:overleaf/socket.io-client#0.9.17-overleaf-5",
-    "undici": "^8.9.0",
-    "uuid": "^14.0.0"
+    "undici": "6.28.0"
   },
   "devDependencies": {
     "@commitlint/cli": "^18.4.3",
