@@ -40,6 +40,8 @@ export interface ParsedHistoryOtRealtimeEnvelope {
     readonly trackChangesSeed?: JsonValue,
     readonly dupIfSource: readonly string[],
     readonly duplicate: boolean,
+    readonly lastVersion?: number,
+    readonly hash?: string,
 }
 
 export interface ParsedHistoryOtJoinState {
@@ -90,13 +92,18 @@ export function parseHistoryOtRealtimeEnvelope(input: unknown): ParsedHistoryOtR
     let trackChangesSeed: JsonValue | undefined;
     let dupIfSource: string[] = [];
     let duplicate = false;
+    let lastVersion: number | undefined;
+    let hash: string | undefined;
 
     if (!isJsonObject(raw)) {
         reasons.push('$ must be a realtime update object');
     } else {
         const hasOperation = hasOwn(raw, 'op');
         classification = hasOperation ? 'collaborator-update' : 'sender-ack';
-        for (const key of unknownKeys(raw, ['doc', 'v', 'op', 'meta', 'dupIfSource', 'dup'])) {
+        for (const key of unknownKeys(
+            raw,
+            ['doc', 'v', 'op', 'meta', 'dupIfSource', 'dup', 'lastV', 'hash'],
+        )) {
             reasons.push(`$.${key} is an unknown realtime update key`);
         }
         if (typeof raw.doc !== 'string' || raw.doc.length === 0) {
@@ -155,6 +162,20 @@ export function parseHistoryOtRealtimeEnvelope(input: unknown): ParsedHistoryOtR
                 duplicate = raw.dup;
             }
         }
+        if (hasOwn(raw, 'lastV')) {
+            if (!isVersion(raw.lastV)) {
+                reasons.push('$.lastV must be a non-negative safe integer when present');
+            } else {
+                lastVersion = raw.lastV;
+            }
+        }
+        if (hasOwn(raw, 'hash')) {
+            if (typeof raw.hash !== 'string') {
+                reasons.push('$.hash must be a string when present');
+            } else {
+                hash = raw.hash;
+            }
+        }
         if (classification === 'sender-ack' && Object.keys(raw).some(key => key !== 'doc' && key !== 'v')) {
             reasons.push('$ sender acknowledgement must contain only doc and v');
         }
@@ -176,6 +197,8 @@ export function parseHistoryOtRealtimeEnvelope(input: unknown): ParsedHistoryOtR
         trackChangesSeed,
         dupIfSource,
         duplicate,
+        lastVersion,
+        hash,
     };
 }
 
@@ -305,6 +328,7 @@ export type HistoryOtSessionResultKind =
     | 'late-ack-ignored'
     | 'stale-generation-ignored'
     | 'permission-updated'
+    | 'reconnect-started'
     | 'rejoin-required';
 
 export interface HistoryOtSessionResult {
@@ -520,8 +544,12 @@ export class HistoryOtSession {
             this.userId = undefined;
             return this.requireRejoin('permission-uncertain');
         }
+        const identityChanged = this.userId !== normalized.userId;
         this.permission = normalized.level;
         this.userId = normalized.userId;
+        if (this.pending !== undefined && identityChanged) {
+            return this.requireRejoin('identity-changed-with-pending-operation');
+        }
         if (this.pending !== undefined && !this.permissionAllows(this.pending.intent)) {
             return this.requireRejoin('permission-changed-with-pending-operation');
         }
@@ -654,6 +682,16 @@ export class HistoryOtSession {
         }
         metaRaw.source = request.publicId;
         this.assertIntent(operation, operationRaw, metaRaw, request.intent);
+        try {
+            applyHistoryOtOperations(this.snapshot, parseHistoryOtOperations(operationRaw));
+        } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            throw new HistoryOtSessionError(
+                'OPERATION_NOT_APPLICABLE',
+                `History OT operation is not applicable to the authoritative snapshot: ${reason}`,
+                [reason],
+            );
+        }
         const envelope: JsonObject = {
             doc: this.docId,
             v: this.version,
@@ -700,7 +738,7 @@ export class HistoryOtSession {
             this.pending.queued = false;
             this.pending.recoveryJoinVersion = undefined;
         }
-        return this.result('rejoin-required', false, undefined, 'reconnect-join-required');
+        return this.result('reconnect-started', false, undefined, 'reconnect-join-required');
     }
 
     prepareRecovery(eventGeneration: number, publicId: string): HistoryOtSessionResult {

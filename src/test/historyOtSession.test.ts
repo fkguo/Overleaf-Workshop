@@ -8,6 +8,7 @@ import {
 import {
     appendHistoryOtThreadEvent,
     HistoryOtSession,
+    HistoryOtSessionError,
     parseHistoryOtJoinState,
     parseHistoryOtRealtimeEnvelope,
     serializeHistoryOtJoinState,
@@ -91,6 +92,30 @@ describe('History OT realtime envelope protocol', () => {
         assert.deepEqual(parsed.user, {opaque: 'user'});
         assert.deepEqual(parsed.time, ['opaque', 42]);
         assert.match(parsed.unsafeReasons.join(' '), /future is unknown metadata/);
+    });
+
+    it('accepts official lastV/hash on full updates and fails closed on malformed values', () => {
+        const raw = {
+            ...fullUpdate(7, [{textOperation: [3, 'x']}]),
+            lastV: 6,
+            hash: 'opaque-history-hash',
+        };
+        const parsed = parseHistoryOtRealtimeEnvelope(raw);
+        assert.equal(parsed.safe, true);
+        assert.equal(parsed.lastVersion, 6);
+        assert.equal(parsed.hash, 'opaque-history-hash');
+        assert.deepEqual(serializeHistoryOtRealtimeEnvelope(parsed), raw);
+
+        const malformed = {
+            ...raw,
+            lastV: 6.5,
+            hash: 42,
+        };
+        const rejected = parseHistoryOtRealtimeEnvelope(malformed);
+        assert.equal(rejected.safe, false);
+        assert.deepEqual(serializeHistoryOtRealtimeEnvelope(rejected), malformed);
+        assert.match(rejected.unsafeReasons.join(' '), /lastV/);
+        assert.match(rejected.unsafeReasons.join(' '), /hash/);
     });
 
     it('fails closed on malformed and non-JSON envelopes', () => {
@@ -220,7 +245,10 @@ describe('HistoryOtSession ordering and recovery', () => {
             publicId: 'source-old',
         });
         session.markQueueAccepted(1);
-        session.reconnect(2);
+        const reconnecting = session.reconnect(2);
+        assert.equal(reconnecting.kind, 'reconnect-started');
+        assert.equal(reconnecting.requiresRejoin, false);
+        assert.equal(reconnecting.state.phase, 'joining');
 
         const rejoined = session.acceptJoin(2, join({content: 'aXbc'}, 6));
         assert.equal(rejoined.state.phase, 'recovery-ready');
@@ -263,6 +291,34 @@ describe('HistoryOtSession ordering and recovery', () => {
         const committed = session.receiveApplied(1, {doc: 'doc-a', v: 9});
         assert.equal(committed.requiresRejoin, true);
         assert.equal(committed.state.snapshot, undefined);
+    });
+
+    it('proves exact-one operations apply before exposing an enqueue envelope', () => {
+        const overRetain = readySession();
+        assert.throws(
+            () => overRetain.stage(1, {
+                operation: [{textOperation: [4]}],
+                intent: {kind: 'plain-write'},
+                publicId: 'source',
+            }),
+            (error: unknown) => error instanceof HistoryOtSessionError
+                && error.code === 'OPERATION_NOT_APPLICABLE',
+        );
+        assert.equal(overRetain.getState().phase, 'ready');
+        assert.equal(overRetain.getState().hasPendingOperation, false);
+
+        const invalidComment = readySession();
+        assert.throws(
+            () => invalidComment.stage(1, {
+                operation: [{commentId: 'comment-a', ranges: [{pos: 2, length: 2}]}],
+                intent: {kind: 'comment-write'},
+                publicId: 'source',
+            }),
+            (error: unknown) => error instanceof HistoryOtSessionError
+                && error.code === 'OPERATION_NOT_APPLICABLE',
+        );
+        assert.equal(invalidComment.getState().phase, 'ready');
+        assert.equal(invalidComment.getState().hasPendingOperation, false);
     });
 });
 
@@ -388,6 +444,29 @@ describe('HistoryOtSession permission intent gate', () => {
         const transition = session.updatePermission(1, {level: 'review', userId: 'user-a'});
         assert.equal(transition.requiresRejoin, true);
         assert.equal(transition.reason, 'permission-changed-with-pending-operation');
+    });
+
+    it('invalidates every pending operation when proven identity changes or disappears', () => {
+        const tracked = readySession('review');
+        tracked.stage(1, {
+            operation: trackedOperation,
+            meta: {tc: 'opaque-seed'},
+            intent: {kind: 'tracked-write'},
+            publicId: 'source',
+        });
+        const changed = tracked.updatePermission(1, {level: 'review', userId: 'user-b'});
+        assert.equal(changed.requiresRejoin, true);
+        assert.equal(changed.reason, 'identity-changed-with-pending-operation');
+
+        const plain = readySession('owner');
+        plain.stage(1, {
+            operation: [{textOperation: [1, 'X', 2]}],
+            intent: {kind: 'plain-write'},
+            publicId: 'source',
+        });
+        const disappeared = plain.updatePermission(1, {level: 'owner'});
+        assert.equal(disappeared.requiresRejoin, true);
+        assert.equal(disappeared.reason, 'identity-changed-with-pending-operation');
     });
 });
 
