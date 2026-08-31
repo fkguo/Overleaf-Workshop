@@ -23,6 +23,7 @@ interface Range {
 interface HistoryOtModule {
     parseHistoryOtSnapshot(input: unknown): unknown,
     serializeHistoryOtSnapshot(input: unknown): unknown,
+    assertHistoryOtSnapshotSafe(input: unknown): void,
     parseHistoryOtOperations(input: unknown): unknown,
     serializeHistoryOtOperations(input: unknown): unknown,
     assertHistoryOtOperationsSafe(input: unknown): void,
@@ -391,6 +392,22 @@ describe('source-derived History OT behavior', () => {
                 [{pos: 0, insertText: '😀'}],
             );
         }, 'non-BMP text-update builder');
+    });
+
+    it('preserves unknown snapshot fields exactly but fails closed before semantic use', () => {
+        const rawCase = asArray(unsafeFixture.cases, 'unsafe cases')
+            .map((item, index) => asObject(item, `unsafe case ${index}`))
+            .find(item => item.id === 'opaque-snapshot-fields-preserved-but-unsafe')!;
+        const original = asJson(rawCase.raw, 'opaque snapshot');
+        const parsed = historyOt.parseHistoryOtSnapshot(original);
+        assert.deepEqual(rawSnapshot(parsed), original);
+        assert.deepEqual(rawCase.raw, original);
+        assertProtocolError(() => {
+            historyOt.assertHistoryOtSnapshotSafe(parsed);
+        }, 'opaque snapshot safety gate');
+        assertProtocolError(() => {
+            historyOt.applyHistoryOtOperations(parsed, parsedOperations([]));
+        }, 'opaque snapshot apply gate');
     });
 });
 

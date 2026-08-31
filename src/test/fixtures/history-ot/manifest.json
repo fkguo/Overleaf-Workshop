@@ -37,6 +37,8 @@
     "bmp-unicode",
     "combining-mark",
     "non-bmp-rejection",
+    "unknown-snapshot-field",
+    "opaque-preservation",
     "adjacent-changes",
     "offset-boundaries"
   ]

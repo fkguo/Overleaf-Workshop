@@ -297,6 +297,24 @@ describe('History OT fixture corpus', () => {
         }
     });
 
+    it('labels unknown snapshot metadata as opaque rather than extending the official schema', () => {
+        const unsafe = fixtures.get('unsafe.json')!;
+        const rawCase = asArray(unsafe.cases, 'unsafe.cases')
+            .map((item, index) => asObject(item, `unsafe.cases[${index}]`))
+            .find(item => item.id === 'opaque-snapshot-fields-preserved-but-unsafe')!;
+        assert.deepEqual(rawCase.opaquePaths, [
+            '$.futureSnapshotMeta',
+            '$.comments[0].thread',
+            '$.comments[0].ranges[0].futureAnchor',
+        ]);
+        const raw = asObject(rawCase.raw, 'opaque snapshot');
+        const comment = asObject(asArray(raw.comments, 'opaque comments')[0], 'opaque comment');
+        const range = asObject(asArray(comment.ranges, 'opaque ranges')[0], 'opaque range');
+        assert.deepEqual(raw.futureSnapshotMeta, {version: 2, mode: 'opaque'});
+        assert.deepEqual(comment.thread, {status: 'opaque', token: 'opaque-thread'});
+        assert.deepEqual(range.futureAnchor, {bias: 'after', token: 'opaque-anchor'});
+    });
+
     it('keeps every unsafe example labelled for fail-closed integration checks', () => {
         const unsafe = fixtures.get('unsafe.json')!;
         const cases = asArray(unsafe.cases, 'unsafe.cases');

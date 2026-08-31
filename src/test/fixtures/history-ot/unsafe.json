@@ -142,6 +142,44 @@
         ]
       },
       "expectedFailure": "protocol-error"
+    },
+    {
+      "id": "opaque-snapshot-fields-preserved-but-unsafe",
+      "coverage": ["unknown-snapshot-field", "opaque-preservation"],
+      "provenance": [
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "libraries/overleaf-editor-core/lib/types.ts",
+          "lineStart": 20,
+          "lineEnd": 52,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/types.ts#L20-L52"
+        }
+      ],
+      "inputKind": "snapshot",
+      "raw": {
+        "content": "abc",
+        "futureSnapshotMeta": {"version": 2, "mode": "opaque"},
+        "comments": [
+          {
+            "id": "comment-opaque",
+            "ranges": [
+              {
+                "pos": 0,
+                "length": 1,
+                "futureAnchor": {"bias": "after", "token": "opaque-anchor"}
+              }
+            ],
+            "thread": {"status": "opaque", "token": "opaque-thread"}
+          }
+        ]
+      },
+      "opaquePaths": [
+        "$.futureSnapshotMeta",
+        "$.comments[0].thread",
+        "$.comments[0].ranges[0].futureAnchor"
+      ],
+      "expectedFailure": "protocol-error"
     }
   ]
 }
