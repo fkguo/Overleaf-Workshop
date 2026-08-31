@@ -23,7 +23,7 @@ import {
     prepareDocumentUpdate,
     requiresVersionConfirmation,
 } from './documentUpdate';
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'crypto';
 import { resolveSynctexOutputIdentity } from '../compile/synctex';
 import {
     CompileOutcome,
@@ -165,7 +165,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     private outputBuildId?: string;
     private compileGroup?: string;
     private clsiServerId?: string;
-    private readonly editorId = uuidv4();
+    private readonly editorId = randomUUID();
     private outputEditorId?: string;
     private pdfDownloadDomain?: string;
     private notify: (events:vscode.FileChangeEvent[])=>void;

@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import * as stream from 'stream';
 import * as FormData from 'form-data';
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'crypto';
 import { fetch } from 'undici';
 import { FileEntity, FileType, FolderEntity } from '../core/remoteFileSystemProvider';
 import { downloadWithRanges } from './httpDownload';
@@ -658,7 +658,7 @@ export class BaseAPI {
     }
 
     async uploadProject(identity:Identity, filename:string, fileContent:Uint8Array) {
-        const uuid = uuidv4();
+        const uuid = randomUUID();
         const fileStream = stream.Readable.from(fileContent);
         const formData = new FormData();
         formData.append('qqfile', fileStream, {filename});
