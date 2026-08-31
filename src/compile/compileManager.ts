@@ -14,6 +14,16 @@ import {
 } from './synctex';
 import { resolveCompileRootDocId } from './compileTarget';
 import { CompileRunGate, SingleFlightGate } from './compileRun';
+import {
+    CompileOutcome,
+    CompileRequestKind,
+    CompileStatus,
+    CompileTrigger,
+    compileRequestKindForTrigger,
+    hasDirtyCompileSource,
+    mergeCompileRequestKinds,
+} from './compileResult';
+import { projectConnectionKey } from '../core/projectUri';
 
 // map string level to severity
 const severityMap: Record<string, vscode.DiagnosticSeverity> = {
@@ -157,6 +167,9 @@ export class CompileManager {
     private stoppingCompile = false;
     private readonly stopGate = new SingleFlightGate();
     private pendingCompileForce?: boolean;
+    private pendingCompileRequestKind?: CompileRequestKind;
+    private pendingCompileUri?: vscode.Uri;
+    private suppressCompileOnSave = 0;
 
     constructor(
         private vfsm: RemoteFileSystemProvider,
@@ -224,7 +237,7 @@ export class CompileManager {
     }
 
     async update(
-        status: 'success'|'compiling'|'failed'|'alert',
+        status: CompileStatus|'compiling'|'alert',
         projectUri?: vscode.Uri,
         isCurrent: () => boolean = () => true,
     ) {
@@ -246,10 +259,77 @@ export class CompileManager {
                     this.status.tooltip.appendMarkdown(`\`${rootDocName}\` **${vscode.l10n.t('Compiling')}**`);
                     this.status.backgroundColor = undefined;
                     break;
-                case 'failed':
+                case 'stopped-on-first-error':
+                    this.status.text = `${compilerName} $(error)`;
+                    this.status.tooltip.appendMarkdown(`\`${rootDocName}\` **${vscode.l10n.t('Compilation stopped on the first error')}**`);
+                    this.status.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+                    break;
+                case 'timedout':
+                    this.status.text = `${compilerName} $(clock)`;
+                    this.status.tooltip.appendMarkdown(`\`${rootDocName}\` **${vscode.l10n.t('Compilation timed out')}**`);
+                    this.status.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+                    break;
+                case 'rate-limited':
+                    this.status.text = `${compilerName} $(watch)`;
+                    this.status.tooltip.appendMarkdown(`\`${rootDocName}\` **${vscode.l10n.t('Compilation is temporarily rate limited')}**`);
+                    this.status.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+                    break;
+                case 'autocompile-backoff':
+                case 'autocompile-disabled':
+                    this.status.text = `${compilerName} $(debug-pause)`;
+                    this.status.tooltip.appendMarkdown(`\`${rootDocName}\` **${vscode.l10n.t('Automatic compilation is temporarily paused')}**`);
+                    this.status.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+                    break;
+                case 'validation-problems':
+                case 'validation-fail':
+                    this.status.text = `${compilerName} $(warning)`;
+                    this.status.tooltip.appendMarkdown(`\`${rootDocName}\` **${vscode.l10n.t('Compilation settings or main document are invalid')}**`);
+                    this.status.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+                    break;
+                case 'compile-in-progress':
+                    this.status.text = `${compilerName} $(sync~spin)`;
+                    this.status.tooltip.appendMarkdown(`\`${rootDocName}\` **${vscode.l10n.t('Another compilation is already in progress')}**`);
+                    this.status.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+                    break;
+                case 'unavailable':
+                case 'clsi-maintenance':
+                case 'clsi-unavailable':
+                    this.status.text = `${compilerName} $(cloud-offline)`;
+                    this.status.tooltip.appendMarkdown(`\`${rootDocName}\` **${vscode.l10n.t('The compilation service is temporarily unavailable')}**`);
+                    this.status.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+                    break;
+                case 'project-too-large':
+                    this.status.text = `${compilerName} $(files)`;
+                    this.status.tooltip.appendMarkdown(`\`${rootDocName}\` **${vscode.l10n.t('The project is too large to compile')}**`);
+                    this.status.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+                    break;
+                case 'too-recently-compiled':
+                    this.status.text = `${compilerName} $(watch)`;
+                    this.status.tooltip.appendMarkdown(`\`${rootDocName}\` **${vscode.l10n.t('The project was compiled too recently; please retry shortly')}**`);
+                    this.status.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+                    break;
+                case 'conflict':
+                case 'missing-updates':
+                    this.status.text = `${compilerName} $(warning)`;
+                    this.status.tooltip.appendMarkdown(`\`${rootDocName}\` **${vscode.l10n.t('The server has not received all document changes')}**`);
+                    this.status.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+                    break;
+                case 'terminated':
+                    this.status.text = `${compilerName} $(circle-slash)`;
+                    this.status.tooltip.appendMarkdown(`\`${rootDocName}\` **${vscode.l10n.t('Compilation was stopped')}**`);
+                    this.status.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+                    break;
+                case 'failure':
+                case 'error':
+                case 'exited':
                     this.status.text = `${compilerName} $(x)`;
                     this.status.tooltip.appendMarkdown(`\`${rootDocName}\` **${vscode.l10n.t('Compile Failed')}**`);
                     this.status.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+                    break;
+                case 'validation-pass':
+                    this.status.text = `${compilerName}`;
+                    this.status.tooltip.appendMarkdown(`\`${rootDocName}\` **${vscode.l10n.t('Compile Success')}**`);
+                    this.status.backgroundColor = undefined;
                     break;
                 case 'alert':
                     this.status.text = `$(alert)`;
@@ -265,10 +345,92 @@ export class CompileManager {
         return uri;
     }
 
-    async compile(force:boolean=false) {
+    private async commitCompileOutcome(
+        outcome: CompileOutcome,
+        compileUri: vscode.Uri,
+        isCurrent: () => boolean,
+    ) {
+        let hasDiagnosticError = false;
+        if (outcome.outputsUpdated && outcome.hasLog) {
+            hasDiagnosticError = await vscode.commands.executeCommand<boolean>(
+                `${ROOT_NAME}.compileManager.compileErrorCheck`,
+                compileUri,
+                isCurrent,
+            ) ?? false;
+            if (!isCurrent()) { return; }
+        }
+
+        const displayStatus: CompileStatus = outcome.successful ?
+            (hasDiagnosticError ? 'failure' : 'success') : outcome.status;
+        await this.update(displayStatus, compileUri, isCurrent);
+        if (!isCurrent()) { return; }
+
+        if (outcome.validationProblems) {
+            console.warn('Overleaf compile validation problems.', outcome.validationProblems);
+        }
+
+        // A failed attempt can update logs, but it must not trigger a PDF reload:
+        // the visible PDF remains the last successful build.
+        if (outcome.successful) {
+            const { identifier } = parseUri(compileUri);
+            pdfViewRecord[identifier] && Object.values(pdfViewRecord[identifier]).forEach(
+                (record) => record.doc.refresh()
+            );
+        }
+    }
+
+    private async saveAllForCompile() {
+        this.suppressCompileOnSave += 1;
+        try {
+            await vscode.workspace.saveAll();
+        } finally {
+            this.suppressCompileOnSave -= 1;
+        }
+    }
+
+    private discardPendingSaveCoveredByCurrentRun() {
+        if (this.pendingCompileForce === false && this.pendingCompileRequestKind === 'automatic') {
+            this.pendingCompileForce = undefined;
+            this.pendingCompileRequestKind = undefined;
+            this.pendingCompileUri = undefined;
+        }
+    }
+
+    private hasDirtyProjectDocument(projectUri: vscode.Uri) {
+        const projectKey = projectConnectionKey(projectUri.authority, projectUri.query);
+        return hasDirtyCompileSource(projectKey, vscode.workspace.textDocuments.map(document => {
+            if (document.uri.scheme !== ROOT_NAME) {
+                return {isDirty: document.isDirty};
+            }
+            try {
+                return {
+                    isDirty: document.isDirty,
+                    projectKey: projectConnectionKey(document.uri.authority, document.uri.query),
+                };
+            } catch {
+                return {isDirty: document.isDirty};
+            }
+        }));
+    }
+
+    async compile(
+        force:boolean=false,
+        trigger:CompileTrigger='command',
+        requestedUri?: vscode.Uri,
+    ) {
+        const requestKind = compileRequestKindForTrigger(trigger);
         if (this.compileRunGate.active || this.stoppingCompile) {
-            if (this.compileRunGate.cancelled || this.stoppingCompile) {
-                this.pendingCompileForce = this.pendingCompileForce === true || force;
+            // Coalesce every trigger which arrives during an active run. In
+            // particular, a save during the initial cache probe must result in
+            // a fresh build after that probe finishes.
+            this.pendingCompileForce = this.pendingCompileForce === true || force;
+            const previousRequestKind = this.pendingCompileRequestKind;
+            this.pendingCompileRequestKind = mergeCompileRequestKinds(
+                previousRequestKind,
+                requestKind,
+            );
+            if (requestKind === 'manual' || previousRequestKind !== 'manual') {
+                this.pendingCompileUri = requestedUri;
             }
             return;
         }
@@ -276,16 +438,23 @@ export class CompileManager {
         await this.compileRunGate.run(async (isCurrent) => {
             let uri: vscode.Uri | undefined;
             try {
-                uri = await CompileManager.check();
+                uri = await CompileManager.check(requestedUri);
                 if (!isCurrent()) { return; }
                 this.activeCompileUri = uri;
                 if (!uri) {
                     this.status.hide();
                     return;
                 }
-                await vscode.workspace.saveAll(); // save all dirty files
-                if (!isCurrent()) { return; }
                 const compileUri = uri;
+
+                // On project open, probe the last successful server build before
+                // saveAll. Otherwise the save event is suppressed by this active
+                // run and a newly saved edit could be left behind a stale cache.
+                if (trigger !== 'initial-project') {
+                    await this.saveAllForCompile(); // save all dirty files
+                    if (!isCurrent()) { return; }
+                    this.discardPendingSaveCoveredByCurrentRun();
+                }
 
                 await this.update('compiling', compileUri, isCurrent);
                 if (!isCurrent()) { return; }
@@ -302,11 +471,32 @@ export class CompileManager {
                     ),
                 );
                 if (!isCurrent()) { return; }
+                if (trigger === 'initial-project') {
+                    // A hot-exit/restored dirty editor has not reached the VFS yet,
+                    // so its change cannot advance sourceRevision. Never adopt a
+                    // cached PDF while such a document exists.
+                    const cachedOutcome = this.hasDirtyProjectDocument(compileUri) ? undefined :
+                        await vfs.adoptCachedCompile(
+                            this.compileAsDraft,
+                            this.compileStopOnFirstError,
+                            rootDocId,
+                            isCurrent,
+                        );
+                    if (!isCurrent()) { return; }
+                    if (cachedOutcome) {
+                        await this.commitCompileOutcome(cachedOutcome, compileUri, isCurrent);
+                        return;
+                    }
+                    await this.saveAllForCompile();
+                    if (!isCurrent()) { return; }
+                    this.discardPendingSaveCoveredByCurrentRun();
+                }
                 const result = await vfs.compile(
                     force,
                     this.compileAsDraft,
                     this.compileStopOnFirstError,
                     rootDocId,
+                    requestKind,
                     isCurrent,
                     () => {
                         if (isCurrent()) {
@@ -320,31 +510,13 @@ export class CompileManager {
                     await this.update('success', compileUri, isCurrent);
                     return;
                 }
-                if (result === false) {
-                    await this.update('failed', compileUri, isCurrent);
-                    return;
-                }
-
-                const hasError = await vscode.commands.executeCommand<boolean>(
-                    `${ROOT_NAME}.compileManager.compileErrorCheck`,
-                    compileUri,
-                    isCurrent,
-                );
-                if (!isCurrent()) { return; }
-                await this.update(hasError ? 'failed' : 'success', compileUri, isCurrent);
-                if (!isCurrent()) { return; }
-
-                // refresh pdf
-                const { identifier } = parseUri(compileUri);
-                pdfViewRecord[identifier] && Object.values(pdfViewRecord[identifier]).forEach(
-                    (record) => record.doc.refresh()
-                );
+                await this.commitCompileOutcome(result, compileUri, isCurrent);
             } catch (error) {
                 if (!isCurrent()) { return; }
                 console.error('Compile failed unexpectedly.', error);
                 if (uri) {
                     try {
-                        await this.update('failed', uri, isCurrent);
+                        await this.update('error', uri, isCurrent);
                     } catch (statusError) {
                         console.error('Unable to update compile failure status.', statusError);
                     }
@@ -364,9 +536,17 @@ export class CompileManager {
     private async runPendingCompile() {
         if (this.compileRunGate.active || this.stoppingCompile) { return; }
         const pendingForce = this.pendingCompileForce;
+        const pendingRequestKind = this.pendingCompileRequestKind;
+        const pendingUri = this.pendingCompileUri;
         this.pendingCompileForce = undefined;
+        this.pendingCompileRequestKind = undefined;
+        this.pendingCompileUri = undefined;
         if (pendingForce !== undefined) {
-            await this.compile(pendingForce);
+            await this.compile(
+                pendingForce,
+                pendingRequestKind === 'automatic' ? 'save' : 'command',
+                pendingUri,
+            );
         }
     }
 
@@ -388,7 +568,7 @@ export class CompileManager {
         } finally {
             try {
                 if (uri) {
-                    await this.update('failed', uri);
+                    await this.update('terminated', uri);
                 }
             } finally {
                 this.stoppingCompile = false;
@@ -660,7 +840,14 @@ export class CompileManager {
             this.pdfViewerReadyTrigger,
             this.pdfViewDisposedTrigger,
             // register compile commands
-            vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.compile`, () => this.compile(true)),
+            vscode.commands.registerCommand(
+                `${ROOT_NAME}.compileManager.compile`,
+                (trigger?: CompileTrigger, requestedUri?: vscode.Uri) => this.compile(
+                    true,
+                    trigger === 'initial-project' ? trigger : 'command',
+                    requestedUri,
+                ),
+            ),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.viewPdf`, () =>  this.openPdf()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.syncCode`, () => this.syncCode()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.syncPdf`, (r) => this.syncPdf(r)),
@@ -669,19 +856,20 @@ export class CompileManager {
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.setRootDoc`, () => this.setRootDoc()),
             // register compile conditions
             vscode.workspace.onDidSaveTextDocument(async (e) => {
+                if (this.suppressCompileOnSave > 0) { return; }
                 const uri = await CompileManager.check.bind(this)(e.uri);
                 const vfs = uri && await this.vfsm.prefetch(uri);
                 const compileCondition = vscode.workspace.getConfiguration(`${ROOT_NAME}.compileOnSave`).get('enabled', true);
                 const postfixCondition = e.fileName.match(/\.tex$|\.sty$|\.cls$|\.bib$/i);
                 if (compileCondition && postfixCondition && vfs?.isInvisibleMode===false) {
-                    this.compile();
+                    this.compile(false, 'save', uri);
                 }
             }),
             EventBus.on('compilerUpdateEvent', () => {
-                this.compile(true);
+                this.compile(true, 'project-setting-event');
             }),
             EventBus.on('rootDocUpdateEvent', () => {
-                this.compile(true);
+                this.compile(true, 'project-setting-event');
             }),
             // register diagnostics triggers
             ...this.diagnosticProvider.triggers,

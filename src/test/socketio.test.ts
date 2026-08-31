@@ -1,5 +1,6 @@
+/* eslint-disable @typescript-eslint/naming-convention */
 import { strict as assert } from 'assert';
-import { SocketIOAPI } from '../api/socketio';
+import { RealtimeFatalError, SocketIOAPI } from '../api/socketio';
 import { SocketRequestError } from '../api/socketRequest';
 
 type Listener = (...args: any[]) => void;
@@ -73,6 +74,7 @@ class FakeBaseAPI {
 
 const identity = {csrfToken: 'csrf', cookies: 'session=cookie'};
 const project = {_id: 'project-id', rootFolder: []};
+const v2ProjectQuery = 'projectId=project-id&esh=1&ssp=1';
 
 function createAPI(url = 'https://www.overleaf.com') {
     const base = new FakeBaseAPI();
@@ -101,7 +103,7 @@ async function waitForEmission(socket: FakeRealtimeSocket, event: string, count 
 describe('SocketIOAPI project protocol', () => {
     it('starts with the project-query auto-join protocol', async () => {
         const {base, socket} = createAPI();
-        assert.equal(base.queries[0], 'projectId=project-id');
+        assert.equal(base.queries[0], v2ProjectQuery);
 
         const transport = base.sockets[0];
         assert.equal(transport.managerConnectCalls, 1);
@@ -157,7 +159,7 @@ describe('SocketIOAPI project protocol', () => {
 
         socket.init();
         assert.equal(base.sockets.length, 2);
-        assert.equal(base.queries[1], 'projectId=project-id');
+        assert.equal(base.queries[1], v2ProjectQuery);
     });
 
     it('retires an invalid v2 handshake instead of reusing its session id', () => {
@@ -175,7 +177,7 @@ describe('SocketIOAPI project protocol', () => {
         assert.equal(socket.generation, failedGeneration);
 
         socket.init();
-        assert.equal(base.queries[1], 'projectId=project-id');
+        assert.equal(base.queries[1], v2ProjectQuery);
     });
 
     it('retires a terminal HTTP handshake error with no active fallback', () => {
@@ -203,7 +205,7 @@ describe('SocketIOAPI project protocol', () => {
         socket.init();
         const replacement = base.sockets[1];
         assert.deepEqual(replacement.socket.options.transports, ['xhr-polling']);
-        assert.equal(base.queries[1], 'projectId=project-id');
+        assert.equal(base.queries[1], v2ProjectQuery);
 
         replacement.serverEmit('connect_failed');
         socket.init();
@@ -286,7 +288,7 @@ describe('SocketIOAPI project protocol', () => {
         );
 
         socket.init();
-        assert.equal(base.queries[2], 'projectId=project-id');
+        assert.equal(base.queries[2], v2ProjectQuery);
         const finalAttempt = base.sockets[2];
         finalAttempt.serverEmit('connect');
         finalAttempt.serverEmit('connectionAccepted', undefined, 'P.compat');
@@ -321,7 +323,7 @@ describe('SocketIOAPI project protocol', () => {
         assert.deepEqual(accepted, ['P.slow']);
 
         socket.init();
-        assert.equal(base.queries[1], 'projectId=project-id');
+        assert.equal(base.queries[1], v2ProjectQuery);
     });
 
     it('returns to v2 when a legacy probe reports client not handshaken', async () => {
@@ -342,7 +344,7 @@ describe('SocketIOAPI project protocol', () => {
         await assert.rejects(rejectedJoin);
 
         socket.init();
-        assert.equal(base.queries[2], 'projectId=project-id');
+        assert.equal(base.queries[2], v2ProjectQuery);
     });
 
     it('never revives a retired socket from late project events', async () => {
@@ -411,7 +413,7 @@ describe('SocketIOAPI project protocol', () => {
         );
 
         socket.init();
-        assert.equal(base.queries[2], 'projectId=project-id');
+        assert.equal(base.queries[2], v2ProjectQuery);
     });
 
     it('retires a disconnected unconfirmed legacy probe before returning to v2', async () => {
@@ -441,7 +443,7 @@ describe('SocketIOAPI project protocol', () => {
         assert.equal(socket.generation, retiredGeneration);
 
         socket.init();
-        assert.equal(base.queries[2], 'projectId=project-id');
+        assert.equal(base.queries[2], v2ProjectQuery);
     });
 
     it('restores a confirmed legacy protocol after leaving alternative mode', async () => {
@@ -466,6 +468,55 @@ describe('SocketIOAPI project protocol', () => {
         socket.init();
 
         assert.equal(base.queries[2], undefined);
+    });
+
+    it('accepts the empty public id used by the HTTP-backed alternative mode', async () => {
+        const {base, socket} = createAPI();
+        const transport = base.sockets[0];
+        // Exercise the alternative-mode join contract with the lightweight fake
+        // transport; SocketIOAlt emits the same empty connectionAccepted id.
+        (socket as any).scheme = 'Alt';
+        (socket as any)._socketInitScheme = 'Alt';
+        transport.serverEmit('connect');
+        transport.serverEmit('connectionAccepted', undefined, '');
+
+        const joined = socket.joinProject('project-id');
+        await waitForEmission(transport, 'joinProject');
+        transport.acknowledge('joinProject', undefined, project, undefined, undefined);
+
+        assert.strictEqual(await joined, project);
+        assert.equal(socket.projectSession?.publicId, '');
+    });
+
+    it('preserves known non-writing permissions through an alternative-mode join', async () => {
+        for (const permissionsLevel of ['readOnly', 'review'] as const) {
+            const {base, socket} = createAPI();
+            const transport = base.sockets[0];
+            transport.serverEmit('connect');
+            const joined = socket.joinProject('project-id');
+            transport.serverEmit('joinProjectResponse', {
+                publicId: `P.${permissionsLevel}`, project, permissionsLevel, protocolVersion: 2,
+            });
+            await joined;
+
+            (socket as any).scheme = 'Alt';
+            (socket as any)._socketInitScheme = 'Alt';
+            (socket as any).resetTransportState();
+            transport.serverEmit('connect');
+            transport.serverEmit('connectionAccepted', undefined, '');
+            const alternativeJoin = socket.joinProject('project-id');
+            await waitForEmission(transport, 'joinProject', 1);
+            transport.acknowledge('joinProject', undefined, project, undefined, undefined);
+            await alternativeJoin;
+
+            assert.equal(socket.projectSession?.permissionsLevel, permissionsLevel);
+            const sentBeforeWrite = transport.emitted.length;
+            await assert.rejects(
+                socket.applyOtUpdate('doc-id', {doc: 'doc-id', v: 1, op: [{p: 0, i: 'x'}]}),
+                (error: unknown) => error instanceof SocketRequestError && error.code === 'server_error',
+            );
+            assert.equal(transport.emitted.length, sentBeforeWrite);
+        }
     });
 
     it('recreates a confirmed legacy transport after a recoverable interruption', async () => {
@@ -501,7 +552,7 @@ describe('SocketIOAPI project protocol', () => {
         replacementV1.serverEmit('connectionAccepted', undefined, 'P.legacy-again');
         const secondJoin = socket.joinProject('project-id', 50);
         await waitForEmission(replacementV1, 'joinProject');
-        replacementV1.acknowledge('joinProject', undefined, project, 'owner', 2);
+        replacementV1.acknowledge('joinProject', undefined, project, 'owner', 1);
         assert.equal(await secondJoin, project);
         assert.equal(base.sockets.length, 3);
         assert.equal(base.queries[2], undefined);
@@ -524,6 +575,246 @@ describe('SocketIOAPI project protocol', () => {
 
         assert.strictEqual(await joined, project);
         assert.deepEqual(accepted, ['first:P.first']);
+    });
+
+    it('echoes the complete server heartbeat with client transport identity', () => {
+        const {base} = createAPI();
+        const transport = base.sockets[0];
+        transport.socket.transport = {name: 'websocket'};
+        transport.socket.sessionid = 'client-session';
+
+        transport.serverEmit('serverPing', 7, 1234, 'xhr-polling', 'server-session');
+
+        const pong = transport.emitted.find(item => item.event === 'clientPong');
+        assert.deepEqual(pong?.args, [
+            7,
+            1234,
+            'xhr-polling',
+            'server-session',
+            'websocket',
+            'client-session',
+        ]);
+    });
+
+    it('retires once for reconnectGracefully and uses the ordinary recovery channel', () => {
+        const {base, socket} = createAPI();
+        const transport = base.sockets[0];
+        let disconnects = 0;
+        let fatals = 0;
+        socket.updateEventHandlers({
+            onDisconnected: () => { disconnects += 1; },
+            onFatalError: () => { fatals += 1; },
+        });
+        transport.serverEmit('connect');
+
+        transport.serverEmit('reconnectGracefully');
+        transport.serverEmit('reconnectGracefully');
+
+        assert.equal(disconnects, 1);
+        assert.equal(fatals, 0);
+        assert.equal(socket.needsReinit, true);
+        assert.equal(transport.socket.options.reconnect, false);
+    });
+
+    it('treats access revocation as terminal without entering the disconnect retry path', () => {
+        const {base, socket} = createAPI();
+        const transport = base.sockets[0];
+        const fatalErrors: RealtimeFatalError[] = [];
+        let disconnects = 0;
+        socket.updateEventHandlers({
+            onDisconnected: () => { disconnects += 1; },
+            onFatalError: error => fatalErrors.push(error),
+        });
+        transport.serverEmit('connect');
+
+        transport.serverEmit('project:access:revoked');
+
+        assert.equal(disconnects, 0);
+        assert.equal(fatalErrors.length, 1);
+        assert.equal(fatalErrors[0].code, 'access_revoked');
+        assert.equal(socket.needsReinit, false);
+        assert.throws(() => socket.init(), RealtimeFatalError);
+    });
+
+    it('treats forceDisconnect as terminal and honors an immediate server delay', async () => {
+        const {base, socket} = createAPI();
+        const transport = base.sockets[0];
+        const fatalErrors: RealtimeFatalError[] = [];
+        socket.updateEventHandlers({onFatalError: error => fatalErrors.push(error)});
+        transport.serverEmit('connect');
+
+        transport.serverEmit('forceDisconnect', 'maintenance', 0);
+        await new Promise<void>(resolve => setTimeout(resolve, 5));
+
+        assert.equal(fatalErrors[0]?.code, 'force_disconnect');
+        assert.equal(socket.isConnected, false);
+        assert.equal(transport.connected, false);
+        assert.equal(socket.needsReinit, false);
+    });
+
+    it('publishes every successful project session with permission and protocol metadata', async () => {
+        const {base, socket} = createAPI();
+        const transport = base.sockets[0];
+        const sessions: any[] = [];
+        socket.updateEventHandlers({onProjectJoined: session => sessions.push(session)});
+        transport.serverEmit('connect');
+
+        const firstJoin = socket.joinProject('project-id');
+        transport.serverEmit('joinProjectResponse', {
+            publicId: 'P.metadata',
+            project,
+            permissionsLevel: 'readAndWrite',
+            protocolVersion: 2,
+        });
+        await firstJoin;
+        await socket.joinProject('project-id');
+
+        assert.deepEqual(sessions, [
+            {
+                publicId: 'P.metadata',
+                permissionsLevel: 'readAndWrite',
+                protocolVersion: 2,
+                generation: socket.generation,
+            },
+            {
+                publicId: 'P.metadata',
+                permissionsLevel: 'readAndWrite',
+                protocolVersion: 2,
+                generation: socket.generation,
+            },
+        ]);
+        assert.deepEqual(socket.projectSession, sessions[1]);
+    });
+
+    it('fails closed for read-only and review-only plain OT writes', async () => {
+        for (const permissionsLevel of ['readOnly', 'review'] as const) {
+            const {base, socket} = createAPI();
+            const transport = base.sockets[0];
+            transport.serverEmit('connect');
+            const joined = socket.joinProject('project-id');
+            transport.serverEmit('joinProjectResponse', {
+                publicId: `P.${permissionsLevel}`,
+                project,
+                permissionsLevel,
+                protocolVersion: 2,
+            });
+            await joined;
+
+            await assert.rejects(
+                socket.applyOtUpdate('doc-id', {doc: 'doc-id', v: 1, op: [{p: 0, i: 'x'}]}),
+                (error: unknown) => error instanceof SocketRequestError && error.code === 'server_error',
+            );
+            assert.equal(transport.emitted.some(item => item.event === 'applyOtUpdate'), false);
+        }
+    });
+
+    it('consumes otUpdateError and retires the generation before a late ACK', async () => {
+        const {base, socket} = createAPI();
+        const transport = base.sockets[0];
+        const updateErrors: any[] = [];
+        let disconnects = 0;
+        socket.updateEventHandlers({
+            onOtUpdateError: error => updateErrors.push(error),
+            onDisconnected: () => { disconnects += 1; },
+        });
+        transport.serverEmit('connect');
+        const joined = socket.joinProject('project-id');
+        transport.serverEmit('joinProjectResponse', {
+            publicId: 'P.writer',
+            project,
+            permissionsLevel: 'owner',
+            protocolVersion: 2,
+        });
+        await joined;
+        const saving = socket.applyOtUpdate('doc-id', {doc: 'doc-id', v: 4, op: [{p: 0, i: 'x'}]});
+        await waitForEmission(transport, 'applyOtUpdate');
+
+        transport.serverEmit('otUpdateError', 'update is too large', {
+            project_id: 'project-id',
+            doc_id: 'doc-id',
+            error: 'update is too large',
+        });
+        transport.acknowledge('applyOtUpdate', undefined);
+
+        await assert.rejects(
+            saving,
+            (error: unknown) => error instanceof SocketRequestError && error.code === 'stale_connection',
+        );
+        assert.deepEqual(updateErrors[0], {
+            message: 'update is too large',
+            projectId: 'project-id',
+            docId: 'doc-id',
+            details: {
+                project_id: 'project-id',
+                doc_id: 'doc-id',
+                error: 'update is too large',
+            },
+        });
+        assert.equal(disconnects, 1);
+        assert.equal(socket.needsReinit, true);
+    });
+
+    it('stops reconnecting when the protocol changes across project joins', async () => {
+        const {base, socket} = createAPI();
+        const first = base.sockets[0];
+        let disconnects = 0;
+        socket.updateEventHandlers({onDisconnected: () => { disconnects += 1; }});
+        first.serverEmit('connect');
+        const firstJoin = socket.joinProject('project-id');
+        first.serverEmit('joinProjectResponse', {
+            publicId: 'P.v2', project, permissionsLevel: 'owner', protocolVersion: 2,
+        });
+        await firstJoin;
+        first.serverEmit('disconnect');
+
+        socket.init();
+        const second = base.sockets[1];
+        const fatalErrors: RealtimeFatalError[] = [];
+        socket.updateEventHandlers({onFatalError: error => fatalErrors.push(error)});
+        second.serverEmit('connect');
+        const changedJoin = socket.joinProject('project-id');
+        second.serverEmit('joinProjectResponse', {
+            publicId: 'P.v3', project, permissionsLevel: 'owner', protocolVersion: 3,
+        });
+
+        await assert.rejects(
+            changedJoin,
+            (error: unknown) => error instanceof RealtimeFatalError && error.code === 'protocol_changed',
+        );
+        assert.equal(fatalErrors[0]?.code, 'protocol_changed');
+        assert.equal(disconnects, 1);
+        assert.equal(socket.needsReinit, false);
+    });
+
+    it('rejects History OT documents without advertising unsupported capability', async () => {
+        const {base, socket} = createAPI();
+        const transport = base.sockets[0];
+        transport.serverEmit('connect');
+        const joined = socket.joinProject('project-id');
+        transport.serverEmit('joinProjectResponse', {
+            publicId: 'P.history', project, permissionsLevel: 'owner', protocolVersion: 2,
+        });
+        await joined;
+
+        const joiningDoc = socket.joinDoc('history-doc');
+        await waitForEmission(transport, 'joinDoc');
+        const joinEmission = transport.emitted.find(item => item.event === 'joinDoc');
+        assert.deepEqual(joinEmission?.args[1], {encodeRanges: true});
+        transport.acknowledge(
+            'joinDoc',
+            undefined,
+            ['tracked'],
+            1,
+            [],
+            {},
+            'history-ot',
+        );
+
+        await assert.rejects(
+            joiningDoc,
+            (error: unknown) => error instanceof RealtimeFatalError && error.code === 'unsupported_history_ot',
+        );
+        assert.equal(socket.needsReinit, false);
     });
 
     it('removes physical handlers when the socket session is disposed', () => {

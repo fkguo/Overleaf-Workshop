@@ -3,7 +3,7 @@ import * as stream from 'stream';
 import * as FormData from 'form-data';
 import { v4 as uuidv4 } from 'uuid';
 import { fetch } from 'undici';
-import { FileEntity, FileType, FolderEntity, OutputFileEntity } from '../core/remoteFileSystemProvider';
+import { FileEntity, FileType, FolderEntity } from '../core/remoteFileSystemProvider';
 import { downloadWithRanges } from './httpDownload';
 import { HttpMethod, shouldRetryHttpRequest } from './httpRequestPolicy';
 
@@ -22,27 +22,76 @@ export interface Identity {
     cookies: string;
 }
 
+interface RequestOptions {
+    timeoutMs?: number;
+    maxRetries?: number;
+}
+
 export interface NewProjectResponseSchema {
     project_id: string,
     owner_ref: string,
     owner: MemberEntity
 }
 
+export type CompileStatus =
+    | 'success'
+    | 'failure'
+    | 'error'
+    | 'stopped-on-first-error'
+    | 'clsi-maintenance'
+    | 'clsi-unavailable'
+    | 'compile-in-progress'
+    | 'conflict'
+    | 'exited'
+    | 'missing-updates'
+    | 'project-too-large'
+    | 'rate-limited'
+    | 'terminated'
+    | 'too-recently-compiled'
+    | 'timedout'
+    | 'autocompile-backoff'
+    | 'autocompile-disabled'
+    | 'unavailable'
+    | 'validation-problems'
+    | 'validation-fail'
+    | 'validation-pass';
+
+export interface CompileOutputFileSchema {
+    url: string;
+    downloadURL?: string;
+    build: string;
+    path: string;
+    type: string;
+    size?: number;
+    editorId?: string;
+    ranges?: unknown;
+    contentId?: string;
+}
+
 export interface CompileResponseSchema {
-    status: 'success' | 'failure' | 'error';
-    compileGroup: string;
+    status: CompileStatus;
+    compileGroup?: string;
     clsiServerId?: string;
+    clsiCacheShard?: string;
     pdfDownloadDomain?: string;
-    outputFiles: Array<OutputFileEntity>;
-    stats: {
+    pdfCachingMinChunkSize?: number;
+    outputFiles: Array<CompileOutputFileSchema>;
+    stats?: {
         "latexmk-errors":number, "pdf-size":number,
         "latex-runs":number, "latex-runs-with-errors":number,
         "latex-runs-0":number, "latex-runs-with-error-0s":number,
     };
-    timings: {
+    timings?: {
         "sync":number, "compile":number, "output":number, "compileE2E":number,
     };
-    enableHybridPdfDownload: boolean;
+    validationProblems?: unknown;
+    enableHybridPdfDownload?: boolean;
+    fromCache?: boolean;
+    options?: {
+        rootResourcePath?: string | null,
+        draft?: boolean,
+        stopOnFirstError?: boolean,
+    };
 }
 
 export interface SyncPdfResponseSchema {
@@ -114,16 +163,24 @@ export interface ProjectTagsResponseSchema {
 export interface ProjectLabelResponseSchema {
     id: string,
     comment: string,
-    version: string,
+    version: number | string,
     user_id: string,
-    created_at: number,
+    created_at: number | string,
     user_display_name?: string,
 }
 
 export interface ProjectUpdateMeta {
-    users: {id:string, first_name:string, last_name?:string, email:string}[],
+    users: ({id:string, first_name:string, last_name?:string, email:string} | null)[],
     start_ts: number,
     end_ts: number,
+    type?: string,
+    source?: string,
+    origin?: string | {
+        kind: string,
+        path?: string,
+        timestamp?: string | number,
+        version?: number,
+    },
 }
 
 export interface ProjectHistoryResponseSchema {
@@ -135,20 +192,23 @@ export interface ProjectHistoryResponseSchema {
     project_ops:{
         add?: {pathname:string},
         remove?: {pathname:string},
+        rename?: {pathname:string, newPathname:string},
         atV: number,
     }[],
 }
 
 export interface ProjectUpdateResponseSchema {
     updates: ProjectHistoryResponseSchema[],
-    nextBeforeTimestamp: number,
+    nextBeforeTimestamp?: number,
+}
+
+export interface ProjectFileDiffChunkSchema {
+        u?: string, d?: string, i?: string,
+        meta?: ProjectUpdateMeta,
 }
 
 export interface ProjectFileDiffResponseSchema {
-    diff: {
-        u?: string, d?: string, i?: string,
-        meta?: ProjectUpdateMeta,
-    }[]
+    diff?: ProjectFileDiffChunkSchema[] | {binary: true},
 }
 
 export interface ProjectFileTreeDiffResponseSchema {
@@ -353,19 +413,32 @@ export class BaseAPI {
         return this;
     }
 
-    protected async request(type:HttpMethod, route:string, body?:FormData|object, callback?: (res?:string)=>object|undefined, extraHeaders?:object ): Promise<ResponseSchema> {
+    protected async request(
+        type:HttpMethod,
+        route:string,
+        body?:FormData|object,
+        callback?: (res?:string)=>object|undefined,
+        extraHeaders?:object,
+        options?:RequestOptions,
+    ): Promise<ResponseSchema> {
         if (this.identity===undefined) { return Promise.reject(); }
 
-        const MAX_HTTP_RETRIES = 2;
+        const maxHttpRetries = options?.maxRetries ?? 2;
         let lastError: {statusCode?: number, message?: string} = {};
 
-        for (let attempt = 0; attempt <= MAX_HTTP_RETRIES; attempt++) {
+        for (let attempt = 0; attempt <= maxHttpRetries; attempt++) {
+            const abortController = options?.timeoutMs ? new AbortController() : undefined;
+            const abortTimer = abortController ? setTimeout(
+                () => abortController.abort(),
+                options!.timeoutMs,
+            ) : undefined;
             try {
                 let res = undefined;
                 switch(type) {
                     case 'GET':
                         res = await fetch(this.url+route, {
                             method: 'GET', redirect: 'manual',
+                            signal: abortController?.signal,
                             headers: {
                                 'Connection': 'keep-alive',
                                 'Cookie': this.identity!.cookies,
@@ -381,6 +454,7 @@ export class BaseAPI {
                         });
                         res = await fetch(this.url+route, {
                             method: 'POST', redirect: 'manual',
+                            signal: abortController?.signal,
                             headers: {
                                 'Connection': 'keep-alive',
                                 'Cookie': this.identity!.cookies,
@@ -395,6 +469,7 @@ export class BaseAPI {
                     case 'DELETE':
                         res = await fetch(this.url+route, {
                             method: 'DELETE', redirect: 'manual',
+                            signal: abortController?.signal,
                             headers: {
                                 'Connection': 'keep-alive',
                                 'Cookie': this.identity!.cookies,
@@ -412,10 +487,10 @@ export class BaseAPI {
                         type: 'success',
                         ...response
                     } as ResponseSchema;
-                } else if (res && shouldRetryHttpRequest(type, res.status) && attempt < MAX_HTTP_RETRIES) {
+                } else if (res && shouldRetryHttpRequest(type, res.status) && attempt < maxHttpRetries) {
                     // Transient error: retry with backoff
                     const delayMs = Math.min(1000 * Math.pow(2, attempt), 4000);
-                    console.log(`HTTP ${res.status} on ${route}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_HTTP_RETRIES})`);
+                    console.log(`HTTP ${res.status} on ${route}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${maxHttpRetries})`);
                     lastError = {statusCode: res.status, message: await res.text().catch(() => '')};
                     await new Promise(r => setTimeout(r, delayMs));
                     continue;
@@ -432,9 +507,9 @@ export class BaseAPI {
                 const errMsg = [err?.message, err?.cause?.code, err?.cause?.message]
                     .filter(Boolean)
                     .join(': ') || String(err);
-                if (shouldRetryHttpRequest(type, undefined, errMsg) && attempt < MAX_HTTP_RETRIES) {
+                if (shouldRetryHttpRequest(type, undefined, errMsg) && attempt < maxHttpRetries) {
                     const delayMs = Math.min(1000 * Math.pow(2, attempt), 4000);
-                    console.log(`HTTP fetch error on ${route}: ${errMsg}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_HTTP_RETRIES})`);
+                    console.log(`HTTP fetch error on ${route}: ${errMsg}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${maxHttpRetries})`);
                     await new Promise(r => setTimeout(r, delayMs));
                     continue;
                 }
@@ -442,13 +517,15 @@ export class BaseAPI {
                     type: 'error',
                     message: errMsg
                 };
+            } finally {
+                if (abortTimer) { clearTimeout(abortTimer); }
             }
         }
 
         // All retries exhausted
         return {
             type: 'error',
-            message: lastError.message || `Request failed after ${MAX_HTTP_RETRIES + 1} attempts`
+            message: lastError.message || `Request failed after ${maxHttpRetries + 1} attempts`
         };
     }
 
@@ -626,7 +703,8 @@ export class BaseAPI {
     }
 
     async compile(identity:Identity, projectId:string, rootResourcePath:string|null,
-        draft:boolean=false, stopOnFirstError:boolean=false, editorId?: string
+        draft:boolean=false, stopOnFirstError:boolean=false, editorId?: string,
+        isAutoCompile:boolean=false,
     ) {
         const body = {
             check: 'silent',
@@ -638,10 +716,19 @@ export class BaseAPI {
         };
 
         this.setIdentity(identity);
-        return this.request('POST', `project/${projectId}/compile?auto_compile=true`, body, (res) => {
+        const query = isAutoCompile ? '?auto_compile=true' : '';
+        return this.request('POST', `project/${projectId}/compile${query}`, body, (res) => {
             const compile = JSON.parse(res!) as CompileResponseSchema;
             return {compile};
         }, {'X-Csrf-Token': identity.csrfToken});
+    }
+
+    async getCachedCompile(identity:Identity, projectId:string) {
+        this.setIdentity(identity);
+        return this.request('GET', `project/${projectId}/output/cached/output.overleaf.json`, undefined, (res) => {
+            const compile = JSON.parse(res!) as CompileResponseSchema;
+            return {compile};
+        }, undefined, {timeoutMs: 5000, maxRetries: 0});
     }
 
     async stopCompile(identity:Identity, projectId:string) {
@@ -825,7 +912,7 @@ export class BaseAPI {
     }
 
     async proxyToHistoryApiAndGetUpdates(identity:Identity, projectId:string, before?:number) {
-        const beforeQuery = before? `&before=${before}` : '';
+        const beforeQuery = before !== undefined ? `&before=${before}` : '';
 
         this.setIdentity(identity);
         return this.request('GET', `project/${projectId}/updates?min_count=10${beforeQuery}`, undefined, (res) => {
@@ -835,8 +922,13 @@ export class BaseAPI {
     }
 
     async proxyToHistoryApiAndGetFileDiff(identity:Identity, projectId:string, pathname:string, from:number, to:number) {
+        const params = new URLSearchParams({
+            pathname,
+            from: String(from),
+            to: String(to),
+        });
         this.setIdentity(identity);
-        return this.request('GET', `project/${projectId}/diff?pathname=${pathname}&from=${from}&to=${to}`, undefined, (res) => {
+        return this.request('GET', `project/${projectId}/diff?${params.toString()}`, undefined, (res) => {
             const diff = JSON.parse(res!) as ProjectFileDiffResponseSchema;
             return {diff};
         });

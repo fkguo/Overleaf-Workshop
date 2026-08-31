@@ -58,6 +58,42 @@ export interface UpdateSchema {
     }
 }
 
+export type PermissionsLevel = 'owner' | 'readAndWrite' | 'review' | 'readOnly';
+
+export interface ProjectSessionSchema {
+    publicId: string,
+    permissionsLevel?: PermissionsLevel,
+    protocolVersion?: number,
+    generation: number,
+}
+
+export interface OtUpdateErrorSchema {
+    message: string,
+    projectId?: string,
+    docId?: string,
+    details?: unknown,
+}
+
+export type RealtimeFatalErrorCode =
+    | 'access_revoked'
+    | 'force_disconnect'
+    | 'protocol_changed'
+    | 'project_unavailable'
+    | 'unsupported_history_ot';
+
+export class RealtimeFatalError extends Error {
+    readonly retryable = false;
+
+    constructor(
+        public readonly code: RealtimeFatalErrorCode,
+        message: string,
+        public readonly details?: unknown,
+    ) {
+        super(message);
+        this.name = 'RealtimeFatalError';
+    }
+}
+
 export interface EventsHandler {
     onFileCreated?: (parentFolderId:string, type:FileType, entity:FileEntity) => void,
     onFileRenamed?: (entityId:string, newName:string) => void,
@@ -67,6 +103,9 @@ export interface EventsHandler {
     //
     onDisconnected?: () => void,
     onConnectionAccepted?: (publicId:string) => void,
+    onProjectJoined?: (session:ProjectSessionSchema) => void,
+    onOtUpdateError?: (error:OtUpdateErrorSchema) => void,
+    onFatalError?: (error:RealtimeFatalError) => void,
     onClientUpdated?: (user:UpdateUserSchema) => void,
     onClientDisconnected?: (id:string) => void,
     //
@@ -83,6 +122,13 @@ type Deferred<T> = {
     promise: Promise<T>,
     resolve: (value: T) => void,
     reject: (reason?: unknown) => void,
+};
+
+type ProjectJoinResponse = {
+    project: ProjectEntity,
+    publicId?: string,
+    permissionsLevel?: PermissionsLevel,
+    protocolVersion?: number,
 };
 
 function deferred<T>(): Deferred<T> {
@@ -119,7 +165,7 @@ export class SocketIOAPI {
     private transportConnectedSignal = deferred<number>();
     private connectionAcceptedSignal = deferred<{generation: number, publicId: string}>();
     private connectionAcceptedGeneration?: number;
-    private v2ProjectResponse?: Deferred<ProjectEntity> & {generation: number};
+    private v2ProjectResponse?: Deferred<ProjectJoinResponse> & {generation: number};
     private documentMembershipQueue: Promise<void> = Promise.resolve();
     private legacyV1Rejected = false;
     private legacyProbeAttempted = false;
@@ -128,6 +174,13 @@ export class SocketIOAPI {
     private realtimeSchemeBeforeAlternative: Exclude<ConnectionScheme, 'Alt'> = 'v2';
     private pollingFallbackAttempts = 0;
     private disposed = false;
+    private currentPublicId?: string;
+    private currentPermissionsLevel?: PermissionsLevel;
+    private lastKnownPermissionsLevel?: PermissionsLevel;
+    private protocolVersion?: number;
+    private joinedGeneration?: number;
+    private terminalFailure?: RealtimeFatalError;
+    private readonly disconnectedNotifications = new WeakSet<object>();
 
     constructor(private url:string,
                 private readonly api:BaseAPI,
@@ -145,6 +198,9 @@ export class SocketIOAPI {
     init() {
         if (this.disposed) {
             throw new SocketRequestError('stale_connection', 'Socket session is disposed', false);
+        }
+        if (this.terminalFailure) {
+            throw this.terminalFailure;
         }
         this.resetTransportState();
 
@@ -186,7 +242,11 @@ export class SocketIOAPI {
             case 'v2':
                 this.record = undefined;
                 // The 0.9 client adds a fresh cache-busting timestamp itself.
-                const query = new URLSearchParams({projectId: this.projectId}).toString();
+                const query = new URLSearchParams({
+                    projectId: this.projectId,
+                    esh: '1',
+                    ssp: '1',
+                }).toString();
                 this.socket = this.api._initSocketV0(this.identity, query);
                 break;
         }
@@ -234,7 +294,7 @@ export class SocketIOAPI {
 
     /** Returns true if the socket needs re-initialization (scheme changed, or socket was never init'd) */
     get needsReinit(): boolean {
-        return this._socketInitScheme !== this.scheme || !this.socket;
+        return !this.terminalFailure && (this._socketInitScheme !== this.scheme || !this.socket);
     }
 
     get isConnected(): boolean {
@@ -243,6 +303,20 @@ export class SocketIOAPI {
 
     get generation(): number {
         return this.socketGeneration;
+    }
+
+    get fatalError(): RealtimeFatalError | undefined {
+        return this.terminalFailure;
+    }
+
+    get projectSession(): ProjectSessionSchema | undefined {
+        if (this.joinedGeneration === undefined || this.currentPublicId === undefined) { return undefined; }
+        return {
+            publicId: this.currentPublicId,
+            permissionsLevel: this.currentPermissionsLevel,
+            protocolVersion: this.protocolVersion,
+            generation: this.joinedGeneration,
+        };
     }
 
     private stopSocketReconnect(socket: any) {
@@ -287,8 +361,23 @@ export class SocketIOAPI {
     }
 
     invalidateCurrentTransport() {
+        // Fatal failures own their user-facing terminal path. Do not additionally
+        // publish an ordinary disconnect, which would make the VFS retry forever.
+        this.retireCurrentTransport(!this.terminalFailure);
+    }
+
+    private notifyDisconnected(socket: any) {
+        if (typeof socket !== 'object' || socket === null) { return; }
+        if (this.disconnectedNotifications.has(socket)) { return; }
+        this.disconnectedNotifications.add(socket);
+        this._handlers.forEach(handler => handler.onDisconnected?.());
+    }
+
+    private retireCurrentTransport(notifyDisconnected: boolean, disconnectDelayMs: number = 0) {
         this._socketInitScheme = undefined;
         this.connectionAcceptedGeneration = undefined;
+        this.joinedGeneration = undefined;
+        this.currentPermissionsLevel = this.scheme === 'Alt' ? this.lastKnownPermissionsLevel : undefined;
 
         const socket = this.socket;
         if (!socket) { return; }
@@ -301,7 +390,24 @@ export class SocketIOAPI {
         if (this.lastDisconnectedSocket !== socket) {
             this.markTransportDisconnected(socket);
         }
-        setTimeout(() => socket.disconnect?.(), 0);
+        if (notifyDisconnected) {
+            this.notifyDisconnected(socket);
+        }
+        setTimeout(() => socket.disconnect?.(), disconnectDelayMs);
+    }
+
+    private terminateRealtime(
+        code: RealtimeFatalErrorCode,
+        message: string,
+        details?: unknown,
+        disconnectDelayMs: number = 0,
+    ): RealtimeFatalError {
+        if (this.terminalFailure) { return this.terminalFailure; }
+        const failure = new RealtimeFatalError(code, message, details);
+        this.terminalFailure = failure;
+        this.retireCurrentTransport(false, disconnectDelayMs);
+        this._handlers.forEach(handler => handler.onFatalError?.(failure));
+        return failure;
     }
 
     private resetTransportState() {
@@ -320,6 +426,9 @@ export class SocketIOAPI {
         ));
         this.connectionAcceptedSignal = deferred<{generation: number, publicId: string}>();
         this.connectionAcceptedGeneration = undefined;
+        this.currentPublicId = undefined;
+        this.currentPermissionsLevel = this.scheme === 'Alt' ? this.lastKnownPermissionsLevel : undefined;
+        this.joinedGeneration = undefined;
         this.rejectV2ProjectResponse(new SocketRequestError(
             'stale_connection',
             'Socket transport was replaced',
@@ -356,6 +465,9 @@ export class SocketIOAPI {
         ));
         this.connectionAcceptedSignal = deferred<{generation: number, publicId: string}>();
         this.connectionAcceptedGeneration = undefined;
+        this.currentPublicId = undefined;
+        this.currentPermissionsLevel = undefined;
+        this.joinedGeneration = undefined;
         this.rejectV2ProjectResponse(new SocketRequestError(
             'disconnected',
             'Socket disconnected before the project session was ready',
@@ -366,7 +478,7 @@ export class SocketIOAPI {
     private ensureV2ProjectResponse() {
         if (!this.v2ProjectResponse || this.v2ProjectResponse.generation !== this.socketGeneration) {
             this.v2ProjectResponse = {
-                ...deferred<ProjectEntity>(),
+                ...deferred<ProjectJoinResponse>(),
                 generation: this.socketGeneration,
             };
         }
@@ -381,6 +493,9 @@ export class SocketIOAPI {
     async waitUntilConnected(timeoutMs: number = CONNECT_TIMEOUT_MS): Promise<number> {
         if (this.disposed) {
             throw new SocketRequestError('stale_connection', 'Socket session is disposed', false);
+        }
+        if (this.terminalFailure) {
+            throw this.terminalFailure;
         }
         if (this.transportConnected) {
             return this.socketGeneration;
@@ -436,6 +551,92 @@ export class SocketIOAPI {
         return queued;
     }
 
+    private acceptPublicId(socket: any, publicId: unknown) {
+        if (
+            socket !== this.socket ||
+            socket === this.retiredSocket ||
+            !this.transportConnected
+        ) { return; }
+        const normalizedPublicId = String(publicId ?? '');
+        const activeScheme = this._socketInitScheme ?? this.scheme;
+        // The HTTP-backed Invisible Mode has no realtime public id, but its
+        // synthetic transport still needs an accepted project-session barrier.
+        if (!normalizedPublicId && activeScheme !== 'Alt') { return; }
+        const alreadyAccepted =
+            this.connectionAcceptedGeneration === this.socketGeneration &&
+            this.currentPublicId === normalizedPublicId;
+        this.connectionAcceptedGeneration = this.socketGeneration;
+        this.currentPublicId = normalizedPublicId;
+        this.connectionAcceptedSignal.resolve({
+            generation: this.socketGeneration,
+            publicId: normalizedPublicId,
+        });
+        if (!alreadyAccepted) {
+            this._handlers.forEach(handler => handler.onConnectionAccepted?.(normalizedPublicId));
+        }
+    }
+
+    private finalizeProjectJoin(
+        response: ProjectJoinResponse,
+        generation: number,
+        fallbackPublicId?: string,
+    ): ProjectEntity {
+        const publicId = response.publicId ?? fallbackPublicId ?? this.currentPublicId;
+        const activeScheme = this._socketInitScheme ?? this.scheme;
+        if (
+            publicId === undefined ||
+            (!publicId && activeScheme !== 'Alt') ||
+            generation !== this.socketGeneration ||
+            !this.transportConnected
+        ) {
+            throw new SocketRequestError(
+                'stale_connection',
+                'Project session changed before join completion',
+                false,
+            );
+        }
+        if (
+            this.protocolVersion !== undefined &&
+            response.protocolVersion !== undefined &&
+            this.protocolVersion !== response.protocolVersion
+        ) {
+            throw this.terminateRealtime(
+                'protocol_changed',
+                `Realtime protocol changed from ${this.protocolVersion} to ${response.protocolVersion}`,
+                response,
+            );
+        }
+        if (response.protocolVersion !== undefined) {
+            this.protocolVersion = response.protocolVersion;
+        }
+        const permissionsLevel = response.permissionsLevel ??
+            (activeScheme === 'Alt' ? this.currentPermissionsLevel ?? this.lastKnownPermissionsLevel : undefined);
+        this.currentPublicId = publicId;
+        this.currentPermissionsLevel = permissionsLevel;
+        if (permissionsLevel !== undefined) {
+            this.lastKnownPermissionsLevel = permissionsLevel;
+        }
+        this.joinedGeneration = generation;
+        const session: ProjectSessionSchema = {
+            publicId,
+            permissionsLevel,
+            protocolVersion: response.protocolVersion ?? this.protocolVersion,
+            generation,
+        };
+        this._handlers.forEach(handler => handler.onProjectJoined?.(session));
+        return response.project;
+    }
+
+    private normalizeOtUpdateError(error: unknown, details?: any): OtUpdateErrorSchema {
+        const message = String(details?.error ?? (error instanceof Error ? error.message : error) ?? 'Unknown OT update error');
+        return {
+            message,
+            projectId: typeof details?.project_id === 'string' ? details.project_id : undefined,
+            docId: typeof details?.doc_id === 'string' ? details.doc_id : undefined,
+            details,
+        };
+    }
+
     private initInternalHandlers(socketAtInit: any) {
         socketAtInit.on('connect', () => {
             if (this.markTransportConnected(socketAtInit)) {
@@ -444,29 +645,24 @@ export class SocketIOAPI {
             }
         });
         socketAtInit.on('disconnect', () => {
-            this.markTransportDisconnected(socketAtInit);
-            if (
+            const wasCurrent =
                 !this.disposed &&
+                !this.terminalFailure &&
                 socketAtInit === this.socket &&
-                socketAtInit !== this.retiredSocket
-            ) {
+                socketAtInit !== this.retiredSocket;
+            if (wasCurrent) {
+                this.markTransportDisconnected(socketAtInit);
                 // Do not enter socket.io 0.9's automatic reconnect loop. Retire
                 // the failed transport; the VFS single-flight retry creates a
                 // clean replacement after this disconnect event is delivered.
-                this.invalidateCurrentTransport();
+                this.retiredSocket = socketAtInit;
+                this._socketInitScheme = undefined;
+                this.stopSocketReconnect(socketAtInit);
+                this.notifyDisconnected(socketAtInit);
             }
         });
         socketAtInit.on('connectionAccepted', (_:any, publicId:any) => {
-            if (
-                socketAtInit !== this.socket ||
-                socketAtInit === this.retiredSocket ||
-                !this.transportConnected
-            ) { return; }
-            this.connectionAcceptedGeneration = this.socketGeneration;
-            this.connectionAcceptedSignal.resolve({
-                generation: this.socketGeneration,
-                publicId: String(publicId ?? ''),
-            });
+            this.acceptPublicId(socketAtInit, publicId);
         });
         socketAtInit.on('connect_failed', () => {
             console.log('SocketIOAPI: connect_failed');
@@ -478,8 +674,58 @@ export class SocketIOAPI {
                 this.invalidateCurrentTransport();
             }
         });
+        socketAtInit.on('serverPing', (...ping: any[]) => {
+            if (socketAtInit !== this.socket || socketAtInit === this.retiredSocket) { return; }
+            const manager = socketAtInit?.socket ?? socketAtInit?.io;
+            socketAtInit.emit(
+                'clientPong',
+                ping[0],
+                ping[1],
+                ping[2],
+                ping[3],
+                manager?.transport?.name,
+                manager?.sessionid,
+            );
+        });
+        socketAtInit.on('reconnectGracefully', () => {
+            if (
+                this.disposed ||
+                this.terminalFailure ||
+                socketAtInit !== this.socket ||
+                socketAtInit === this.retiredSocket
+            ) { return; }
+            console.log('SocketIOAPI: server requested a graceful reconnect');
+            // The server already drains clients in bounded batches. Retiring this
+            // generation once lets the VFS recover pending OT through its normal
+            // deduplicated path without enabling socket.io's own reconnect loop.
+            this.retireCurrentTransport(true);
+        });
         socketAtInit.on('forceDisconnect', (message:string, delay=10) => {
             console.log('SocketIOAPI: forceDisconnect', message);
+            if (socketAtInit !== this.socket || socketAtInit === this.retiredSocket) { return; }
+            const delaySeconds = Number.isFinite(Number(delay)) ? Math.max(0, Number(delay)) : 10;
+            this.terminateRealtime(
+                'force_disconnect',
+                String(message || 'The realtime server forced this session to disconnect'),
+                {message, delaySeconds},
+                delaySeconds * 1000,
+            );
+        });
+        socketAtInit.on('project:access:revoked', () => {
+            if (socketAtInit !== this.socket || socketAtInit === this.retiredSocket) { return; }
+            this.terminateRealtime(
+                'access_revoked',
+                'Access to this Overleaf project was revoked',
+            );
+        });
+        socketAtInit.on('otUpdateError', (error:any, details:any) => {
+            if (socketAtInit !== this.socket || socketAtInit === this.retiredSocket) { return; }
+            const updateError = this.normalizeOtUpdateError(error, details);
+            this._handlers.forEach(handler => handler.onOtUpdateError?.(updateError));
+            // Official Overleaf disconnects immediately after this event. Retire
+            // synchronously so no further save can be sent in the gap, and notify
+            // the ordinary recovery path exactly once.
+            this.retireCurrentTransport(true);
         });
         socketAtInit.on('connectionRejected', (err:any) => {
             if (socketAtInit !== this.socket || socketAtInit === this.retiredSocket) { return; }
@@ -503,7 +749,15 @@ export class SocketIOAPI {
                 this.legacyV1Rejected = true;
                 this.scheme = 'v2';
             }
-            this.invalidateCurrentTransport();
+            if (/^(?:not authorized|invalid session|project not found)$/i.test(message)) {
+                this.terminateRealtime(
+                    'project_unavailable',
+                    `Project connection rejected: ${message}`,
+                    err,
+                );
+            } else {
+                this.invalidateCurrentTransport();
+            }
         });
         socketAtInit.on('error', (err:any) => {
             if (socketAtInit !== this.socket || socketAtInit === this.retiredSocket) { return; }
@@ -544,10 +798,14 @@ export class SocketIOAPI {
                     socketAtInit === this.retiredSocket ||
                     !this.transportConnected
                 ) { return; }
-                const publicId = res.publicId as string;
-                const project = res.project as ProjectEntity;
-                this.ensureV2ProjectResponse().resolve(project);
-                this._handlers.forEach(handler => handler.onConnectionAccepted?.(publicId));
+                const response: ProjectJoinResponse = {
+                    publicId: typeof res?.publicId === 'string' ? res.publicId : undefined,
+                    project: res?.project as ProjectEntity,
+                    permissionsLevel: res?.permissionsLevel,
+                    protocolVersion: typeof res?.protocolVersion === 'number' ? res.protocolVersion : undefined,
+                };
+                this.acceptPublicId(socketAtInit, response.publicId);
+                this.ensureV2ProjectResponse().resolve(response);
             });
         }
     }
@@ -581,6 +839,9 @@ export class SocketIOAPI {
         this.rejectV2ProjectResponse(error);
         this.transportConnected = false;
         this.lastDisconnectedSocket = undefined;
+        this.currentPublicId = undefined;
+        this.currentPermissionsLevel = undefined;
+        this.joinedGeneration = undefined;
         this._socketInitScheme = undefined;
         this.socket = undefined;
     }
@@ -650,22 +911,13 @@ export class SocketIOAPI {
                     });
                     break;
                 case handlers.onDisconnected:
-                    this.socket.on('disconnect', () => {
-                        handler();
-                    });
+                case handlers.onConnectionAccepted:
+                case handlers.onProjectJoined:
+                case handlers.onOtUpdateError:
+                case handlers.onFatalError:
+                    // Internal handlers dispatch these lifecycle events after
+                    // validating the active socket generation.
                     break;
-                case handlers.onConnectionAccepted: {
-                    const socketAtRegistration = this.socket;
-                    socketAtRegistration.on('connectionAccepted', (_:any, publicId:any) => {
-                        if (
-                            socketAtRegistration !== this.socket ||
-                            socketAtRegistration === this.retiredSocket ||
-                            !this.transportConnected
-                        ) { return; }
-                        handler(publicId);
-                    });
-                    break;
-                }
                 case handlers.onClientUpdated:
                     this.socket.on('clientTracking.clientUpdated', (user:UpdateUserSchema) => {
                         handler(user);
@@ -727,7 +979,7 @@ export class SocketIOAPI {
             case 'Alt':
             case 'v1': {
                 try {
-                    await this.waitUntilConnectionAccepted(generation);
+                    const publicId = await this.waitUntilConnectionAccepted(generation);
                     const socketAtJoin = this.socket;
                     const response = await requestWithAck<[ProjectEntity, string, number]>(
                         socketAtJoin,
@@ -749,8 +1001,14 @@ export class SocketIOAPI {
                     if (activeScheme === 'v1') {
                         this.legacyV1Confirmed = true;
                     }
-                    this.record = Promise.resolve(response[0]);
-                    return response[0];
+                    const project = this.finalizeProjectJoin({
+                        project: response[0],
+                        publicId,
+                        permissionsLevel: response[1] as PermissionsLevel | undefined,
+                        protocolVersion: response[2],
+                    }, generation, publicId);
+                    this.record = Promise.resolve(project);
+                    return project;
                 } catch (error) {
                     const failedUnconfirmedLegacyProbe =
                         activeScheme === 'v1' &&
@@ -785,7 +1043,8 @@ export class SocketIOAPI {
                     // joinProjectResponse. Event order therefore cannot identify a
                     // legacy server: doing so would replace a valid project-query
                     // socket with a v1 socket that omits projectId.
-                    const project = await withTimeout(response.promise, 'project handshake', timeoutMs);
+                    const joinResponse = await withTimeout(response.promise, 'project handshake', timeoutMs);
+                    const project = this.finalizeProjectJoin(joinResponse, generation);
                     this.record = Promise.resolve(project);
                     return project;
                 } catch (error) {
@@ -829,14 +1088,40 @@ export class SocketIOAPI {
      * @returns {Promise}
      */
     async joinDoc(docId:string) {
-        return this.queueDocumentMembership(() =>
-            this.request<[Array<string>, number, Array<any>, any]>('joinDoc', [docId, { encodeRanges: true }])
-        )
-            .then((returns: [Array<string>, number, Array<any>, any]) => {
-                const [docLinesAscii, version, updates, ranges] = returns;
+        try {
+            return await this.queueDocumentMembership(() =>
+                this.request<[Array<string>, number, Array<any>, any, string?]>(
+                    'joinDoc',
+                    // Deliberately do not claim supportsHistoryOT. This client cannot
+                    // safely interpret tracked-change operations yet.
+                    [docId, { encodeRanges: true }],
+                )
+            )
+            .then((returns: [Array<string>, number, Array<any>, any, string?]) => {
+                const [docLinesAscii, version, updates, ranges, type = 'sharejs-text-ot'] = returns;
+                if (type !== 'sharejs-text-ot') {
+                    throw this.terminateRealtime(
+                        'unsupported_history_ot',
+                        `Document ${docId} uses unsupported OT type ${type}`,
+                        {docId, type},
+                    );
+                }
                 const docLines = docLinesAscii.map((line) => decodePackedUtf8(line));
                 return {docLines, version, updates, ranges};
             });
+        } catch (error) {
+            if (
+                error instanceof SocketRequestError &&
+                /history-ot|does not support history/i.test(error.message)
+            ) {
+                throw this.terminateRealtime(
+                    'unsupported_history_ot',
+                    `Document ${docId} requires History OT / Track Changes support`,
+                    error,
+                );
+            }
+            throw error;
+        }
     }
 
     /**
@@ -858,6 +1143,29 @@ export class SocketIOAPI {
      * @returns {Promise}
      */
     async applyOtUpdate(docId:string, update:UpdateSchema) {
+        const activeScheme = this._socketInitScheme ?? this.scheme;
+        if (this.currentPermissionsLevel === 'readOnly' || this.currentPermissionsLevel === 'review') {
+            throw new SocketRequestError(
+                'server_error',
+                this.currentPermissionsLevel === 'review' ?
+                    'Plain OT writes are disabled for review-only sessions because Track Changes is not supported' :
+                    'This realtime project session does not have write permission',
+                false,
+                {permissionsLevel: this.currentPermissionsLevel, docId},
+            );
+        }
+        if (
+            activeScheme !== 'Alt' &&
+            this.currentPermissionsLevel !== 'owner' &&
+            this.currentPermissionsLevel !== 'readAndWrite'
+        ) {
+            throw new SocketRequestError(
+                'server_error',
+                'This realtime project session does not have write permission',
+                false,
+                {permissionsLevel: this.currentPermissionsLevel, docId},
+            );
+        }
         return this.request<any[]>('applyOtUpdate', [docId, update])
             .then(() => {
                 return;
