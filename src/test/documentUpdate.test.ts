@@ -1,10 +1,8 @@
 import { strict as assert } from 'assert';
 import {
-    buildRecoveryUpdate,
-    desiredChangesArePresent,
     isSenderConfirmation,
     prepareDocumentUpdate,
-    requiresVersionConfirmation,
+    prepareProvenDocumentUpdate,
 } from '../core/documentUpdate';
 
 describe('prepareDocumentUpdate', () => {
@@ -59,34 +57,77 @@ describe('prepareDocumentUpdate', () => {
     });
 });
 
-describe('requiresVersionConfirmation', () => {
-    it('waits for realtime OT version events in the normal connection mode', () => {
-        assert.equal(requiresVersionConfirmation(false), true);
+describe('prepareProvenDocumentUpdate', () => {
+    it('blocks a cold-restored stale buffer instead of manufacturing the fresh remote as its base', () => {
+        const result = prepareProvenDocumentUpdate(
+            undefined,
+            12,
+            'collaborator edit\ncurrent ending',
+            'old opening\nold ending',
+        );
+        assert.deepEqual(result, {status: 'blocked', reason: 'missing-base'});
     });
 
-    it('accepts the HTTP-backed alternative mode acknowledgement without an OT event', () => {
-        assert.equal(requiresVersionConfirmation(true), false);
+    it('allows an ordinary edit from the exact acknowledged version and content', () => {
+        const result = prepareProvenDocumentUpdate(
+            {version: 12, content: 'current', pendingWrite: false},
+            12,
+            'current',
+            'current local',
+        );
+        assert.equal(result.status, 'ready');
+        if (result.status === 'ready') {
+            assert.deepEqual(result.prepared.operations, [{p: 7, i: ' local', d: undefined}]);
+        }
+    });
+
+    it('fails closed for remote version or content movement, including non-overlapping edits', () => {
+        assert.deepEqual(
+            prepareProvenDocumentUpdate(
+                {version: 12, content: 'abc', pendingWrite: false},
+                13,
+                'aRbc',
+                'abcL',
+            ),
+            {status: 'blocked', reason: 'version-mismatch'},
+        );
+        assert.deepEqual(
+            prepareProvenDocumentUpdate(
+                {version: 12, content: 'abc', pendingWrite: false},
+                12,
+                'aRbc',
+                'abcL',
+            ),
+            {status: 'blocked', reason: 'content-mismatch'},
+        );
+    });
+
+    it('never replays a pending write, but accepts an authoritative exact desired snapshot as a no-op', () => {
+        assert.deepEqual(
+            prepareProvenDocumentUpdate(
+                {version: 12, content: 'base', pendingWrite: true},
+                12,
+                'base',
+                'desired',
+            ),
+            {status: 'blocked', reason: 'pending-write'},
+        );
+        const confirmed = prepareProvenDocumentUpdate(
+            {version: 12, content: 'base', pendingWrite: true},
+            13,
+            'desired',
+            'desired',
+        );
+        assert.equal(confirmed.status, 'noop');
+        if (confirmed.status === 'noop') {
+            assert.deepEqual(confirmed.prepared.operations, []);
+        }
     });
 });
 
-describe('realtime update recovery', () => {
+describe('realtime update classification', () => {
     it('distinguishes the sender version bump from a collaborator operation', () => {
         assert.equal(isSenderConfirmation({}), true);
         assert.equal(isSenderConfirmation({op: [{p: 0, i: 'remote'}]}), false);
-    });
-
-    it('resubmits the exact original operation and version with prior source ids', () => {
-        const original = {doc: 'doc', v: 7, op: [{p: 1, i: 'x'}]};
-        const recovery = buildRecoveryUpdate(original, ['old-id', 'old-id', '', 'older-id']);
-        assert.equal(recovery.v, 7);
-        assert.strictEqual(recovery.op, original.op);
-        assert.deepEqual(recovery.dupIfSource, ['old-id', 'older-id']);
-        assert.equal('dupIfSource' in original, false);
-    });
-
-    it('confirms local intent only when every desired change is in the authoritative text', () => {
-        assert.equal(desiredChangesArePresent('abc', 'aXbYc', 'abYc'), true);
-        assert.equal(desiredChangesArePresent('abc', 'aXbc', 'abYc'), false);
-        assert.equal(desiredChangesArePresent('abc', 'aXc', 'aYc'), false);
     });
 });

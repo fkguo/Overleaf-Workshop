@@ -13,7 +13,7 @@ import {
     toSynctexSourceLocation,
 } from './synctex';
 import { resolveCompileRootDocId } from './compileTarget';
-import { CompileRunGate, SingleFlightGate } from './compileRun';
+import { CompileRunGate, requireSavedCompileInputs, SingleFlightGate } from './compileRun';
 import {
     CompileOutcome,
     CompileRequestKind,
@@ -382,7 +382,7 @@ export class CompileManager {
     private async saveAllForCompile() {
         this.suppressCompileOnSave += 1;
         try {
-            await vscode.workspace.saveAll();
+            requireSavedCompileInputs(await vscode.workspace.saveAll());
         } finally {
             this.suppressCompileOnSave -= 1;
         }

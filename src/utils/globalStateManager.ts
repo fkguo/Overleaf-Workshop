@@ -170,7 +170,12 @@ export class GlobalStateManager {
         if (server.login!==undefined) {
             const api = new ExtendedBaseAPI(server.url);
             const socket = new SocketIOAPI(server.url, api, server.login.identity, projectId);
-            return {api, socket};
+            return {
+                api,
+                socket,
+                serverUrl: new URL(server.url).href,
+                userId: server.login.userId,
+            };
         }
     }
 

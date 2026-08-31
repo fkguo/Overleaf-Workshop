@@ -1,5 +1,9 @@
 import { strict as assert } from 'assert';
-import { CompileRunGate, SingleFlightGate } from '../compile/compileRun';
+import {
+    CompileRunGate,
+    requireSavedCompileInputs,
+    SingleFlightGate,
+} from '../compile/compileRun';
 
 describe('CompileRunGate', () => {
     it('releases the compile state after a failed startup attempt', async () => {
@@ -100,5 +104,15 @@ describe('SingleFlightGate', () => {
         finish();
         await first;
         assert.equal(gate.active, false);
+    });
+});
+
+describe('compile input save gate', () => {
+    it('stops initial and ordinary compile paths when saveAll reports a blocked document', () => {
+        assert.doesNotThrow(() => requireSavedCompileInputs(true));
+        assert.throws(
+            () => requireSavedCompileInputs(false),
+            /could not be saved safely/,
+        );
     });
 });

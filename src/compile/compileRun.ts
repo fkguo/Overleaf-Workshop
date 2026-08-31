@@ -53,3 +53,9 @@ export class SingleFlightGate {
         return tracked;
     }
 }
+
+export function requireSavedCompileInputs(saved: boolean): void {
+    if (!saved) {
+        throw new Error('Compilation stopped because one or more dirty documents could not be saved safely');
+    }
+}

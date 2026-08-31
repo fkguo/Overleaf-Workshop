@@ -8,9 +8,12 @@ import { CompileManager } from './compile/compileManager';
 import { LangIntellisenseProvider } from './intellisense';
 import { LocalReplicaSCMProvider } from './scm/localReplicaSCM';
 
+let activeRemoteFileSystemProvider: RemoteFileSystemProvider | undefined;
+
 export function activate(context: vscode.ExtensionContext) {
     // Register: [core] RemoteFileSystemProvider
     const remoteFileSystemProvider = new RemoteFileSystemProvider(context);
+    activeRemoteFileSystemProvider = remoteFileSystemProvider;
     context.subscriptions.push( ...remoteFileSystemProvider.triggers );
 
     // Register: [core] ProjectManagerProvider on Activitybar
@@ -48,7 +51,11 @@ export function activate(context: vscode.ExtensionContext) {
     });
 }
 
-export function deactivate() {
-    vscode.commands.executeCommand('setContext', `${ROOT_NAME}.activate`, false);
-    vscode.commands.executeCommand('setContext', `${ROOT_NAME}.activateCompile`, false);
+export async function deactivate() {
+    await Promise.all([
+        vscode.commands.executeCommand('setContext', `${ROOT_NAME}.activate`, false),
+        vscode.commands.executeCommand('setContext', `${ROOT_NAME}.activateCompile`, false),
+        activeRemoteFileSystemProvider?.flushProvenance(),
+    ]);
+    activeRemoteFileSystemProvider = undefined;
 }
