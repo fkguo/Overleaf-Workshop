@@ -1,0 +1,127 @@
+{
+  "fixtureFormat": "history-ot-fixture-v1",
+  "surface": "realtime-history-ot",
+  "cases": [
+    {
+      "id": "non-bmp-insert",
+      "coverage": ["malformed", "non-bmp-rejection"],
+      "provenance": [
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "libraries/overleaf-editor-core/test/unit/text_operation.test.js",
+          "lineStart": 185,
+          "lineEnd": 203,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/test/unit/text_operation.test.js#L185-L203"
+        }
+      ],
+      "inputKind": "operations",
+      "raw": [{"textOperation": ["😀"]}],
+      "expectedFailure": "protocol-error"
+    },
+    {
+      "id": "base-length-mismatch",
+      "coverage": ["malformed"],
+      "provenance": [
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "services/document-updater/test/acceptance/js/ApplyingUpdatesToADocTests.js",
+          "lineStart": 661,
+          "lineEnd": 696,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/document-updater/test/acceptance/js/ApplyingUpdatesToADocTests.js#L661-L696"
+        }
+      ],
+      "inputKind": "apply",
+      "baseSnapshot": {"content": "short"},
+      "raw": [{"textOperation": [99, -1]}],
+      "expectedFailure": "protocol-error"
+    },
+    {
+      "id": "opaque-unknown-operation",
+      "coverage": ["unknown-operation"],
+      "provenance": [
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "libraries/overleaf-editor-core/lib/operation/edit_operation_builder.js",
+          "lineStart": 15,
+          "lineEnd": 52,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/operation/edit_operation_builder.js#L15-L52"
+        }
+      ],
+      "inputKind": "operations",
+      "raw": [{"opaqueOperation": {"payload": "must-not-become-text"}}],
+      "expectedFailure": "protocol-error"
+    },
+    {
+      "id": "legacy-positioned-insert-is-not-history-ot-scan-op",
+      "coverage": ["unknown-operation", "rest-diff-separation"],
+      "provenance": [
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "libraries/overleaf-editor-core/lib/types.ts",
+          "lineStart": 115,
+          "lineEnd": 163,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/types.ts#L115-L163"
+        }
+      ],
+      "inputKind": "operations",
+      "raw": [{"textOperation": [{"p": 0, "i": "legacy"}]}],
+      "expectedFailure": "protocol-error"
+    },
+    {
+      "id": "invalid-tracking-directive",
+      "coverage": ["malformed"],
+      "provenance": [
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "libraries/overleaf-editor-core/lib/types.ts",
+          "lineStart": 31,
+          "lineEnd": 46,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/types.ts#L31-L46"
+        }
+      ],
+      "inputKind": "operations",
+      "raw": [
+        {
+          "textOperation": [
+            {"r": 1, "tracking": {"type": "mystery", "userId": "u", "ts": "2026-01-02T03:04:05.000Z"}}
+          ]
+        }
+      ],
+      "expectedFailure": "protocol-error"
+    },
+    {
+      "id": "out-of-bounds-tracked-range",
+      "coverage": ["malformed"],
+      "provenance": [
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "libraries/overleaf-editor-core/lib/types.ts",
+          "lineStart": 20,
+          "lineEnd": 52,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/types.ts#L20-L52"
+        }
+      ],
+      "inputKind": "snapshot",
+      "raw": {
+        "content": "abc",
+        "trackedChanges": [
+          {
+            "range": {"pos": 2, "length": 5},
+            "tracking": {
+              "type": "delete",
+              "userId": "user-fixture",
+              "ts": "2026-01-02T03:04:05.000Z"
+            }
+          }
+        ]
+      },
+      "expectedFailure": "protocol-error"
+    }
+  ]
+}

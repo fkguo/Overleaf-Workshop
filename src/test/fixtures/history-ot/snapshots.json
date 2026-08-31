@@ -1,0 +1,117 @@
+{
+  "fixtureFormat": "history-ot-fixture-v1",
+  "surface": "realtime-history-ot",
+  "cases": [
+    {
+      "id": "plain-bmp-crlf-snapshot",
+      "coverage": ["snapshot", "crlf", "bmp-unicode", "combining-mark"],
+      "provenance": [
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "libraries/overleaf-editor-core/lib/types.ts",
+          "lineStart": 48,
+          "lineEnd": 52,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/types.ts#L48-L52"
+        },
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "libraries/overleaf-editor-core/lib/operation/scan_op.js",
+          "lineStart": 87,
+          "lineEnd": 107,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/operation/scan_op.js#L87-L107"
+        }
+      ],
+      "raw": {
+        "content": "A\r\n中文 β e\u0301\n"
+      },
+      "expectedVisibleText": "A\r\n中文 β e\u0301\n"
+    },
+    {
+      "id": "adjacent-tracked-changes-and-comments",
+      "coverage": [
+        "snapshot",
+        "tracked-insert",
+        "tracked-delete",
+        "adjacent-changes",
+        "offset-boundaries"
+      ],
+      "provenance": [
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "libraries/overleaf-editor-core/lib/types.ts",
+          "lineStart": 15,
+          "lineEnd": 52,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/types.ts#L15-L52"
+        },
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "libraries/overleaf-editor-core/lib/file_data/string_file_data.js",
+          "lineStart": 91,
+          "lineEnd": 109,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/file_data/string_file_data.js#L91-L109"
+        },
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "services/web/frontend/js/features/source-editor/utils/tracked-deletes.ts",
+          "lineStart": 10,
+          "lineEnd": 76,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/web/frontend/js/features/source-editor/utils/tracked-deletes.ts#L10-L76"
+        }
+      ],
+      "raw": {
+        "content": "foo NEWold baz",
+        "comments": [
+          {
+            "id": "comment-active",
+            "ranges": [{"pos": 4, "length": 6}]
+          },
+          {
+            "id": "comment-resolved",
+            "ranges": [{"pos": 0, "length": 3}],
+            "resolved": true
+          }
+        ],
+        "trackedChanges": [
+          {
+            "range": {"pos": 4, "length": 3},
+            "tracking": {
+              "type": "insert",
+              "userId": "user-alpha",
+              "ts": "2026-01-02T03:04:05.000Z"
+            }
+          },
+          {
+            "range": {"pos": 7, "length": 3},
+            "tracking": {
+              "type": "delete",
+              "userId": "user-beta",
+              "ts": "2026-01-02T03:04:06.000Z"
+            }
+          }
+        ]
+      },
+      "expectedVisibleText": "foo NEW baz",
+      "snapshotToVisible": [
+        {"input": 0, "expected": 0},
+        {"input": 4, "expected": 4},
+        {"input": 7, "expected": 7},
+        {"input": 8, "expected": 7},
+        {"input": 9, "expected": 7},
+        {"input": 10, "expected": 7},
+        {"input": 14, "expected": 11}
+      ],
+      "visibleToSnapshot": [
+        {"input": 0, "expected": 0},
+        {"input": 4, "expected": 4},
+        {"input": 7, "expected": 7},
+        {"input": 8, "expected": 11},
+        {"input": 11, "expected": 14}
+      ]
+    }
+  ]
+}

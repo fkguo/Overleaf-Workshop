@@ -1,0 +1,266 @@
+{
+  "fixtureFormat": "history-ot-fixture-v1",
+  "surface": "realtime-history-ot",
+  "applyCases": [
+    {
+      "id": "plain-insert-from-document-updater",
+      "coverage": ["snapshot"],
+      "provenance": [
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "services/document-updater/test/acceptance/js/ApplyingUpdatesToADocTests.js",
+          "lineStart": 28,
+          "lineEnd": 48,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/document-updater/test/acceptance/js/ApplyingUpdatesToADocTests.js#L28-L48"
+        }
+      ],
+      "baseSnapshot": {"content": "one\ntwo\nthree"},
+      "rawOperations": [
+        {"textOperation": [4, "one and a half\n", 9]}
+      ],
+      "expectedSnapshot": {"content": "one\none and a half\ntwo\nthree"},
+      "expectedVisibleText": "one\none and a half\ntwo\nthree"
+    },
+    {
+      "id": "tracked-insert-with-comment-and-content-hash",
+      "coverage": ["tracked-insert", "bmp-unicode", "combining-mark"],
+      "provenance": [
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "libraries/overleaf-editor-core/lib/types.ts",
+          "lineStart": 115,
+          "lineEnd": 137,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/types.ts#L115-L137"
+        },
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "libraries/overleaf-editor-core/test/unit/text_operation.test.js",
+          "lineStart": 938,
+          "lineEnd": 983,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/test/unit/text_operation.test.js#L938-L983"
+        }
+      ],
+      "baseSnapshot": {
+        "content": "foo baz",
+        "comments": [{"id": "comment-insert", "ranges": []}]
+      },
+      "rawOperations": [
+        {
+          "textOperation": [
+            4,
+            {
+              "i": "新βe\u0301 ",
+              "tracking": {
+                "type": "insert",
+                "userId": "user-alpha",
+                "ts": "2026-01-02T03:04:05.000Z"
+              },
+              "commentIds": ["comment-insert"]
+            },
+            3
+          ],
+          "contentHash": "fixture-content-hash-001"
+        }
+      ],
+      "expectedSnapshot": {
+        "content": "foo 新βe\u0301 baz",
+        "comments": [
+          {"id": "comment-insert", "ranges": [{"pos": 4, "length": 5}]}
+        ],
+        "trackedChanges": [
+          {
+            "range": {"pos": 4, "length": 5},
+            "tracking": {
+              "type": "insert",
+              "userId": "user-alpha",
+              "ts": "2026-01-02T03:04:05.000Z"
+            }
+          }
+        ]
+      },
+      "expectedVisibleText": "foo 新βe\u0301 baz"
+    },
+    {
+      "id": "tracked-delete-retains-snapshot-text",
+      "coverage": ["tracked-delete"],
+      "provenance": [
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "services/document-updater/test/acceptance/js/SettingADocumentTests.js",
+          "lineStart": 507,
+          "lineEnd": 579,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/document-updater/test/acceptance/js/SettingADocumentTests.js#L507-L579"
+        }
+      ],
+      "baseSnapshot": {"content": "foo old baz"},
+      "rawOperations": [
+        {
+          "textOperation": [
+            4,
+            {
+              "r": 3,
+              "tracking": {
+                "type": "delete",
+                "userId": "user-beta",
+                "ts": "2026-01-02T03:04:06.000Z"
+              }
+            },
+            4
+          ]
+        }
+      ],
+      "expectedSnapshot": {
+        "content": "foo old baz",
+        "trackedChanges": [
+          {
+            "range": {"pos": 4, "length": 3},
+            "tracking": {
+              "type": "delete",
+              "userId": "user-beta",
+              "ts": "2026-01-02T03:04:06.000Z"
+            }
+          }
+        ]
+      },
+      "expectedVisibleText": "foo  baz"
+    }
+  ],
+  "commentLifecycle": {
+    "id": "comment-add-resolve-delete",
+    "coverage": ["comment-add", "comment-resolve", "comment-delete"],
+    "provenance": [
+      {
+        "repository": "https://github.com/overleaf/overleaf",
+        "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+        "path": "services/web/frontend/js/features/review-panel/context/threads-context.tsx",
+        "lineStart": 344,
+        "lineEnd": 383,
+        "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/web/frontend/js/features/review-panel/context/threads-context.tsx#L344-L383"
+      },
+      {
+        "repository": "https://github.com/overleaf/overleaf",
+        "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+        "path": "libraries/overleaf-editor-core/lib/types.ts",
+        "lineStart": 139,
+        "lineEnd": 163,
+        "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/types.ts#L139-L163"
+      }
+    ],
+    "baseSnapshot": {"content": "alpha beta"},
+    "steps": [
+      {
+        "name": "add",
+        "rawOperations": [
+          {"commentId": "comment-alpha", "ranges": [{"pos": 6, "length": 4}]}
+        ],
+        "expectedSnapshot": {
+          "content": "alpha beta",
+          "comments": [
+            {"id": "comment-alpha", "ranges": [{"pos": 6, "length": 4}]}
+          ]
+        }
+      },
+      {
+        "name": "resolve",
+        "rawOperations": [
+          {"commentId": "comment-alpha", "resolved": true}
+        ],
+        "expectedSnapshot": {
+          "content": "alpha beta",
+          "comments": [
+            {
+              "id": "comment-alpha",
+              "ranges": [{"pos": 6, "length": 4}],
+              "resolved": true
+            }
+          ]
+        }
+      },
+      {
+        "name": "delete",
+        "rawOperations": [{"deleteComment": "comment-alpha"}],
+        "expectedSnapshot": {"content": "alpha beta"}
+      }
+    ]
+  },
+  "trackedChangeDecisions": {
+    "id": "accept-reject-adjacent-insert-delete",
+    "coverage": ["tracked-insert", "tracked-delete", "adjacent-changes"],
+    "provenance": [
+      {
+        "repository": "https://github.com/overleaf/overleaf",
+        "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+        "path": "services/web/frontend/js/features/review-panel/context/ranges-context.tsx",
+        "lineStart": 219,
+        "lineEnd": 306,
+        "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/web/frontend/js/features/review-panel/context/ranges-context.tsx#L219-L306"
+      }
+    ],
+    "baseSnapshot": {
+      "content": "foo NEWold baz",
+      "trackedChanges": [
+        {
+          "range": {"pos": 4, "length": 3},
+          "tracking": {
+            "type": "insert",
+            "userId": "user-alpha",
+            "ts": "2026-01-02T03:04:05.000Z"
+          }
+        },
+        {
+          "range": {"pos": 7, "length": 3},
+          "tracking": {
+            "type": "delete",
+            "userId": "user-beta",
+            "ts": "2026-01-02T03:04:06.000Z"
+          }
+        }
+      ]
+    },
+    "changes": [
+      {"range": {"pos": 4, "length": 3}, "type": "insert"},
+      {"range": {"pos": 7, "length": 3}, "type": "delete"}
+    ],
+    "expectedAcceptOperations": [
+      {"textOperation": [4, {"r": 3, "tracking": {"type": "none"}}, -3, 4]}
+    ],
+    "expectedAcceptedSnapshot": {"content": "foo NEW baz"},
+    "expectedRejectOperations": [
+      {"textOperation": [4, -3, {"r": 3, "tracking": {"type": "none"}}, 4]}
+    ],
+    "expectedRejectedSnapshot": {"content": "foo old baz"}
+  },
+  "visibleTextUpdate": {
+    "id": "insert-at-tracked-delete-boundary",
+    "coverage": ["offset-boundaries"],
+    "provenance": [
+      {
+        "repository": "https://github.com/overleaf/overleaf",
+        "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+        "path": "services/web/frontend/js/features/source-editor/utils/tracked-deletes.ts",
+        "lineStart": 22,
+        "lineEnd": 76,
+        "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/web/frontend/js/features/source-editor/utils/tracked-deletes.ts#L22-L76"
+      }
+    ],
+    "baseSnapshot": {
+      "content": "foo NEWold baz",
+      "trackedChanges": [
+        {
+          "range": {"pos": 7, "length": 3},
+          "tracking": {
+            "type": "delete",
+            "userId": "user-beta",
+            "ts": "2026-01-02T03:04:06.000Z"
+          }
+        }
+      ]
+    },
+    "desiredVisibleText": "foo NEW! baz",
+    "expectedOperations": [{"textOperation": [7, "!", 7]}]
+  }
+}

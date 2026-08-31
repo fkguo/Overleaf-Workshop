@@ -1,0 +1,109 @@
+{
+  "fixtureFormat": "history-ot-fixture-v1",
+  "surface": "realtime-history-ot",
+  "cases": [
+    {
+      "id": "join-doc-history-ot",
+      "coverage": ["joinDoc", "snapshot"],
+      "provenance": [
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "services/real-time/test/acceptance/js/JoinDocTests.js",
+          "lineStart": 595,
+          "lineEnd": 667,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/real-time/test/acceptance/js/JoinDocTests.js#L595-L667"
+        },
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "services/real-time/app/js/WebsocketController.js",
+          "lineStart": 318,
+          "lineEnd": 376,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/real-time/app/js/WebsocketController.js#L318-L376"
+        }
+      ],
+      "request": {
+        "event": "joinDoc",
+        "args": ["doc-fixture", {"supportsHistoryOT": true}]
+      },
+      "callback": {
+        "snapshot": {"content": "alpha\r\nβ"},
+        "version": 42,
+        "operations": [],
+        "ranges": {},
+        "otType": "history-ot"
+      }
+    },
+    {
+      "id": "sender-ack-only",
+      "coverage": ["sender-ack"],
+      "provenance": [
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "services/real-time/app/js/DocumentUpdaterController.js",
+          "lineStart": 124,
+          "lineEnd": 160,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/real-time/app/js/DocumentUpdaterController.js#L124-L160"
+        },
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "services/real-time/test/unit/js/DocumentUpdaterController.test.js",
+          "lineStart": 175,
+          "lineEnd": 220,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/real-time/test/unit/js/DocumentUpdaterController.test.js#L175-L220"
+        }
+      ],
+      "event": "otUpdateApplied",
+      "payload": {"v": 43, "doc": "doc-fixture"},
+      "expectedClassification": "sender-ack",
+      "expectedOperationCount": 0
+    },
+    {
+      "id": "duplicate-source-update",
+      "coverage": ["duplicate-source"],
+      "provenance": [
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "services/document-updater/test/acceptance/js/ApplyingUpdatesToADocTests.js",
+          "lineStart": 844,
+          "lineEnd": 892,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/document-updater/test/acceptance/js/ApplyingUpdatesToADocTests.js#L844-L892"
+        },
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "services/document-updater/app/js/HistoryOTUpdateManager.js",
+          "lineStart": 55,
+          "lineEnd": 79,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/document-updater/app/js/HistoryOTUpdateManager.js#L55-L79"
+        }
+      ],
+      "firstUpdate": {
+        "doc": "doc-fixture",
+        "v": 42,
+        "op": [{"textOperation": [4, "one and a half\n", 9]}],
+        "meta": {"source": "source-fixture"}
+      },
+      "retryUpdate": {
+        "doc": "doc-fixture",
+        "v": 42,
+        "op": [{"textOperation": [4, "one and a half\n", 9]}],
+        "dupIfSource": ["source-fixture"],
+        "meta": {"source": "source-fixture"}
+      },
+      "duplicateAppliedEvent": {
+        "doc": "doc-fixture",
+        "v": 42,
+        "op": [{"textOperation": [4, "one and a half\n", 9]}],
+        "dupIfSource": ["source-fixture"],
+        "dup": true,
+        "meta": {"source": "source-fixture"}
+      },
+      "expectedCollaboratorDeliveryCount": 0
+    }
+  ]
+}

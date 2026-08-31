@@ -1,0 +1,43 @@
+{
+  "fixtureFormat": "history-ot-fixture-v1",
+  "surface": "realtime-history-ot",
+  "description": "Sanitized protocol fixtures for Overleaf realtime History OT. These are not Project History REST update or diff payloads.",
+  "upstream": {
+    "repository": "https://github.com/overleaf/overleaf",
+    "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+    "commitUrl": "https://github.com/overleaf/overleaf/commit/28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+    "verifiedHead": "28ad3b03b71cb4311decdcb55c36b33ec10d72db"
+  },
+  "workshopBaseline": {
+    "repository": "https://github.com/fkguo/Overleaf-Workshop",
+    "commit": "046638b5b5762129dc51214ee19fdbef75d3c183",
+    "commitUrl": "https://github.com/fkguo/Overleaf-Workshop/commit/046638b5b5762129dc51214ee19fdbef75d3c183"
+  },
+  "files": [
+    "snapshots.json",
+    "operations.json",
+    "events.json",
+    "unsafe.json",
+    "rest-diff.json"
+  ],
+  "requiredCoverage": [
+    "snapshot",
+    "joinDoc",
+    "tracked-insert",
+    "tracked-delete",
+    "comment-add",
+    "comment-resolve",
+    "comment-delete",
+    "sender-ack",
+    "duplicate-source",
+    "malformed",
+    "unknown-operation",
+    "rest-diff-separation",
+    "crlf",
+    "bmp-unicode",
+    "combining-mark",
+    "non-bmp-rejection",
+    "adjacent-changes",
+    "offset-boundaries"
+  ]
+}

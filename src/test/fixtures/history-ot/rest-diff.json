@@ -1,0 +1,38 @@
+{
+  "fixtureFormat": "history-ot-fixture-v1",
+  "surface": "project-history-rest-diff",
+  "description": "Negative discriminator fixture. This REST response must never be parsed as realtime History OT operations.",
+  "coverage": ["rest-diff-separation"],
+  "provenance": [
+    {
+      "repository": "https://github.com/fkguo/Overleaf-Workshop",
+      "commit": "046638b5b5762129dc51214ee19fdbef75d3c183",
+      "path": "src/api/base.ts",
+      "lineStart": 205,
+      "lineEnd": 212,
+      "url": "https://github.com/fkguo/Overleaf-Workshop/blob/046638b5b5762129dc51214ee19fdbef75d3c183/src/api/base.ts#L205-L212"
+    },
+    {
+      "repository": "https://github.com/fkguo/Overleaf-Workshop",
+      "commit": "046638b5b5762129dc51214ee19fdbef75d3c183",
+      "path": "src/api/base.ts",
+      "lineStart": 924,
+      "lineEnd": 934,
+      "url": "https://github.com/fkguo/Overleaf-Workshop/blob/046638b5b5762129dc51214ee19fdbef75d3c183/src/api/base.ts#L924-L934"
+    }
+  ],
+  "raw": {
+    "diff": [
+      {
+        "u": "unchanged",
+        "meta": {
+          "users": [],
+          "start_ts": 1000,
+          "end_ts": 2000
+        }
+      },
+      {"d": "old text"},
+      {"i": "new text"}
+    ]
+  }
+}
