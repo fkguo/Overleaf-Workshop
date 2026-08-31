@@ -1,19 +1,23 @@
 import {strict as assert} from 'assert';
-import type {HistoryOtScanOperation, HistoryOtTrackingDirective} from '../core/historyOt';
 import {
     HistoryOtProtocolError,
     applyHistoryOtOperations,
     assertHistoryOtOperationsSafe,
+    assertHistoryOtWireOperationSafe,
     buildAcceptTrackedChangesOperation,
     buildHistoryOtTextUpdate,
     buildRejectTrackedChangesOperation,
     composeHistoryOtOperations,
     getVisibleHistoryOtText,
+    getSafeHistoryOtWireOperation,
     invertHistoryOtOperations,
     parseHistoryOtOperations,
+    parseHistoryOtOperationSequence,
     parseHistoryOtSnapshot,
+    parseHistoryOtWireOperation,
     serializeHistoryOtOperations,
     serializeHistoryOtSnapshot,
+    serializeHistoryOtWireOperation,
     snapshotOffsetToVisible,
     transformHistoryOtOperations,
     visibleOffsetToSnapshot,
@@ -131,6 +135,39 @@ describe('History-OT lossless protocol parsing', () => {
         }
     });
 
+    it('separates exact-one realtime wire envelopes from offline operation sequences', () => {
+        const single = [{textOperation: [1]}];
+        const wire = parseHistoryOtWireOperation(single);
+        assert.equal(wire.safe, true);
+        assert.deepEqual(serializeHistoryOtWireOperation(wire), single);
+        assert.deepEqual(getSafeHistoryOtWireOperation(wire), single[0]);
+
+        for (const input of [
+            [],
+            [{textOperation: [1]}, {noOp: true}],
+            [{futureOperation: true}],
+        ]) {
+            const parsed = parseHistoryOtWireOperation(input);
+            assert.equal(parsed.safe, false);
+            assert.deepEqual(serializeHistoryOtWireOperation(parsed), input);
+            assert.throws(() => assertHistoryOtWireOperationSafe(parsed), HistoryOtProtocolError);
+        }
+        assert.equal(parseHistoryOtOperationSequence([
+            {textOperation: [1]}, {noOp: true},
+        ]).safe, true);
+    });
+
+    it('labels touching comment ranges as an adapter safety narrowing', () => {
+        const input = {
+            content: 'ab',
+            comments: [{id: 'c', ranges: [{pos: 0, length: 1}, {pos: 1, length: 1}]}],
+        };
+        const parsed = parseHistoryOtSnapshot(input);
+        assert.equal(parsed.safe, false);
+        assert.deepEqual(serializeHistoryOtSnapshot(parsed), input);
+        assert.match(parsed.unsafeReasons.join('; '), /upstream-canonical pre-merged/);
+    });
+
     it('does not confuse opaque kind/raw snapshot fields with parser wrappers', () => {
         const input = {
             content: 'x',
@@ -228,10 +265,10 @@ describe('History-OT snapshot application', () => {
         ]);
     });
 
-    it('applies operation arrays sequentially, including comment state operations', () => {
+    it('applies an explicitly offline operation sequence, including comment state changes', () => {
         const after = applyHistoryOtOperations(
             parseHistoryOtSnapshot({content: 'abc'}),
-            parseHistoryOtOperations([
+            parseHistoryOtOperationSequence([
                 {commentId: 'c', ranges: [{pos: 0, length: 2}], resolved: false},
                 {commentId: 'c', resolved: true},
                 {textOperation: [1, 'X', 2]},
@@ -550,51 +587,9 @@ describe('History-OT algebra', () => {
         assert.equal((rawOperations(composed) as any[]).length, 1);
     });
 
-    it('canonicalizes adjacent same-kind tracked scans before algebra', () => {
+    it('fails closed for tracked and clear-tracking snapshot-free algebra', () => {
         const early = '2024-01-01T00:00:00.000Z';
         const late = '2025-01-01T00:00:00.000Z';
-        const concurrentDeletion = parseHistoryOtOperations([{textOperation: [
-            {r: 1, tracking: {type: 'delete', userId: 'u', ts: late}},
-            {r: 1, tracking: {type: 'delete', userId: 'u', ts: early}},
-        ]}]);
-        const physicalDeletion = parseHistoryOtOperations([{textOperation: [1, -1]}]);
-        const [physicalPrime, trackedPrime] = transformHistoryOtOperations(
-            physicalDeletion, concurrentDeletion,
-        );
-        const base = parseHistoryOtSnapshot({content: 'ab'});
-        const physicalBranch = applyHistoryOtOperations(
-            applyHistoryOtOperations(base, physicalDeletion), trackedPrime,
-        );
-        const trackedBranch = applyHistoryOtOperations(
-            applyHistoryOtOperations(base, concurrentDeletion), physicalPrime,
-        );
-        assert.deepEqual(rawSnapshot(physicalBranch), rawSnapshot(trackedBranch));
-        assert.equal(
-            ((rawSnapshot(physicalBranch) as any).trackedChanges[0].tracking.ts),
-            early,
-        );
-
-        const insertion = parseHistoryOtOperations([{textOperation: [
-            {i: 'X', tracking: {type: 'insert', userId: 'u', ts: late}},
-            {i: 'Y', tracking: {type: 'insert', userId: 'u', ts: early}},
-        ]}]);
-        const keepFirst = parseHistoryOtOperations([{textOperation: [1, -1]}]);
-        const sequential = applyHistoryOtOperations(
-            applyHistoryOtOperations(parseHistoryOtSnapshot({content: ''}), insertion),
-            keepFirst,
-        );
-        const direct = applyHistoryOtOperations(
-            parseHistoryOtSnapshot({content: ''}),
-            composeHistoryOtOperations(insertion, keepFirst),
-        );
-        assert.deepEqual(rawSnapshot(direct), rawSnapshot(sequential));
-        assert.equal(((rawSnapshot(direct) as any).trackedChanges[0].tracking.ts), early);
-    });
-
-    it('documents the official snapshot-merge limit of snapshot-free tracked algebra', () => {
-        const early = '2024-01-01T00:00:00.000Z';
-        const late = '2025-01-01T00:00:00.000Z';
-
         const trackedBase = parseHistoryOtSnapshot({
             content: 'a',
             trackedChanges: [{
@@ -608,32 +603,27 @@ describe('History-OT algebra', () => {
             tracking: {userId: 'u', ts: late},
         }]);
         const deleteOriginal = parseHistoryOtOperations([{textOperation: [1, -1]}]);
-        const normalSequential = applyHistoryOtOperations(
-            applyHistoryOtOperations(trackedBase, normalTrackedInsert), deleteOriginal,
-        );
-        const normalDirect = applyHistoryOtOperations(
-            trackedBase, composeHistoryOtOperations(normalTrackedInsert, deleteOriginal),
-        );
-        assert.equal((rawSnapshot(normalDirect) as any).content, 'X');
-        assert.equal((rawSnapshot(normalSequential) as any).content, 'X');
-        assert.equal(
-            ((rawSnapshot(normalSequential) as any).trackedChanges[0].tracking.ts),
-            early,
-        );
-        assert.equal(((rawSnapshot(normalDirect) as any).trackedChanges[0].tracking.ts), late);
-
         const removeBase = parseHistoryOtOperations([{textOperation: [-1]}]);
-        const [removePrime, insertPrime] = transformHistoryOtOperations(
-            removeBase, normalTrackedInsert,
+        assert.throws(
+            () => composeHistoryOtOperations(normalTrackedInsert, deleteOriginal),
+            /cannot preserve authoritative tracking metadata/,
         );
-        const removeBranch = applyHistoryOtOperations(
-            applyHistoryOtOperations(trackedBase, removeBase), insertPrime,
+        assert.throws(
+            () => transformHistoryOtOperations(removeBase, normalTrackedInsert),
+            /cannot preserve authoritative tracking metadata/,
         );
-        const insertBranch = applyHistoryOtOperations(
-            applyHistoryOtOperations(trackedBase, normalTrackedInsert), removePrime,
+
+        const clearTracking = parseHistoryOtOperations([{textOperation: [{
+            r: 1, tracking: {type: 'none'},
+        }]}]);
+        assert.throws(
+            () => composeHistoryOtOperations(clearTracking, parseHistoryOtOperations([{textOperation: [1]}])),
+            /cannot preserve authoritative tracking metadata/,
         );
-        assert.equal(((rawSnapshot(removeBranch) as any).trackedChanges[0].tracking.ts), late);
-        assert.equal(((rawSnapshot(insertBranch) as any).trackedChanges[0].tracking.ts), early);
+        assert.throws(
+            () => transformHistoryOtOperations(clearTracking, parseHistoryOtOperations([{textOperation: [1]}])),
+            /cannot preserve authoritative tracking metadata/,
+        );
     });
 
     it('only folds adjacent compatible array members', () => {
@@ -673,13 +663,6 @@ describe('History-OT algebra', () => {
                 snapshot: {content: 'ab'},
                 left: [{textOperation: [1, 'L', 1]}],
                 right: [{textOperation: [1, 'R', 1]}],
-            },
-            {
-                snapshot: {content: 'abc'},
-                left: [{textOperation: [{r: 2, tracking: {
-                    type: 'delete', userId: 'left', ts: timestamp,
-                }}, 1]}],
-                right: [{textOperation: [1, -1, 1]}],
             },
         ];
 
@@ -733,47 +716,6 @@ describe('History-OT algebra', () => {
         }
     });
 
-    it('passes a tracked-metadata transform scan', () => {
-        const base = parseHistoryOtSnapshot({content: 'abc'});
-        const operations = simpleTextOperations(3);
-        for (let pos = 0; pos <= 3; pos += 1) {
-            const scans: HistoryOtScanOperation[] = [];
-            if (pos > 0) { scans.push(pos); }
-            scans.push({
-                i: 'T',
-                tracking: {type: 'insert', userId: 'insert-user', ts: timestamp},
-            });
-            if (pos < 3) { scans.push(3 - pos); }
-            operations.push(parseHistoryOtOperations([{textOperation: scans}]));
-        }
-        const trackingOptions: HistoryOtTrackingDirective[] = [
-            {type: 'delete', userId: 'delete-user', ts: timestamp},
-            {type: 'none'},
-        ];
-        for (let pos = 0; pos < 3; pos += 1) {
-            for (const tracking of trackingOptions) {
-                const scans: HistoryOtScanOperation[] = [];
-                if (pos > 0) { scans.push(pos); }
-                scans.push({r: 1, tracking});
-                if (pos + 1 < 3) { scans.push(3 - pos - 1); }
-                operations.push(parseHistoryOtOperations([{textOperation: scans}]));
-            }
-        }
-
-        for (const left of operations) {
-            for (const right of operations) {
-                const [leftPrime, rightPrime] = transformHistoryOtOperations(left, right);
-                const leftBranch = applyHistoryOtOperations(
-                    applyHistoryOtOperations(base, left), rightPrime,
-                );
-                const rightBranch = applyHistoryOtOperations(
-                    applyHistoryOtOperations(base, right), leftPrime,
-                );
-                assert.deepEqual(rawSnapshot(leftBranch), rawSnapshot(rightBranch));
-            }
-        }
-    });
-
     it('passes the supported comment-operation transform matrix', () => {
         const base = parseHistoryOtSnapshot({
             content: 'abc',
@@ -789,6 +731,15 @@ describe('History-OT algebra', () => {
         ];
         for (const left of operations) {
             for (const right of operations) {
+                const leftRaw = rawOperations(left) as Array<Record<string, unknown>>;
+                const rightRaw = rawOperations(right) as Array<Record<string, unknown>>;
+                if ('ranges' in leftRaw[0] && 'ranges' in rightRaw[0]) {
+                    assert.throws(
+                        () => transformHistoryOtOperations(left, right),
+                        /cannot guarantee exact CommentList wire order/,
+                    );
+                    continue;
+                }
                 const [leftPrime, rightPrime] = transformHistoryOtOperations(left, right);
                 const leftBranch = applyHistoryOtOperations(
                     applyHistoryOtOperations(base, left), rightPrime,
@@ -801,7 +752,7 @@ describe('History-OT algebra', () => {
         }
     });
 
-    it('preserves official comment insertion order and exposes its raw-order limitation', () => {
+    it('fails closed where comment insertion order prevents exact algebra', () => {
         const base = parseHistoryOtSnapshot({content: 'a'});
         const addC = parseHistoryOtOperations([{
             commentId: 'c', ranges: [{pos: 0, length: 1}],
@@ -809,24 +760,33 @@ describe('History-OT algebra', () => {
         const addD = parseHistoryOtOperations([{
             commentId: 'd', ranges: [{pos: 0, length: 1}],
         }]);
-        const [addCPrime, addDPrime] = transformHistoryOtOperations(addC, addD);
-        const leftBranch = applyHistoryOtOperations(
-            applyHistoryOtOperations(base, addC), addDPrime,
+        assert.throws(
+            () => transformHistoryOtOperations(addC, addD),
+            /cannot guarantee exact CommentList wire order/,
         );
-        const rightBranch = applyHistoryOtOperations(
-            applyHistoryOtOperations(base, addD), addCPrime,
+        const ordered = applyHistoryOtOperations(
+            base,
+            parseHistoryOtOperationSequence([
+                {commentId: 'c', ranges: [{pos: 0, length: 1}]},
+                {commentId: 'd', ranges: [{pos: 0, length: 1}]},
+            ]),
         );
         const commentC = {id: 'c', ranges: [{pos: 0, length: 1}]};
         const commentD = {id: 'd', ranges: [{pos: 0, length: 1}]};
-        assert.deepEqual(rawSnapshot(leftBranch), {content: 'a', comments: [commentC, commentD]});
-        assert.deepEqual(rawSnapshot(rightBranch), {content: 'a', comments: [commentD, commentC]});
+        assert.deepEqual(rawSnapshot(ordered), {content: 'a', comments: [commentC, commentD]});
 
         const withComments = parseHistoryOtSnapshot({content: 'a', comments: [commentC, commentD]});
         const deleteC = parseHistoryOtOperations([{deleteComment: 'c'}]);
-        const inverse = invertHistoryOtOperations(withComments, deleteC);
+        assert.throws(
+            () => invertHistoryOtOperations(withComments, deleteC),
+            /cannot be inverted with exact CommentList wire order/,
+        );
+
+        const deleteD = parseHistoryOtOperations([{deleteComment: 'd'}]);
+        const inverseD = invertHistoryOtOperations(withComments, deleteD);
         assert.deepEqual(rawSnapshot(applyHistoryOtOperations(
-            applyHistoryOtOperations(withComments, deleteC), inverse,
-        )), {content: 'a', comments: [commentD, commentC]});
+            applyHistoryOtOperations(withComments, deleteD), inverseD,
+        )), {content: 'a', comments: [commentC, commentD]});
     });
 
     it('moves concurrent add-comment ranges through text operations', () => {
@@ -865,6 +825,15 @@ describe('History-OT algebra', () => {
             applyHistoryOtOperations(snapshot, operation), inverse,
         );
         assert.deepEqual(rawSnapshot(recovered), rawSnapshot(snapshot));
+    });
+
+    it('fails inversion before it would generate a forbidden surrogate insertion', () => {
+        const snapshot = parseHistoryOtSnapshot({content: 'a😀b'});
+        const deletion = parseHistoryOtOperations([{textOperation: [1, -2, 1]}]);
+        assert.throws(
+            () => invertHistoryOtOperations(snapshot, deletion),
+            /would reinsert unsupported surrogate text/,
+        );
     });
 
     it('reverses array order and restores overwritten comment state', () => {
