@@ -1,5 +1,6 @@
 import {
     HistoryOtOperationArray,
+    HistoryOtOperation,
     HistoryOtOperationsInput,
     HistoryOtRange,
     HistoryOtSnapshotInput,
@@ -7,13 +8,17 @@ import {
     JsonValue,
     ParsedHistoryOtOperations,
     ParsedHistoryOtSnapshot,
+    ParsedHistoryOtWireOperation,
     StringFileDataSnapshot,
+    HistoryOtWireOperationArray,
+    HistoryOtWireOperationInput,
 } from './types';
 
 export const HISTORY_OT_MAX_STRING_LENGTH = 2 * 1024 * 1024;
 
 const parsedSnapshots = new WeakSet<object>();
 const parsedOperations = new WeakSet<object>();
+const parsedWireOperations = new WeakSet<object>();
 
 export class HistoryOtProtocolError extends Error {
     constructor(
@@ -182,7 +187,10 @@ function validateCanonicalRanges(
             continue;
         }
         if (range.pos <= previousEnd) {
-            reasons.push(`${path}[${index}] overlaps, touches, or precedes the previous range`);
+            reasons.push(
+                `${path}[${index}] overlaps, precedes, or touches the previous range; `
+                + 'this adapter requires upstream-canonical pre-merged comment ranges',
+            );
             valid = false;
         }
         previousEnd = range.pos + range.length;
@@ -324,7 +332,7 @@ function validateCommentIds(value: JsonValue | undefined, path: string, reasons:
     });
 }
 
-function containsHighSurrogate(value: string): boolean {
+export function containsUnsupportedHistoryOtInsertion(value: string): boolean {
     return /[\uD800-\uDBFF]/.test(value);
 }
 
@@ -339,7 +347,7 @@ function validateScanOperation(value: JsonValue, path: string, reasons: string[]
         if (value.length === 0) {
             reasons.push(`${path} cannot insert an empty string`);
         }
-        if (containsHighSurrogate(value)) {
+        if (containsUnsupportedHistoryOtInsertion(value)) {
             reasons.push(`${path} insertion contains a non-BMP character`);
         }
         return;
@@ -360,7 +368,7 @@ function validateScanOperation(value: JsonValue, path: string, reasons: string[]
         }
         if (typeof value.i !== 'string' || value.i.length === 0) {
             reasons.push(`${path}.i must be a non-empty string`);
-        } else if (containsHighSurrogate(value.i)) {
+        } else if (containsUnsupportedHistoryOtInsertion(value.i)) {
             reasons.push(`${path}.i contains a non-BMP character`);
         }
         if (hasOwn(value, 'tracking')) {
@@ -523,6 +531,14 @@ function validateOperationsRaw(raw: JsonValue): string[] {
     return reasons;
 }
 
+function validateWireOperationRaw(raw: JsonValue): string[] {
+    const reasons = validateOperationsRaw(raw);
+    if (Array.isArray(raw) && raw.length !== 1) {
+        reasons.unshift('$ realtime update.op must contain exactly one logical operation');
+    }
+    return reasons;
+}
+
 export function parseHistoryOtSnapshot(input: unknown): ParsedHistoryOtSnapshot {
     const raw = deepCloneJson(input);
     const unsafeReasons = validateSnapshotRaw(raw);
@@ -549,6 +565,20 @@ export function parseHistoryOtOperations(input: unknown): ParsedHistoryOtOperati
     return parsed;
 }
 
+/** Parse an exact-one realtime `update.op` envelope without losing unsafe input. */
+export function parseHistoryOtWireOperation(input: unknown): ParsedHistoryOtWireOperation {
+    const raw = deepCloneJson(input);
+    const unsafeReasons = validateWireOperationRaw(raw);
+    const parsed: ParsedHistoryOtWireOperation = {
+        kind: 'history-ot-wire-operation',
+        raw,
+        safe: unsafeReasons.length === 0,
+        unsafeReasons,
+    };
+    parsedWireOperations.add(parsed);
+    return parsed;
+}
+
 function isParsedSnapshot(input: HistoryOtSnapshotInput): input is ParsedHistoryOtSnapshot {
     return typeof input === 'object' && input !== null && parsedSnapshots.has(input);
 }
@@ -557,12 +587,22 @@ function isParsedOperations(input: HistoryOtOperationsInput): input is ParsedHis
     return typeof input === 'object' && input !== null && parsedOperations.has(input);
 }
 
+function isParsedWireOperation(
+    input: HistoryOtWireOperationInput,
+): input is ParsedHistoryOtWireOperation {
+    return typeof input === 'object' && input !== null && parsedWireOperations.has(input);
+}
+
 export function serializeHistoryOtSnapshot(input: HistoryOtSnapshotInput): JsonValue {
     return deepCloneJson(isParsedSnapshot(input) ? input.raw : input);
 }
 
 export function serializeHistoryOtOperations(input: HistoryOtOperationsInput): JsonValue {
     return deepCloneJson(isParsedOperations(input) ? input.raw : input);
+}
+
+export function serializeHistoryOtWireOperation(input: HistoryOtWireOperationInput): JsonValue {
+    return deepCloneJson(isParsedWireOperation(input) ? input.raw : input);
 }
 
 export function assertHistoryOtSnapshotSafe(
@@ -591,6 +631,21 @@ export function assertHistoryOtOperationsSafe(
     }
 }
 
+export function assertHistoryOtWireOperationSafe(
+    input: HistoryOtWireOperationInput,
+): asserts input is ParsedHistoryOtWireOperation | HistoryOtWireOperationArray {
+    const parsed = isParsedWireOperation(input)
+        ? parseHistoryOtWireOperation(input.raw)
+        : parseHistoryOtWireOperation(input);
+    if (!parsed.safe) {
+        throw new HistoryOtProtocolError(
+            'UNSAFE_WIRE_OPERATION',
+            `Unsafe realtime History-OT update.op: ${parsed.unsafeReasons.join('; ')}`,
+            parsed.unsafeReasons,
+        );
+    }
+}
+
 export function getSafeSnapshotRaw(input: HistoryOtSnapshotInput): StringFileDataSnapshot {
     const parsed = isParsedSnapshot(input) ? parseHistoryOtSnapshot(input.raw) : parseHistoryOtSnapshot(input);
     assertHistoryOtSnapshotSafe(parsed);
@@ -602,3 +657,19 @@ export function getSafeOperationsRaw(input: HistoryOtOperationsInput): HistoryOt
     assertHistoryOtOperationsSafe(parsed);
     return deepCloneJson(parsed.raw) as HistoryOtOperationArray;
 }
+
+/** Return the single logical operation only after the realtime exact-one gate passes. */
+export function getSafeHistoryOtWireOperation(
+    input: HistoryOtWireOperationInput,
+): HistoryOtOperation {
+    const parsed = isParsedWireOperation(input)
+        ? parseHistoryOtWireOperation(input.raw)
+        : parseHistoryOtWireOperation(input);
+    assertHistoryOtWireOperationSafe(parsed);
+    return deepCloneJson((parsed.raw as HistoryOtWireOperationArray)[0]) as HistoryOtOperation;
+}
+
+/** Explicitly named aliases for the offline/local sequence API. */
+export const parseHistoryOtOperationSequence = parseHistoryOtOperations;
+export const serializeHistoryOtOperationSequence = serializeHistoryOtOperations;
+export const assertHistoryOtOperationSequenceSafe = assertHistoryOtOperationsSafe;

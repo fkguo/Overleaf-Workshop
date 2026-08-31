@@ -76,6 +76,38 @@ function noOperation(): HistoryOtNoOperation {
     return {noOp: true};
 }
 
+function hasTrackingDirective(operation: HistoryOtOperation): boolean {
+    return operationKind(operation) === 'text'
+        && asText(operation).textOperation.some(scan =>
+            typeof scan === 'object' && scan !== null && hasOwn(scan, 'tracking'));
+}
+
+function assertSnapshotIndependentAlgebraDomain(
+    operations: HistoryOtOperationArray,
+    algebra: 'compose' | 'transform',
+): void {
+    if (operations.some(hasTrackingDirective)) {
+        throw new HistoryOtProtocolError(
+            'UNSUPPORTED_TRACKED_ALGEBRA',
+            `History-OT ${algebra} cannot preserve authoritative tracking metadata without the base snapshot`,
+        );
+    }
+}
+
+function assertCommentTransformOrderDomain(
+    left: HistoryOtOperationArray,
+    right: HistoryOtOperationArray,
+): void {
+    const leftAdds = left.some(operation => operationKind(operation) === 'add-comment');
+    const rightAdds = right.some(operation => operationKind(operation) === 'add-comment');
+    if (leftAdds && rightAdds) {
+        throw new HistoryOtProtocolError(
+            'UNSUPPORTED_COMMENT_ORDER_TRANSFORM',
+            'Concurrent add-comment operations cannot guarantee exact CommentList wire order',
+        );
+    }
+}
+
 function canonicalizeGeneratedOperation(operation: HistoryOtOperation): HistoryOtOperation {
     const kind = operationKind(operation);
     if (kind === 'text') {
@@ -261,9 +293,13 @@ export function composeHistoryOtOperations(
     firstInput: HistoryOtOperationsInput,
     secondInput: HistoryOtOperationsInput,
 ): ParsedHistoryOtOperations {
+    const first = getSafeOperationsRaw(firstInput);
+    const second = getSafeOperationsRaw(secondInput);
+    assertSnapshotIndependentAlgebraDomain(first, 'compose');
+    assertSnapshotIndependentAlgebraDomain(second, 'compose');
     const operations = [
-        ...getSafeOperationsRaw(firstInput),
-        ...getSafeOperationsRaw(secondInput),
+        ...first,
+        ...second,
     ].map(operation => clone(operation));
     if (operations.length === 0) {
         return parseHistoryOtOperations([]);
@@ -378,6 +414,9 @@ export function transformHistoryOtOperations(
 ): [ParsedHistoryOtOperations, ParsedHistoryOtOperations] {
     const left = getSafeOperationsRaw(firstInput).map(operation => clone(operation));
     const right = getSafeOperationsRaw(secondInput).map(operation => clone(operation));
+    assertSnapshotIndependentAlgebraDomain(left, 'transform');
+    assertSnapshotIndependentAlgebraDomain(right, 'transform');
+    assertCommentTransformOrderDomain(left, right);
     for (let leftIndex = 0; leftIndex < left.length; leftIndex += 1) {
         for (let rightIndex = 0; rightIndex < right.length; rightIndex += 1) {
             [left[leftIndex], right[rightIndex]] = transformPair(
@@ -428,6 +467,15 @@ function invertSingleOperation(
     if (previous === undefined) {
         return kind === 'add-comment' ? {deleteComment: id} : noOperation();
     }
+    if (kind === 'delete-comment') {
+        const previousIndex = snapshot.comments?.findIndex(comment => comment.id === id) ?? -1;
+        if (previousIndex !== (snapshot.comments?.length ?? 0) - 1) {
+            throw new HistoryOtProtocolError(
+                'UNSUPPORTED_COMMENT_ORDER_INVERSE',
+                'Deleting a non-final comment cannot be inverted with exact CommentList wire order',
+            );
+        }
+    }
     assertCommentCanBeEncoded(previous);
     return addFromComment(previous);
 }
@@ -444,5 +492,13 @@ export function invertHistoryOtOperations(
         snapshot = applySingleOperation(snapshot, operation);
     }
     inverses.reverse();
-    return parseHistoryOtOperations(inverses.map(canonicalizeGeneratedOperation));
+    const parsed = parseHistoryOtOperations(inverses.map(canonicalizeGeneratedOperation));
+    if (!parsed.safe) {
+        throw new HistoryOtProtocolError(
+            'UNSAFE_INVERSE_RESULT',
+            `History-OT inverse is outside the safe operation domain: ${parsed.unsafeReasons.join('; ')}`,
+            parsed.unsafeReasons,
+        );
+    }
+    return parsed;
 }

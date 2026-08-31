@@ -9,6 +9,7 @@ import {
 import {
     getSafeSnapshotRaw,
     HistoryOtProtocolError,
+    containsUnsupportedHistoryOtInsertion,
     normalizeHistoryOtTimestamp,
     parseHistoryOtOperations,
 } from './protocol';
@@ -22,7 +23,7 @@ function assertTrackingInput(tracking: HistoryOtTrackingInput): void {
 }
 
 function assertInsertedText(text: string): void {
-    if (/[\uD800-\uDBFF]/.test(text)) {
+    if (containsUnsupportedHistoryOtInsertion(text)) {
         throw new HistoryOtProtocolError(
             'NON_BMP_INSERTION', 'History-OT does not support inserted non-BMP characters',
         );

@@ -2,13 +2,20 @@ export * from './types';
 
 export {
     assertHistoryOtOperationsSafe,
+    assertHistoryOtOperationSequenceSafe,
     assertHistoryOtSnapshotSafe,
+    assertHistoryOtWireOperationSafe,
+    getSafeHistoryOtWireOperation,
     HISTORY_OT_MAX_STRING_LENGTH,
     HistoryOtProtocolError,
     parseHistoryOtOperations,
+    parseHistoryOtOperationSequence,
     parseHistoryOtSnapshot,
+    parseHistoryOtWireOperation,
     serializeHistoryOtOperations,
+    serializeHistoryOtOperationSequence,
     serializeHistoryOtSnapshot,
+    serializeHistoryOtWireOperation,
 } from './protocol';
 
 export {

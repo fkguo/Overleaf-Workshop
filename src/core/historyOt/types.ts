@@ -26,6 +26,7 @@ export type HistoryOtTrackingDirective = HistoryOtTracking | HistoryOtClearTrack
 
 export interface HistoryOtComment extends JsonObject {
     id: string,
+    /** Adapter-safe input must already use upstream-canonical, non-touching ranges. */
     ranges: HistoryOtRange[],
     resolved?: boolean,
 }
@@ -93,8 +94,14 @@ export type HistoryOtOperation =
     | HistoryOtSetCommentStateOperation
     | HistoryOtNoOperation;
 
-/** The realtime History-OT wire protocol carries one edit operation per array. */
-export type HistoryOtOperationArray = HistoryOtOperation[];
+/** An ordered offline/local sequence. Never pass this directly as realtime `update.op`. */
+export type HistoryOtOperationSequence = HistoryOtOperation[];
+
+/** @deprecated Use HistoryOtOperationSequence for offline/local sequencing. */
+export type HistoryOtOperationArray = HistoryOtOperationSequence;
+
+/** The realtime `update.op` envelope contains exactly one logical operation. */
+export type HistoryOtWireOperationArray = [HistoryOtOperation];
 
 export interface ParsedHistoryOtSnapshot {
     readonly kind: 'history-ot-snapshot',
@@ -110,8 +117,17 @@ export interface ParsedHistoryOtOperations {
     readonly unsafeReasons: readonly string[],
 }
 
+export interface ParsedHistoryOtWireOperation {
+    readonly kind: 'history-ot-wire-operation',
+    readonly raw: JsonValue,
+    readonly safe: boolean,
+    readonly unsafeReasons: readonly string[],
+}
+
 export type HistoryOtSnapshotInput = ParsedHistoryOtSnapshot | JsonValue;
+/** Offline/local operation-sequence input; not a realtime wire envelope. */
 export type HistoryOtOperationsInput = ParsedHistoryOtOperations | JsonValue;
+export type HistoryOtWireOperationInput = ParsedHistoryOtWireOperation | JsonValue;
 
 export interface HistoryOtTrackingInput {
     userId: string,

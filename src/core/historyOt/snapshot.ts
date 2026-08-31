@@ -12,6 +12,7 @@ import {
     deepCloneJson,
     HISTORY_OT_MAX_STRING_LENGTH,
     HistoryOtProtocolError,
+    containsUnsupportedHistoryOtInsertion,
 } from './protocol';
 import {decodeTextOperation, TextOperationAccumulator} from './text';
 
@@ -498,8 +499,15 @@ export function invertTextOperation(
             const start = ordered[index - 1];
             const end = ordered[index];
             const range = {pos: start, length: end - start};
+            const restoredText = snapshot.content.slice(start, end);
+            if (containsUnsupportedHistoryOtInsertion(restoredText)) {
+                throw new HistoryOtProtocolError(
+                    'NON_BMP_INVERSE',
+                    'History-OT cannot invert a deletion that would reinsert unsupported surrogate text',
+                );
+            }
             inverse.insert(
-                snapshot.content.slice(start, end),
+                restoredText,
                 trackingCoveringRange(snapshot.trackedChanges ?? [], range),
                 coveringCommentIds(snapshot.comments ?? [], range),
             );
