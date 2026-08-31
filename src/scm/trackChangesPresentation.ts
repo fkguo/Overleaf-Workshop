@@ -178,7 +178,8 @@ function assertSafeNonNegativeInteger(value: number, label: string): void {
  * UTF-16 line index matching JavaScript/VS Code offset units without changing
  * line endings or Unicode normalization. Offsets inside CRLF clamp to the
  * preceding line end, as VS Code does; reverse mapping selects the CR offset.
- * The supported presentation domain is BMP text with LF/CRLF line endings.
+ * Well-formed surrogate pairs remain two addressable UTF-16 code units. Lone
+ * surrogates are rejected rather than repaired or normalized.
  */
 export class Utf16TextIndex {
     private readonly lines: readonly Utf16Line[];
@@ -189,10 +190,21 @@ export class Utf16TextIndex {
         let offset = 0;
         while (offset < text.length) {
             const codeUnit = text.charCodeAt(offset);
-            if (codeUnit >= 0xd800 && codeUnit <= 0xdfff) {
+            if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+                const nextCodeUnit = text.charCodeAt(offset + 1);
+                if (nextCodeUnit < 0xdc00 || nextCodeUnit > 0xdfff) {
+                    throw new HistoryOtProtocolError(
+                        'UNSUPPORTED_PRESENTATION_TEXT',
+                        'History-OT presentation does not accept a lone high surrogate',
+                    );
+                }
+                offset += 2;
+                continue;
+            }
+            if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
                 throw new HistoryOtProtocolError(
                     'UNSUPPORTED_PRESENTATION_TEXT',
-                    'History-OT presentation currently supports BMP text only',
+                    'History-OT presentation does not accept a lone low surrogate',
                 );
             }
             if (codeUnit === 0x0d) {
@@ -432,8 +444,8 @@ function cloneThreadData(
     commentId: string,
 ): DirectoryLookup<JsonValue> {
     const lookup = lookupDirectory(threads, commentId);
-    if (!lookup.found) {
-        return lookup;
+    if (!lookup.found || lookup.value === undefined) {
+        return {found: false};
     }
     return {found: true, value: deepCloneJson(lookup.value)};
 }

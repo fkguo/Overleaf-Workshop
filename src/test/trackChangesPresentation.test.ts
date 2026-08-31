@@ -20,7 +20,7 @@ function isProtocolErrorWithCode(code: string): (error: unknown) => boolean {
 }
 
 describe('realtime History OT presentation', () => {
-    it('maps BMP, Chinese, Greek, combining marks, LF, and CRLF in UTF-16 units', () => {
+    it('maps Unicode, combining marks, LF, and CRLF in UTF-16 code units', () => {
         const text = 'A\r\n中文 β e\u0301\nZ';
 
         assert.deepEqual(utf16OffsetToPosition(text, 0), {line: 0, character: 0});
@@ -41,6 +41,35 @@ describe('realtime History OT presentation', () => {
         assert.deepEqual(utf16OffsetToPosition('x\ny', 1), {line: 0, character: 1});
         assert.deepEqual(utf16OffsetToPosition('x\ny', 2), {line: 1, character: 0});
         assert.equal(utf16PositionToOffset('x\ny', {line: 1, character: 0}), 2);
+
+        const emojiText = 'a😀b';
+        assert.deepEqual(utf16OffsetToPosition(emojiText, 1), {line: 0, character: 1});
+        assert.deepEqual(utf16OffsetToPosition(emojiText, 2), {line: 0, character: 2});
+        assert.deepEqual(utf16OffsetToPosition(emojiText, 3), {line: 0, character: 3});
+        assert.deepEqual(utf16OffsetToPosition(emojiText, 4), {line: 0, character: 4});
+        assert.equal(utf16PositionToOffset(emojiText, {line: 0, character: 1}), 1);
+        assert.equal(utf16PositionToOffset(emojiText, {line: 0, character: 2}), 2);
+        assert.equal(utf16PositionToOffset(emojiText, {line: 0, character: 3}), 3);
+
+        const emojiModel = buildRealtimeHistoryOtPresentation({
+            content: emojiText,
+            trackedChanges: [{
+                range: {pos: 1, length: 2},
+                tracking: {type: 'insert', userId: 'u-emoji', ts: insertTimestamp},
+            }],
+        });
+        const emojiInsertion = emojiModel.trackedChanges[0];
+        assert.equal(emojiInsertion.kind, 'tracked-insertion');
+        if (emojiInsertion.kind !== 'tracked-insertion') {
+            throw new Error('expected emoji insertion');
+        }
+        assert.equal(emojiInsertion.insertedText, '😀');
+        assert.deepEqual(emojiInsertion.visibleRange, {
+            startOffset: 1,
+            endOffset: 3,
+            start: {line: 0, character: 1},
+            end: {line: 0, character: 3},
+        });
     });
 
     it('rejects invalid positions and text outside the declared presentation domain', () => {
@@ -65,7 +94,11 @@ describe('realtime History OT presentation', () => {
             isProtocolErrorWithCode('UNSUPPORTED_PRESENTATION_TEXT'),
         );
         assert.throws(
-            () => utf16OffsetToPosition('a😀b', 1),
+            () => utf16OffsetToPosition('a\ud800b', 1),
+            isProtocolErrorWithCode('UNSUPPORTED_PRESENTATION_TEXT'),
+        );
+        assert.throws(
+            () => utf16OffsetToPosition('a\udc00b', 1),
             isProtocolErrorWithCode('UNSUPPORTED_PRESENTATION_TEXT'),
         );
     });
@@ -292,7 +325,10 @@ describe('realtime History OT presentation', () => {
             }],
             future: {token: 7, flags: [true, null]},
         };
-        const threads = {'c-hidden': opaqueThread};
+        const threads: Record<string, typeof opaqueThread | undefined> = {
+            'c-hidden': opaqueThread,
+            'c-span': undefined,
+        };
 
         const model = buildRealtimeHistoryOtPresentation(snapshot, {commentThreads: threads});
 
@@ -343,6 +379,7 @@ describe('realtime History OT presentation', () => {
         );
 
         const span = model.comments[2];
+        assert.equal(Object.prototype.hasOwnProperty.call(span, 'threadData'), false);
         assert.deepEqual(span.ranges[0].visibleAnchor, {
             kind: 'range',
             range: {
