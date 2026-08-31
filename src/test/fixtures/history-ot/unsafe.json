@@ -55,6 +55,26 @@
       "expectedFailure": "protocol-error"
     },
     {
+      "id": "opaque-later-operation",
+      "coverage": ["unknown-operation", "whole-batch-validation"],
+      "provenance": [
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "libraries/overleaf-editor-core/lib/types.ts",
+          "lineStart": 115,
+          "lineEnd": 163,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/types.ts#L115-L163"
+        }
+      ],
+      "inputKind": "operations",
+      "raw": [
+        {"textOperation": [3]},
+        {"opaqueOperation": {"payload": "later-members-must-also-be-validated"}}
+      ],
+      "expectedFailure": "protocol-error"
+    },
+    {
       "id": "legacy-positioned-insert-is-not-history-ot-scan-op",
       "coverage": ["unknown-operation", "rest-diff-separation"],
       "provenance": [

@@ -148,6 +148,22 @@
         "lineStart": 139,
         "lineEnd": 163,
         "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/types.ts#L139-L163"
+      },
+      {
+        "repository": "https://github.com/overleaf/overleaf",
+        "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+        "path": "libraries/overleaf-editor-core/lib/file_data/string_file_data.js",
+        "lineStart": 46,
+        "lineEnd": 58,
+        "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/file_data/string_file_data.js#L46-L58"
+      },
+      {
+        "repository": "https://github.com/overleaf/overleaf",
+        "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+        "path": "libraries/overleaf-editor-core/lib/comment.js",
+        "lineStart": 151,
+        "lineEnd": 160,
+        "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/comment.js#L151-L160"
       }
     ],
     "baseSnapshot": {"content": "alpha beta"},
@@ -198,6 +214,14 @@
         "lineStart": 219,
         "lineEnd": 306,
         "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/web/frontend/js/features/review-panel/context/ranges-context.tsx#L219-L306"
+      },
+      {
+        "repository": "https://github.com/overleaf/overleaf",
+        "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+        "path": "libraries/overleaf-editor-core/lib/file_data/string_file_data.js",
+        "lineStart": 46,
+        "lineEnd": 58,
+        "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/libraries/overleaf-editor-core/lib/file_data/string_file_data.js#L46-L58"
       }
     ],
     "baseSnapshot": {
@@ -261,6 +285,7 @@
       ]
     },
     "desiredVisibleText": "foo NEW! baz",
+    "edits": [{"pos": 7, "insertText": "!"}],
     "expectedOperations": [{"textOperation": [7, "!", 7]}]
   }
 }
