@@ -303,7 +303,7 @@ describe('History OT fixture corpus', () => {
             .map((item, index) => asObject(item, `unsafe.cases[${index}]`));
         const adapterPolicyIds = [
             'opaque-later-operation',
-            'legacy-positioned-insert-is-not-history-ot-scan-op',
+            'legacy-realtime-positioned-insert-is-not-history-ot-scan-op',
             'invalid-tracking-directive',
             'out-of-bounds-tracked-range',
             'opaque-snapshot-fields-preserved-but-unsafe',
