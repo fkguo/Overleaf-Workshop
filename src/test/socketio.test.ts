@@ -120,6 +120,124 @@ describe('SocketIOAPI project protocol', () => {
         assert.equal(socket.needsReinit, false);
     });
 
+    it('fails terminally when a v2 sender rotates after response resolution but before join finalization', async () => {
+        const {base, socket} = createAPI();
+        const transport = base.sockets[0];
+        const fatalErrors: RealtimeFatalError[] = [];
+        socket.updateEventHandlers({onFatalError: error => fatalErrors.push(error)});
+        transport.serverEmit('connect');
+
+        const joined = socket.joinProject('project-id');
+        transport.serverEmit('joinProjectResponse', {
+            publicId: 'P.original',
+            project,
+            permissionsLevel: 'owner',
+            protocolVersion: 2,
+        });
+        transport.serverEmit('connectionAccepted', undefined, 'P.rotated');
+
+        await assert.rejects(
+            joined,
+            (error: unknown) => error instanceof RealtimeFatalError && error.code === 'sender_changed',
+        );
+        assert.equal(fatalErrors.length, 1);
+        assert.strictEqual(socket.fatalError, fatalErrors[0]);
+        assert.equal(socket.projectSession, undefined);
+        assert.equal(socket.needsReinit, false);
+    });
+
+    it('rejects every conflicting ready-state project response without changing the sender witness', async () => {
+        const cases = [
+            {
+                name: 'sender',
+                response: {
+                    publicId: 'P.rotated', project, permissionsLevel: 'owner', protocolVersion: 2,
+                },
+                code: 'sender_changed',
+            },
+            {
+                name: 'project',
+                response: {
+                    publicId: 'P.fixed',
+                    project: {_id: 'different-project-id', rootFolder: []},
+                    permissionsLevel: 'owner',
+                    protocolVersion: 2,
+                },
+                code: 'project_unavailable',
+            },
+            {
+                name: 'protocol',
+                response: {
+                    publicId: 'P.fixed', project, permissionsLevel: 'owner', protocolVersion: 3,
+                },
+                code: 'protocol_changed',
+            },
+        ] as const;
+
+        for (const scenario of cases) {
+            const {base, socket} = createAPI();
+            const transport = base.sockets[0];
+            const fatalErrors: RealtimeFatalError[] = [];
+            socket.updateEventHandlers({onFatalError: error => fatalErrors.push(error)});
+            transport.serverEmit('connect');
+            const joined = socket.joinProject('project-id');
+            transport.serverEmit('joinProjectResponse', {
+                publicId: 'P.fixed', project, permissionsLevel: 'owner', protocolVersion: 2,
+            });
+            await joined;
+            const originalWitness = socket.projectSession;
+
+            transport.serverEmit('joinProjectResponse', scenario.response);
+
+            assert.equal(fatalErrors.length, 1, `${scenario.name} conflict must be terminal`);
+            assert.equal(fatalErrors[0].code, scenario.code);
+            assert.equal(socket.projectSession, undefined);
+            assert.equal(socket.needsReinit, false);
+            assert.deepEqual(originalWitness, {
+                publicId: 'P.fixed',
+                permissionsLevel: 'owner',
+                protocolVersion: 2,
+                generation: originalWitness?.generation,
+            });
+        }
+    });
+
+    it('keeps an accepted sender stable across duplicate signals and on the dedupe source chain', async () => {
+        const {base, socket} = createAPI();
+        const transport = base.sockets[0];
+        const accepted: string[] = [];
+        socket.updateEventHandlers({onConnectionAccepted: publicId => accepted.push(publicId)});
+        transport.serverEmit('connect');
+        const joined = socket.joinProject('project-id');
+        const response = {
+            publicId: 'P.fixed', project, permissionsLevel: 'owner' as const, protocolVersion: 2,
+        };
+        transport.serverEmit('joinProjectResponse', response);
+        await joined;
+        const witness = socket.projectSession!;
+
+        transport.serverEmit('connectionAccepted', undefined, 'P.fixed');
+        transport.serverEmit('joinProjectResponse', response);
+        assert.deepEqual(socket.projectSession, witness);
+        assert.deepEqual(accepted, ['P.fixed']);
+
+        const saving = socket.applyOtUpdate(
+            'doc-id',
+            {
+                doc: 'doc-id',
+                v: 4,
+                op: [{p: 0, i: 'x'}],
+                dupIfSource: [witness.publicId],
+            },
+            witness,
+        );
+        await waitForEmission(transport, 'applyOtUpdate');
+        const wireUpdate = transport.emitted.find(item => item.event === 'applyOtUpdate')?.args[1];
+        assert.deepEqual(wireUpdate.dupIfSource, ['P.fixed']);
+        transport.acknowledge('applyOtUpdate', undefined);
+        await saving;
+    });
+
     it('terminates a session whose joined project identity differs from the request', async () => {
         const {base, socket} = createAPI();
         const transport = base.sockets[0];
@@ -311,6 +429,33 @@ describe('SocketIOAPI project protocol', () => {
         assert.equal(base.sockets.length, 2);
     });
 
+    it('fails terminally when a legacy join sender rotates while its ACK is pending', async () => {
+        const {base, socket} = createAPI('https://self-hosted.example');
+        socket.invalidateCurrentTransport();
+        (socket as any).scheme = 'v1';
+        socket.init();
+        const transport = base.sockets[1];
+        const fatalErrors: RealtimeFatalError[] = [];
+        socket.updateEventHandlers({onFatalError: error => fatalErrors.push(error)});
+        transport.serverEmit('connect');
+        transport.serverEmit('connectionAccepted', undefined, 'P.original');
+
+        const joined = socket.joinProject('project-id');
+        await waitForEmission(transport, 'joinProject');
+        transport.serverEmit('connectionAccepted', undefined, 'P.rotated');
+        transport.acknowledge('joinProject', undefined, project, 'owner', 2);
+
+        await assert.rejects(
+            joined,
+            (error: unknown) => error instanceof SocketRequestError && error.code === 'stale_connection',
+        );
+        assert.equal(fatalErrors.length, 1);
+        assert.equal(fatalErrors[0].code, 'sender_changed');
+        assert.strictEqual(socket.fatalError, fatalErrors[0]);
+        assert.equal(socket.projectSession, undefined);
+        assert.equal(socket.needsReinit, false);
+    });
+
     it('never returns to v1 after the server explicitly rejects its missing project id', async () => {
         const {base, socket} = createAPI('https://self-hosted.example');
         const firstAttempt = base.sockets[0];
@@ -344,7 +489,7 @@ describe('SocketIOAPI project protocol', () => {
         await nextMicrotask();
         assert.equal(settled, false);
 
-        finalAttempt.serverEmit('joinProjectResponse', {publicId: 'P.modern', project});
+        finalAttempt.serverEmit('joinProjectResponse', {publicId: 'P.compat', project});
         assert.strictEqual(await joined, project);
         assert.equal(socket.needsReinit, false);
     });
@@ -418,6 +563,55 @@ describe('SocketIOAPI project protocol', () => {
         const joined = socket.joinProject('project-id');
         replacement.serverEmit('joinProjectResponse', {publicId: 'P.current', project});
         assert.strictEqual(await joined, project);
+    });
+
+    it('drops full OT operations emitted by a retired socket generation', async () => {
+        const {base, socket} = createAPI();
+        const retired = base.sockets[0];
+        const updates: unknown[] = [];
+        socket.updateEventHandlers({
+            onFileChanged: (update, sender) => updates.push({update, sender}),
+        });
+        retired.serverEmit('connect');
+        const firstJoin = socket.joinProject('project-id');
+        retired.serverEmit('joinProjectResponse', {publicId: 'P.retired', project});
+        await firstJoin;
+
+        socket.invalidateCurrentTransport();
+        retired.serverEmit('otUpdateApplied', {
+            doc: 'doc-id',
+            v: 4,
+            op: [{p: 0, i: 'stale-before-replacement'}],
+        });
+        assert.deepEqual(
+            updates,
+            [],
+            'a retired transport must be inert even before replacement removes its listeners',
+        );
+
+        socket.init();
+        const current = base.sockets[1];
+        current.serverEmit('connect');
+        const secondJoin = socket.joinProject('project-id');
+        current.serverEmit('joinProjectResponse', {publicId: 'P.current', project});
+        await secondJoin;
+
+        retired.serverEmit('otUpdateApplied', {
+            doc: 'doc-id',
+            v: 4,
+            op: [{p: 0, i: 'stale'}],
+        });
+        assert.deepEqual(updates, [], 'a retired transport must have no observable OT effect');
+
+        current.serverEmit('otUpdateApplied', {
+            doc: 'doc-id',
+            v: 4,
+            op: [{p: 0, i: 'current'}],
+        });
+        assert.deepEqual(updates, [{
+            update: {doc: 'doc-id', v: 4, op: [{p: 0, i: 'current'}]},
+            sender: {publicId: 'P.current', generation: socket.generation},
+        }]);
     });
 
     it('retires an already disconnected socket before it can reconnect late', () => {

@@ -555,6 +555,58 @@ export class DocumentProvenanceStore {
         });
     }
 
+    /**
+     * Atomically replace one exact pending intent with its next proven base.
+     * A failed storage write leaves the previous pending record intact.
+     */
+    async reconcilePendingWrite(
+        recordName: string,
+        expectedPendingWrite: JsonValue,
+        input: DirtyDocumentProvenance,
+    ): Promise<DocumentProvenanceRecord> {
+        if (!isJsonValue(expectedPendingWrite)) {
+            throw new Error('expectedPendingWrite must be JSON-compatible');
+        }
+        return this.enqueue(async () => {
+            const current = this.requireValidCurrent(recordName, await this.readRecord(recordName));
+            if (current.pendingWrite === undefined
+                || JSON.stringify(current.pendingWrite) !== JSON.stringify(expectedPendingWrite)) {
+                throw new Error(`Cannot reconcile provenance record ${recordName}: pending-write mismatch`);
+            }
+
+            const identity = canonicalizeDocumentIdentity(input.identity);
+            const bufferIncarnationId = requireNonEmptyString(
+                input.bufferIncarnationId,
+                'bufferIncarnationId',
+            );
+            const baseVersion = requireVersion(input.baseVersion, 'baseVersion');
+            if (typeof input.baseText !== 'string' || typeof input.dirtyText !== 'string') {
+                throw new Error('baseText and dirtyText must be strings');
+            }
+            if (!identitiesEqual(current.identity, identity)
+                || current.bufferIncarnationId !== bufferIncarnationId
+                || this.currentRecordName(identity, bufferIncarnationId) !== recordName) {
+                throw new Error(`Cannot reconcile provenance record ${recordName}: identity mismatch`);
+            }
+
+            const reconciled: DocumentProvenanceRecord = {
+                schemaVersion: DOCUMENT_PROVENANCE_SCHEMA_VERSION,
+                recordName,
+                identity,
+                identityHash: current.identityHash,
+                bufferIncarnationId,
+                baseVersion,
+                baseText: input.baseText,
+                baseHash: sha256Text(input.baseText),
+                dirtyText: input.dirtyText,
+                dirtyHash: sha256Text(input.dirtyText),
+                updatedAt: nextTimestamp(this.now, current.updatedAt),
+            };
+            await this.writeRecord(reconciled);
+            return reconciled;
+        });
+    }
+
     async clearRecord(recordName: string): Promise<void> {
         if (!recordName.startsWith(`${RECORD_NAMESPACE}.`) || !recordName.endsWith(RECORD_SUFFIX)) {
             throw new Error('An explicit provenance record name is required');

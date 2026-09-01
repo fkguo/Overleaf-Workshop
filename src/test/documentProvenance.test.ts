@@ -67,6 +67,18 @@ class BlockingMemoryStorage extends MemoryStorage {
     }
 }
 
+class FailingMemoryStorage extends MemoryStorage {
+    failNextWrite = false;
+
+    async write(recordName: string, content: Uint8Array): Promise<void> {
+        if (this.failNextWrite) {
+            this.failNextWrite = false;
+            throw new Error('injected atomic write failure');
+        }
+        await super.write(recordName, content);
+    }
+}
+
 const baseIdentity: DocumentProvenanceIdentity = {
     canonicalServerUrl: 'https://www.overleaf.com',
     userId: 'verified-user',
@@ -447,6 +459,65 @@ describe('DocumentProvenanceStore', () => {
             /not-current-session/,
         );
         await assert.rejects(() => firstStore.clearRecord(''), /explicit provenance record name/);
+    });
+
+    it('atomically reconciles one exact pending intent and leaves it retryable on write failure', async () => {
+        const storage = new FailingMemoryStorage();
+        const store = createStore(storage, 'window-a');
+        const created = await store.createOrUpdateCurrent({
+            identity: baseIdentity,
+            bufferIncarnationId: defaultBufferIncarnationId,
+            baseVersion: 12,
+            baseText: 'abc',
+            dirtyText: 'abXc',
+        });
+        const pending: JsonValue = {state: 'submitted', doc: 'main-doc', v: 12};
+        await store.markPendingWrite(created.recordName, pending);
+
+        storage.failNextWrite = true;
+        await assert.rejects(
+            () => store.reconcilePendingWrite(created.recordName, pending, {
+                identity: baseIdentity,
+                bufferIncarnationId: defaultBufferIncarnationId,
+                baseVersion: 13,
+                baseText: 'abXc',
+                dirtyText: 'abXYc',
+            }),
+            /injected atomic write failure/,
+        );
+        const retained = await store.resolveCurrentRecord(created.recordName, {
+            identity: baseIdentity,
+            bufferIncarnationId: defaultBufferIncarnationId,
+            baseVersion: 12,
+            baseText: 'abc',
+            dirtyText: 'abXc',
+        });
+        assert.equal(retained.kind, 'valid');
+        if (retained.kind === 'valid') {
+            assert.deepEqual(retained.record.pendingWrite, pending);
+        }
+
+        await assert.rejects(
+            () => store.reconcilePendingWrite(created.recordName, {state: 'wrong'}, {
+                identity: baseIdentity,
+                bufferIncarnationId: defaultBufferIncarnationId,
+                baseVersion: 13,
+                baseText: 'abXc',
+                dirtyText: 'abXYc',
+            }),
+            /pending-write mismatch/,
+        );
+        const reconciled = await store.reconcilePendingWrite(created.recordName, pending, {
+            identity: baseIdentity,
+            bufferIncarnationId: defaultBufferIncarnationId,
+            baseVersion: 13,
+            baseText: 'abXc',
+            dirtyText: 'abXYc',
+        });
+        assert.equal(reconciled.pendingWrite, undefined);
+        assert.equal(reconciled.baseVersion, 13);
+        assert.equal(reconciled.baseText, 'abXc');
+        assert.equal(reconciled.dirtyText, 'abXYc');
     });
 
     it('flush waits for already queued atomic storage operations', async () => {

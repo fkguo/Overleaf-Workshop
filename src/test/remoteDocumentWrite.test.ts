@@ -209,6 +209,7 @@ class TestTextDocument {
 
 class MemoryStorage implements ProvenanceStorage {
     readonly records = new Map<string, Uint8Array>();
+    beforeWrite?: (name: string, content: Uint8Array) => void | Promise<void>;
     beforeDelete?: () => void | Promise<void>;
     afterWrite?: (name: string, content: Uint8Array) => void | Promise<void>;
 
@@ -220,6 +221,7 @@ class MemoryStorage implements ProvenanceStorage {
         return value && new Uint8Array(value);
     }
     async write(name: string, content: Uint8Array): Promise<void> {
+        await this.beforeWrite?.(name, content);
         this.records.set(name, new Uint8Array(content));
         await this.afterWrite?.(name, content);
     }
@@ -241,6 +243,7 @@ type HarnessOptions = {
     applyError?: Error,
     applyBeforeError?: boolean,
     versionError?: Error,
+    confirmationVersion?: number,
 };
 
 type Harness = {
@@ -254,6 +257,7 @@ type Harness = {
     submissions: Array<{docId: string, update: any}>,
     getRemoteText(): string,
     setRemoteText(value: string): void,
+    setRemoteVersion(value: number): void,
 };
 
 function applyOperations(text: string, operations: Array<{p: number, i?: string, d?: string}>): string {
@@ -283,7 +287,7 @@ function makeHarness(options: HarnessOptions = {}): Harness {
     const userId = options.userId ?? 'user-1';
     const docId = options.docId ?? 'doc-1';
     const protocolVersion = options.protocolVersion ?? 2;
-    const remoteVersion = options.remoteVersion ?? 7;
+    let remoteVersion = options.remoteVersion ?? 7;
     let remoteText = options.remoteText ?? 'remote text';
     const uri = makeUri(`/Project/main.tex`, 'overleaf-workshop', 'server',
         `user=${userId}&project=${projectId}`);
@@ -323,6 +327,8 @@ function makeHarness(options: HarnessOptions = {}): Harness {
         joiningDocuments: new Map(),
         pendingDocumentUpdates: new Map(),
         stagedEditorBases: new Map(),
+        pendingReadTickets: new Map(),
+        boundReadCandidates: new Map(),
         activeEditorBases: new Map(),
         documentIdsByPath: new Map([[uri.toString(), docId]]),
         editorBufferIds: new WeakMap(),
@@ -348,6 +354,7 @@ function makeHarness(options: HarnessOptions = {}): Harness {
                 submissions.push({docId: submittedDocId, update});
                 if (options.applyError && !options.applyBeforeError) { throw options.applyError; }
                 remoteText = applyOperations(remoteText, update.op ?? []);
+                remoteVersion = Math.max(remoteVersion, update.v + 1);
                 if (options.applyError) { throw options.applyError; }
             },
         },
@@ -357,12 +364,14 @@ function makeHarness(options: HarnessOptions = {}): Harness {
             doc.remoteCache = remoteText;
             return {doc, content: remoteText};
         },
-        waitForDocumentVersion: () => ({
-            promise: options.versionError ? Promise.reject(options.versionError) : Promise.resolve(),
+        waitForDocumentVersion: (_docId: string, expectedVersion: number) => ({
+            promise: options.versionError ?
+                Promise.reject(options.versionError) :
+                Promise.resolve(options.confirmationVersion ?? expectedVersion),
             cancel: () => {},
         }),
         joinFreshDocumentSession: async () => {
-            doc.version = remoteVersion + 1;
+            doc.version = remoteVersion;
             doc.remoteCache = remoteText;
             return {doc, content: remoteText};
         },
@@ -394,6 +403,7 @@ function makeHarness(options: HarnessOptions = {}): Harness {
         submissions,
         getRemoteText: () => remoteText,
         setRemoteText: value => { remoteText = value; },
+        setRemoteVersion: value => { remoteVersion = value; },
     };
 }
 
@@ -481,6 +491,53 @@ describe('remote document exact-base write gate', () => {
         }
     });
 
+    it('serializes a path-key creation with a doc-key follow-up save', async () => {
+        const harness = makeHarness();
+        let resolveFirst!: () => void;
+        let signalFirstStarted!: () => void;
+        const holdFirst = new Promise<void>(resolve => { resolveFirst = resolve; });
+        const firstStarted = new Promise<void>(resolve => { signalFirstStarted = resolve; });
+        const executions: string[] = [];
+        let resolutions = 0;
+        harness.vfs._resolveUri = async () => {
+            resolutions += 1;
+            return resolutions === 1 ?
+                {fileType: undefined, fileEntity: undefined} :
+                {fileType: 'doc', fileEntity: harness.doc};
+        };
+        harness.vfs.writeFileNow = async (
+            _uri: TestUri,
+            content: Uint8Array,
+        ) => {
+            executions.push(new TextDecoder().decode(content));
+            if (executions.length === 1) {
+                signalFirstStarted();
+                await holdFirst;
+            }
+        };
+
+        const first = harness.vfs.writeFile(
+            harness.uri,
+            new TextEncoder().encode('initial create'),
+            true,
+            false,
+        );
+        await firstStarted;
+        const second = harness.vfs.writeFile(
+            harness.uri,
+            new TextEncoder().encode('follow-up save'),
+            false,
+            true,
+        );
+        await new Promise(resolve => setImmediate(resolve));
+
+        assert.deepEqual(executions, ['initial create']);
+        resolveFirst();
+        await Promise.all([first, second]);
+        assert.deepEqual(executions, ['initial create', 'follow-up save']);
+        assert.equal(harness.vfs.documentWrites.size, 0);
+    });
+
     it('rejects a cold stale hot-exit buffer against newer remote text without submitting OT', async () => {
         const harness = makeHarness({remoteText: 'collaborator revision', remoteVersion: 12});
         await seedColdRecord(
@@ -535,7 +592,7 @@ describe('remote document exact-base write gate', () => {
         assert.equal(missingPath.submissions.length, 0);
     });
 
-    it('rejects create:false writes for both missing paths and non-document entities', async () => {
+    it('rejects missing paths and never re-resolves non-document entities through upload creation', async () => {
         const missing = makeHarness();
         missing.vfs._resolveUri = async () => ({fileType: undefined, fileEntity: undefined});
         let missingCreateCalls = 0;
@@ -553,23 +610,47 @@ describe('remote document exact-base write gate', () => {
         assert.equal(missing.submissions.length, 0);
 
         const binary = makeHarness();
-        binary.vfs._resolveUri = async () => ({
-            fileType: 'file',
-            fileEntity: {_id: 'binary-1', name: 'image.png', _type: 'file'},
-        });
+        let binaryResolutions = 0;
+        binary.vfs._resolveUri = async () => {
+            binaryResolutions += 1;
+            return binaryResolutions === 1 ? {
+                fileType: 'file',
+                fileEntity: {_id: 'binary-1', name: 'image.png', _type: 'file'},
+            } : {
+                fileType: undefined,
+                fileEntity: undefined,
+            };
+        };
         let binaryCreateCalls = 0;
         binary.vfs.createFile = async () => { binaryCreateCalls += 1; };
         await assert.rejects(
             binary.vfs.writeFileNow(
                 binary.uri,
                 new TextEncoder().encode('must not overwrite'),
+                true,
+                true,
+            ),
+            /Only Overleaf text documents/i,
+        );
+        assert.equal(binaryResolutions, 1, 'the non-doc path must not be resolved again');
+        assert.equal(binaryCreateCalls, 0);
+        assert.equal(binary.submissions.length, 0);
+
+        const binaryWithoutCreate = makeHarness();
+        binaryWithoutCreate.vfs._resolveUri = async () => ({
+            fileType: 'file',
+            fileEntity: {_id: 'binary-2', name: 'image.png', _type: 'file'},
+        });
+        await assert.rejects(
+            binaryWithoutCreate.vfs.writeFileNow(
+                binaryWithoutCreate.uri,
+                new TextEncoder().encode('must not overwrite'),
                 false,
                 true,
             ),
             /Only Overleaf text documents/i,
         );
-        assert.equal(binaryCreateCalls, 0);
-        assert.equal(binary.submissions.length, 0);
+        assert.equal(binaryWithoutCreate.submissions.length, 0);
     });
 
     it('writes recovery-copy bytes from the same editor at dialog completion', async () => {
@@ -710,11 +791,13 @@ describe('remote document exact-base write gate', () => {
         }
     });
 
-    it('reloads only the exact blocked editor even if focus changes', async () => {
-        const harness = makeHarness({remoteText: 'authoritative', remoteVersion: 7});
+    it('freshly reloads only the exact blocked editor even if focus changes', async () => {
+        const harness = makeHarness({remoteText: 'cached authoritative', remoteVersion: 7});
         harness.vfs.observeTextDocument(harness.document);
         harness.document.setDirtyText('blocked local bytes');
         harness.vfs.observeTextDocument(harness.document);
+        harness.setRemoteText('fresh authoritative + collaborator');
+        harness.setRemoteVersion(8);
         const unrelated = new TestTextDocument(makeUri('/unrelated.tex'), 'unrelated bytes');
         openTextDocuments.push(unrelated);
         let exactEditorEdits = 0;
@@ -738,10 +821,11 @@ describe('remote document exact-base write gate', () => {
                     return true;
                 },
             });
-            harness.vfs.openFile = async () => {
-                harness.vfs.stageEditorBase(harness.uri, harness.doc, 'authoritative');
+            const joinFresh = harness.vfs.joinFreshDocumentSession.bind(harness.vfs);
+            harness.vfs.joinFreshDocumentSession = async (docId: string) => {
+                const authoritative = await joinFresh(docId);
                 vscodeStub.window.activeTextEditor = {document: unrelated};
-                return new TextEncoder().encode('authoritative');
+                return authoritative;
             };
             harness.document.saveHandler = async () => {
                 harness.document.markClean();
@@ -763,7 +847,7 @@ describe('remote document exact-base write gate', () => {
 
             assert.equal(exactEditorEdits, 1);
             assert.equal(globalReverts, 0);
-            assert.equal(harness.document.getText(), 'authoritative');
+            assert.equal(harness.document.getText(), 'fresh authoritative + collaborator');
             assert.equal(harness.document.isDirty, false);
             assert.equal(unrelated.getText(), 'unrelated bytes');
             assert.equal(unrelated.isDirty, false);
@@ -788,7 +872,19 @@ describe('remote document exact-base write gate', () => {
         assert.equal(harness.getRemoteText(), 'hello world');
         assert.equal(harness.doc.localCache, 'hello world');
         assert.equal(harness.doc.remoteCache, 'hello world');
-        assert.deepEqual(await harness.storage.list(), []);
+        const records = await harness.storage.list();
+        assert.equal(records.length, 1);
+        const reconciled = await harness.store.resolveCurrentRecord(records[0], {
+            identity: harness.identity,
+            bufferIncarnationId: harness.vfs.editorBufferIds.get(harness.document),
+            baseVersion: 8,
+            baseText: 'hello world',
+            dirtyText: 'hello world',
+        });
+        assert.equal(reconciled.kind, 'valid');
+        if (reconciled.kind === 'valid') {
+            assert.equal(reconciled.record.pendingWrite, undefined);
+        }
     });
 
     it('promotes only an explicitly confirmed clean provider read and persists the later dirty editor text', async () => {
@@ -819,21 +915,64 @@ describe('remote document exact-base write gate', () => {
         assert.equal(harness.getRemoteText(), 'dirty edit');
     });
 
-    it('keeps an acknowledged snapshot as ancestry when realtime advances during cleanup', async () => {
+    it('keeps the host dirty when realtime advances during acknowledged cleanup', async () => {
         const harness = makeHarness({remoteText: 'hello', remoteVersion: 7});
         await confirmBase(harness, 'hello');
-        harness.storage.beforeDelete = () => {
+        let advanced = false;
+        harness.storage.afterWrite = (_name, bytes) => {
+            const record = JSON.parse(new TextDecoder().decode(bytes)) as {
+                pendingWrite?: unknown,
+                baseVersion?: number,
+                baseText?: string,
+            };
+            if (advanced
+                || record.pendingWrite !== undefined
+                || record.baseVersion !== 8
+                || record.baseText !== 'hello world') { return; }
+            advanced = true;
             harness.setRemoteText('hello world + collaborator');
             harness.doc.version = 9;
             harness.doc.remoteCache = 'hello world + collaborator';
         };
 
-        await write(harness, 'hello world');
+        await assert.rejects(
+            write(harness, 'hello world'),
+            /confirmed with collaborator text absent from this editor/i,
+        );
 
         assert.equal(harness.submissions.length, 1);
+        assert.equal(harness.document.isDirty, true);
+        assert.equal(harness.document.getText(), 'hello world');
         assert.equal(harness.doc.version, 9);
         assert.equal(harness.doc.remoteCache, 'hello world + collaborator');
         assert.equal(harness.getRemoteText(), 'hello world + collaborator');
+    });
+
+    it('rejects a fresh snapshot behind the observed transformed confirmation', async () => {
+        const harness = makeHarness({
+            remoteText: 'hello',
+            remoteVersion: 7,
+            confirmationVersion: 9,
+        });
+        const bufferId = await confirmBase(harness, 'hello');
+
+        await assert.rejects(
+            write(harness, 'hello world'),
+            /authoritative revision is behind the observed sender confirmation/i,
+        );
+
+        assert.equal(harness.submissions.length, 1);
+        assert.equal(harness.getRemoteText(), 'hello world');
+        assert.equal(harness.document.isDirty, true);
+        assert.equal(harness.document.getText(), 'hello world');
+        const pending = harness.vfs.pendingDocumentUpdates.get(bufferId);
+        assert.equal(pending?.confirmationVersion, 9);
+        const records = await harness.storage.list();
+        assert.equal(records.length, 1);
+        const persisted = JSON.parse(new TextDecoder().decode(
+            harness.storage.records.get(records[0])!,
+        )) as {pendingWrite?: unknown};
+        assert.notEqual(persisted.pendingWrite, undefined);
     });
 
     it('keeps the acknowledged base when the same buffer changes during cleanup', async () => {
@@ -842,7 +981,18 @@ describe('remote document exact-base write gate', () => {
         harness.document.setDirtyText('hello world');
         harness.vfs.observeTextDocument(harness.document);
         harness.vfs.observeWillSaveTextDocument(harness.document);
-        harness.storage.beforeDelete = () => {
+        let advanced = false;
+        harness.storage.afterWrite = (_name, bytes) => {
+            const record = JSON.parse(new TextDecoder().decode(bytes)) as {
+                pendingWrite?: unknown,
+                baseVersion?: number,
+                baseText?: string,
+            };
+            if (advanced
+                || record.pendingWrite !== undefined
+                || record.baseVersion !== 8
+                || record.baseText !== 'hello world') { return; }
+            advanced = true;
             harness.document.setDirtyText('hello world + next local edit');
             harness.vfs.observeTextDocument(harness.document);
         };
@@ -873,6 +1023,86 @@ describe('remote document exact-base write gate', () => {
             dirtyText: 'hello world + next local edit',
         });
         assert.equal(persisted.kind, 'valid');
+
+        harness.storage.afterWrite = undefined;
+        harness.vfs.observeWillSaveTextDocument(harness.document);
+        await harness.vfs.writeFileNow(
+            harness.uri,
+            new TextEncoder().encode('hello world + next local edit'),
+            false,
+            true,
+        );
+        assert.equal(harness.submissions.length, 2, 'only the later edit may produce the second OT');
+        assert.equal(harness.getRemoteText(), 'hello world + next local edit');
+    });
+
+    it('retries confirmed-state persistence without resending the acknowledged OT', async () => {
+        const harness = makeHarness({remoteText: 'hello', remoteVersion: 7});
+        const bufferId = await confirmBase(harness, 'hello');
+        let failedReconciliation = false;
+        harness.storage.beforeWrite = (_name, bytes) => {
+            const record = JSON.parse(new TextDecoder().decode(bytes)) as {
+                pendingWrite?: unknown,
+                baseVersion?: number,
+                baseText?: string,
+            };
+            if (failedReconciliation
+                || record.pendingWrite !== undefined
+                || record.baseVersion !== 8
+                || record.baseText !== 'hello world') { return; }
+            failedReconciliation = true;
+            throw new Error('injected confirmed-state persistence failure');
+        };
+
+        await assert.rejects(
+            write(harness, 'hello world'),
+            /confirmed-state persistence failure/,
+        );
+        assert.equal(harness.submissions.length, 1);
+        assert.equal(harness.getRemoteText(), 'hello world');
+        assert.equal(harness.document.isDirty, true);
+        const pending = harness.vfs.pendingDocumentUpdates.get(bufferId);
+        assert.equal(pending?.confirmationVersion, 7);
+
+        harness.storage.beforeWrite = undefined;
+        await write(harness, 'hello world');
+        assert.equal(harness.submissions.length, 1, 'confirmed recovery must emit zero duplicate OT');
+        assert.equal(harness.document.isDirty, false);
+        assert.equal(harness.vfs.pendingDocumentUpdates.has(bufferId), false);
+        const active = harness.vfs.activeEditorBases.get(bufferId);
+        const resolved = await harness.store.resolveCurrentRecord(active.recordName, {
+            identity: harness.identity,
+            bufferIncarnationId: bufferId,
+            baseVersion: 8,
+            baseText: 'hello world',
+            dirtyText: 'hello world',
+        });
+        assert.equal(resolved.kind, 'valid', JSON.stringify(resolved));
+        if (resolved.kind === 'valid') {
+            assert.equal(resolved.record.pendingWrite, undefined);
+        }
+    });
+
+    it('does not make record deletion part of acknowledged-write completion', async () => {
+        const harness = makeHarness({remoteText: 'hello', remoteVersion: 7});
+        await confirmBase(harness, 'hello');
+        let deleteCalls = 0;
+        harness.storage.beforeDelete = () => {
+            deleteCalls += 1;
+            throw new Error('injected delete failure');
+        };
+
+        await write(harness, 'hello world');
+
+        assert.equal(deleteCalls, 0);
+        assert.equal(harness.submissions.length, 1);
+        assert.equal(harness.getRemoteText(), 'hello world');
+        const records = await harness.storage.list();
+        assert.equal(records.length, 1);
+        const parsed = JSON.parse(new TextDecoder().decode(
+            harness.storage.records.get(records[0])!,
+        )) as {pendingWrite?: unknown};
+        assert.equal(parsed.pendingWrite, undefined);
     });
 
     it('rechecks remote authority after durable provenance I/O and immediately before submission', async () => {

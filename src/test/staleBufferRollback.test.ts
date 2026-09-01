@@ -3,6 +3,7 @@ import {requireSavedCompileInputs} from '../compile/compileRun';
 import {
     applyTextOperations,
     createAliasProviderProject,
+    createEventWiredProviderProject,
     createVirtualProject,
     DeterministicRealtimeServer,
     HarnessStorage,
@@ -20,6 +21,8 @@ const PROJECT_A = 'project-a';
 const PROJECT_B = 'project-b';
 const OWN_CONFIRMED = 'OWN_CONFIRMED';
 const COLLABORATOR = 'COLLABORATOR';
+const ENABLE_CLEAN_EDITOR = 'Reload Remote and Enable Editing';
+const CREATE_NEW_DOCUMENT = 'Create New Remote Document';
 
 function addProject(
     server: DeterministicRealtimeServer,
@@ -59,6 +62,717 @@ function replaceAt(content: string, from: string, to: string): TextOperation[] {
 describe('stale-buffer rollback safety', () => {
     beforeEach(() => resetHarnessDocuments());
     after(() => resetHarnessRuntime());
+
+    it('wires a clean provider read through open, edit, and public writeFile', async () => {
+        const base = 'alpha omega';
+        const desired = 'alpha LOCAL omega';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Public Clean Open', 4);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'public-clean-open',
+            projectId: PROJECT_A,
+        });
+
+        assert.equal(
+            new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
+            base,
+        );
+        harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.openClean(harness.events);
+        await settleAsyncWork();
+        await settleAsyncWork();
+
+        editor.editThroughEvents(desired, harness.events);
+        const result = await editor.saveThroughProvider(harness.provider, harness.events);
+
+        assert.equal(result.saved, true);
+        assert.equal(editor.dirty, false);
+        assert.equal(server.capturedUpdates.length, 1);
+        assert.equal(server.text(PROJECT_A), desired);
+        harness.dispose();
+    });
+
+    it('keeps a clean provider read quarantined when enable-editing is cancelled', async () => {
+        const base = 'remote base';
+        const desired = 'untrusted local edit';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Public Clean Open Cancel', 4);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'public-clean-open-cancel',
+            projectId: PROJECT_A,
+        });
+
+        assert.equal(
+            new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
+            base,
+        );
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.openClean(harness.events);
+        await settleAsyncWork();
+        await settleAsyncWork();
+        assert.equal(harness.events.warningMessages.length, 1);
+        assert.equal(harness.events.warningMessages[0].items.includes(ENABLE_CLEAN_EDITOR), true);
+
+        editor.editThroughEvents(desired, harness.events);
+        const result = await editor.saveThroughProvider(harness.provider, harness.events);
+
+        assert.equal(result.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), desired);
+        assert.equal(server.capturedUpdates.length, 0);
+        assert.equal(server.text(PROJECT_A), base);
+        harness.dispose();
+    });
+
+    it('keeps a public merged save dirty until host refresh, then saves a later edit', async () => {
+        const base = 'LEFT middle RIGHT';
+        const local = 'LOCAL middle RIGHT';
+        const merged = 'LOCAL middle REMOTE';
+        const followUp = `${merged} NEXT`;
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Public Merge Lifecycle', 4);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'public-merge-lifecycle',
+            projectId: PROJECT_A,
+        });
+        assert.equal(new TextDecoder().decode(await harness.provider.readFile(harness.uri)), base);
+        harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.openClean(harness.events);
+        await settleAsyncWork();
+        await settleAsyncWork();
+
+        editor.editThroughEvents(local, harness.events);
+        server.collaboratorUpdate(PROJECT_A, replaceAt(base, 'RIGHT', 'REMOTE'));
+        const mergedSave = await editor.saveThroughProvider(harness.provider, harness.events);
+        assert.equal(mergedSave.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), local);
+        assert.equal(server.text(PROJECT_A), merged);
+        assert.equal(server.capturedUpdates.length, 1);
+
+        await editor.reloadAuthoritative(harness.vfs, merged);
+        editor.editThroughEvents(followUp, harness.events);
+        const secondSave = await editor.saveThroughProvider(harness.provider, harness.events);
+        assert.equal(secondSave.saved, true);
+        assert.equal(editor.dirty, false);
+        assert.equal(server.capturedUpdates.length, 2);
+        assert.equal(server.text(PROJECT_A), followUp);
+        harness.dispose();
+    });
+
+    it('rejects a stale hot-exit overlay that arrives before clean-open confirmation', async () => {
+        const advanced = `base\n${OWN_CONFIRMED}\n${COLLABORATOR}\n`;
+        const restored = 'base\nLOCAL_DRAFT\n';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, advanced, PROJECT_A, 'Public Hot Exit', 12);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'public-hot-exit',
+            projectId: PROJECT_A,
+        });
+
+        assert.equal(
+            new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
+            advanced,
+        );
+        const confirmation = harness.events.deferWarningResponse();
+        const editor = new SimulatedDirtyEditor(harness.uri, advanced);
+        editor.openClean(harness.events);
+        editor.editThroughEvents(restored, harness.events);
+        confirmation.resolve(ENABLE_CLEAN_EDITOR);
+        await settleAsyncWork();
+        await settleAsyncWork();
+
+        const result = await editor.saveThroughProvider(harness.provider, harness.events);
+
+        assert.equal(result.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), restored);
+        assert.equal(server.capturedUpdates.length, 0);
+        assert.equal(server.text(PROJECT_A), advanced);
+        assert.match(server.text(PROJECT_A), new RegExp(OWN_CONFIRMED));
+        assert.match(server.text(PROJECT_A), new RegExp(COLLABORATOR));
+        harness.dispose();
+    });
+
+    it('routes manual, autosave, and saveAll through the same public provenance gate', async () => {
+        for (const trigger of ['manual', 'auto', 'save-all'] as const) {
+            const base = `base-${trigger}`;
+            const desired = `${base}-LOCAL`;
+            const server = new DeterministicRealtimeServer();
+            addProject(server, base, PROJECT_A, `Public ${trigger}`, 8);
+            const harness = await createEventWiredProviderProject({
+                server,
+                storage: new HarnessStorage(),
+                windowId: `public-${trigger}`,
+                projectId: PROJECT_A,
+            });
+            assert.equal(
+                new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
+                base,
+                trigger,
+            );
+            harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
+            const editor = new SimulatedDirtyEditor(harness.uri, base);
+            editor.openClean(harness.events);
+            await settleAsyncWork();
+            await settleAsyncWork();
+            editor.editThroughEvents(desired, harness.events);
+
+            const host = new SimulatedEditorHost();
+            let saved: boolean;
+            if (trigger === 'manual') {
+                saved = (await host.manualSaveThroughProvider(
+                    editor,
+                    harness.provider,
+                    harness.events,
+                )).saved;
+                assert.equal(host.manualSaveCalls, 1);
+            } else if (trigger === 'auto') {
+                saved = (await host.autoSaveThroughProvider(
+                    editor,
+                    harness.provider,
+                    harness.events,
+                )).saved;
+                assert.equal(host.autoSaveCalls, 1);
+            } else {
+                saved = await host.saveAllThroughProvider([{
+                    editor,
+                    provider: harness.provider,
+                    events: harness.events,
+                }]);
+                assert.equal(host.saveAllCalls, 1);
+            }
+
+            assert.equal(saved, true, trigger);
+            assert.equal(editor.dirty, false, trigger);
+            assert.equal(server.capturedUpdates.length, 1, trigger);
+            assert.equal(server.text(PROJECT_A), desired, trigger);
+            editor.closeThroughEvents(harness.events);
+            harness.dispose();
+        }
+    });
+
+    it('rejects a stale alias after a confirmed alias save and collaborator advance', async () => {
+        const base = 'LEFT middle RIGHT';
+        const aliasAContent = 'LOCAL middle RIGHT';
+        const aliasBContent = 'LEFT middle STALE-B';
+        const expectedRemote = 'LOCAL middle REMOTE';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Public Alias History', 3);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'public-alias-history',
+            projectId: PROJECT_A,
+        });
+
+        assert.equal(
+            new TextDecoder().decode(await harness.provider.readFile(harness.encodedUri)),
+            base,
+        );
+        harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
+        const aliasA = new SimulatedDirtyEditor(harness.encodedUri, base);
+        aliasA.openClean(harness.events);
+        await settleAsyncWork();
+        await settleAsyncWork();
+
+        assert.equal(
+            new TextDecoder().decode(await harness.provider.readFile(harness.reorderedUri)),
+            base,
+        );
+        const aliasBConfirmation = harness.events.deferWarningResponse();
+        const aliasB = new SimulatedDirtyEditor(harness.reorderedUri, base);
+        aliasB.openClean(harness.events);
+
+        aliasA.editThroughEvents(aliasAContent, harness.events);
+        const aliasASave = await aliasA.saveThroughProvider(harness.provider, harness.events);
+        assert.equal(aliasASave.saved, true);
+        assert.equal(server.text(PROJECT_A), aliasAContent);
+        aliasA.closeThroughEvents(harness.events);
+
+        server.collaboratorUpdate(
+            PROJECT_A,
+            replaceAt(aliasAContent, 'RIGHT', 'REMOTE'),
+        );
+        assert.equal(server.text(PROJECT_A), expectedRemote);
+
+        aliasBConfirmation.resolve(ENABLE_CLEAN_EDITOR);
+        await settleAsyncWork();
+        await settleAsyncWork();
+        const aliasBBufferId = harness.vfs.editorBufferIds.get(aliasB.document);
+        assert.equal(
+            harness.vfs.activeEditorBases.has(aliasBBufferId),
+            false,
+            'the stale alias read must not become a trusted base after remote advancement',
+        );
+
+        aliasB.editThroughEvents(aliasBContent, harness.events);
+        const packetsBeforeAliasBSave = server.capturedUpdates.length;
+        const aliasBSave = await aliasB.saveThroughProvider(harness.provider, harness.events);
+
+        assert.equal(aliasBSave.saved, false);
+        assert.equal(aliasB.dirty, true);
+        assert.equal(aliasB.document.getText(), aliasBContent);
+        assert.equal(server.capturedUpdates.length, packetsBeforeAliasBSave);
+        assert.equal(server.text(PROJECT_A), expectedRemote);
+        assert.match(server.text(PROJECT_A), /LOCAL/);
+        assert.match(server.text(PROJECT_A), /REMOTE/);
+        harness.dispose();
+    });
+
+    it('creates a genuinely new text document from an exact public save intent', async () => {
+        const server = new DeterministicRealtimeServer();
+        addProject(server, 'existing', PROJECT_A, 'Public New Document', 3);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'public-new-document',
+            projectId: PROJECT_A,
+        });
+        await harness.vfs.init();
+        const newUri = harness.uri.with({path: '/Public New Document/new.tex'});
+        const editor = new SimulatedDirtyEditor(newUri, 'new text');
+        editor.attach();
+        harness.events.queueWarningResponse(CREATE_NEW_DOCUMENT);
+
+        const created = await editor.saveThroughProvider(
+            harness.provider,
+            harness.events,
+            {create: true, overwrite: false},
+        );
+
+        assert.equal(created.saved, true);
+        assert.equal(editor.dirty, false);
+        assert.equal(server.documentCreationCount, 1);
+        assert.equal(server.addDocCallCount, 1);
+        assert.equal(server.uploadFileCallCount, 0, 'safe text creation must never use upload upsert');
+        assert.equal(server.projectEntitiesReadCount, 2, 'creation requires fresh pre/post path checks');
+        assert.equal(server.documentByName(PROJECT_A, 'new.tex')?.content, 'new text');
+        assert.equal(server.capturedUpdates.length, 1, 'initial bytes must be revision-bound OT');
+
+        editor.editThroughEvents('new text + later edit', harness.events);
+        const updated = await editor.saveThroughProvider(harness.provider, harness.events);
+        assert.equal(updated.saved, true);
+        assert.equal(server.capturedUpdates.length, 2);
+        assert.equal(
+            server.documentByName(PROJECT_A, 'new.tex')?.content,
+            'new text + later edit',
+        );
+        harness.dispose();
+    });
+
+    it('keeps collaborator bytes when the new empty base advances before initial OT', async () => {
+        const server = new DeterministicRealtimeServer();
+        addProject(server, 'existing', PROJECT_A, 'Public New Document Advanced', 3);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'public-new-document-advanced',
+            projectId: PROJECT_A,
+        });
+        await harness.vfs.init();
+        const newUri = harness.uri.with({path: '/Public New Document Advanced/new.tex'});
+        const editor = new SimulatedDirtyEditor(newUri, 'local initial text');
+        editor.attach();
+        harness.events.queueWarningResponse(CREATE_NEW_DOCUMENT);
+        const verifyCreated = harness.vfs.verifyFreshCreatedDocumentPath.bind(harness.vfs);
+        harness.vfs.verifyFreshCreatedDocumentPath = async (...args: unknown[]) => {
+            await verifyCreated(...args);
+            const created = server.documentByName(PROJECT_A, 'new.tex');
+            assert.ok(created);
+            server.collaboratorUpdate(
+                PROJECT_A,
+                [{p: 0, i: 'collaborator text'}],
+                created.id,
+            );
+        };
+
+        const result = await editor.saveThroughProvider(
+            harness.provider,
+            harness.events,
+            {create: true, overwrite: false},
+        );
+
+        assert.equal(result.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), 'local initial text');
+        assert.equal(server.documentCreationCount, 1);
+        assert.equal(server.addDocCallCount, 1);
+        assert.equal(server.uploadFileCallCount, 0);
+        assert.equal(server.capturedUpdates.length, 0);
+        assert.equal(server.documentByName(PROJECT_A, 'new.tex')?.content, 'collaborator text');
+        harness.dispose();
+    });
+
+    it('serializes a second onWillSave through the real create and initial-OT flow', async () => {
+        const server = new DeterministicRealtimeServer();
+        addProject(server, 'existing', PROJECT_A, 'Public New Document Queued', 3);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'public-new-document-queued',
+            projectId: PROJECT_A,
+        });
+        await harness.vfs.init();
+        const newUri = harness.uri.with({path: '/Public New Document Queued/new.tex'});
+        const editor = new SimulatedDirtyEditor(newUri, 'first text');
+        editor.attach();
+        harness.events.queueWarningResponse(CREATE_NEW_DOCUMENT);
+        server.holdNextApplicationAfterAck();
+
+        harness.events.fireWillSave(editor.document);
+        const first = harness.provider.writeFile(
+            newUri,
+            new TextEncoder().encode('first text'),
+            {create: true, overwrite: false},
+        );
+        for (let attempt = 0; attempt < 20 && server.capturedUpdates.length === 0; attempt += 1) {
+            await settleAsyncWork();
+        }
+        assert.equal(server.capturedUpdates.length, 1);
+        assert.equal(server.documentByName(PROJECT_A, 'new.tex')?.content, '');
+
+        editor.editThroughEvents('second text', harness.events);
+        harness.events.fireWillSave(editor.document);
+        const second = harness.provider.writeFile(
+            newUri,
+            new TextEncoder().encode('second text'),
+            {create: true, overwrite: true},
+        );
+        await settleAsyncWork();
+        assert.equal(
+            server.capturedUpdates.length,
+            1,
+            'the doc-key follow-up must remain behind the path-key creation',
+        );
+
+        server.releaseHeldApplication();
+        await first;
+        await second;
+        editor.dirty = false;
+        harness.events.fireDidSave(editor.document);
+
+        assert.equal(server.documentCreationCount, 1);
+        assert.equal(server.addDocCallCount, 1);
+        assert.equal(server.uploadFileCallCount, 0);
+        assert.equal(server.capturedUpdates.length, 2);
+        assert.equal(server.logicalApplyCount, 2);
+        assert.equal(server.documentByName(PROJECT_A, 'new.tex')?.content, 'second text');
+        const bufferId = harness.vfs.editorBufferIds.get(editor.document);
+        assert.equal(harness.vfs.activeEditorBases.get(bufferId)?.content, 'second text');
+        harness.dispose();
+    });
+
+    it('deduplicates an outcome-unknown initial OT after atomic text creation', async () => {
+        const server = new DeterministicRealtimeServer();
+        addProject(server, 'existing', PROJECT_A, 'Public New Document Retry', 3);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'public-new-document-retry',
+            projectId: PROJECT_A,
+        });
+        await harness.vfs.init();
+        const newUri = harness.uri.with({path: '/Public New Document Retry/new.tex'});
+        const editor = new SimulatedDirtyEditor(newUri, 'new text');
+        editor.attach();
+        harness.events.queueWarningResponse(CREATE_NEW_DOCUMENT);
+        server.loseNextAckAfterCommit();
+
+        const uncertain = await editor.saveThroughProvider(
+            harness.provider,
+            harness.events,
+            {create: true, overwrite: false},
+        );
+
+        assert.equal(uncertain.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), 'new text');
+        assert.equal(server.documentCreationCount, 1);
+        assert.equal(server.addDocCallCount, 1);
+        assert.equal(server.uploadFileCallCount, 0);
+        assert.equal(server.logicalApplyCount, 1);
+        assert.equal(server.capturedUpdates.length, 1);
+        assert.equal(server.documentByName(PROJECT_A, 'new.tex')?.content, 'new text');
+
+        await settleAsyncWork();
+        await settleAsyncWork();
+        const recovered = await editor.saveThroughProvider(
+            harness.provider,
+            harness.events,
+            {create: true, overwrite: true},
+        );
+
+        assert.equal(recovered.saved, true);
+        assert.equal(editor.dirty, false);
+        assert.equal(server.documentCreationCount, 1, 'retry must not create a second document');
+        assert.equal(server.addDocCallCount, 1);
+        assert.equal(server.logicalApplyCount, 1, 'deduplicated retry must not apply twice');
+        assert.equal(server.capturedUpdates.length, 2);
+        assert.equal(server.senderConfirmationCount, 1);
+        const [initial, retry] = server.capturedUpdates;
+        assert.equal(retry.update.v, initial.update.v);
+        assert.deepEqual(retry.update.op, initial.update.op);
+        assert.deepEqual(retry.update.dupIfSource, [initial.publicId]);
+        assert.equal(server.documentByName(PROJECT_A, 'new.tex')?.content, 'new text');
+        harness.dispose();
+    });
+
+    it('keeps a genuinely new text document dirty when creation is not confirmed', async () => {
+        const server = new DeterministicRealtimeServer();
+        addProject(server, 'existing', PROJECT_A, 'Public New Document Cancel', 3);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'public-new-document-cancel',
+            projectId: PROJECT_A,
+        });
+        await harness.vfs.init();
+        const newUri = harness.uri.with({path: '/Public New Document Cancel/new.tex'});
+        const editor = new SimulatedDirtyEditor(newUri, 'unconfirmed text');
+        editor.attach();
+
+        const result = await editor.saveThroughProvider(
+            harness.provider,
+            harness.events,
+            {create: true, overwrite: false},
+        );
+
+        assert.equal(result.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), 'unconfirmed text');
+        assert.equal(server.documentCreationCount, 0);
+        assert.equal(server.documentByName(PROJECT_A, 'new.tex'), undefined);
+        assert.equal(server.capturedUpdates.length, 0);
+        harness.dispose();
+    });
+
+    it('rejects new-document creation when the buffer changes during confirmation', async () => {
+        const server = new DeterministicRealtimeServer();
+        addProject(server, 'existing', PROJECT_A, 'Public New Document Changed', 3);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'public-new-document-changed',
+            projectId: PROJECT_A,
+        });
+        await harness.vfs.init();
+        const newUri = harness.uri.with({path: '/Public New Document Changed/new.tex'});
+        const editor = new SimulatedDirtyEditor(newUri, 'initial text');
+        editor.attach();
+        const confirmation = harness.events.deferWarningResponse();
+
+        const saving = editor.saveThroughProvider(
+            harness.provider,
+            harness.events,
+            {create: true, overwrite: false},
+        );
+        await settleAsyncWork();
+        editor.editThroughEvents('changed while confirming', harness.events);
+        confirmation.resolve(CREATE_NEW_DOCUMENT);
+        const result = await saving;
+
+        assert.equal(result.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), 'changed while confirming');
+        assert.equal(server.documentCreationCount, 0);
+        assert.equal(server.documentByName(PROJECT_A, 'new.tex'), undefined);
+        assert.equal(server.capturedUpdates.length, 0);
+        harness.dispose();
+    });
+
+    it('rejects ambiguous dirty buffers for one genuinely new path', async () => {
+        const server = new DeterministicRealtimeServer();
+        addProject(server, 'existing', PROJECT_A, 'Public New Document Ambiguous', 3);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'public-new-document-ambiguous',
+            projectId: PROJECT_A,
+        });
+        await harness.vfs.init();
+        const newUri = harness.uri.with({path: '/Public New Document Ambiguous/new.tex'});
+        const first = new SimulatedDirtyEditor(newUri, 'same text');
+        const second = new SimulatedDirtyEditor(newUri, 'same text');
+        first.attach();
+        second.attach();
+
+        const result = await first.saveThroughProvider(
+            harness.provider,
+            harness.events,
+            {create: true, overwrite: false},
+        );
+
+        assert.equal(result.saved, false);
+        assert.equal(first.dirty, true);
+        assert.equal(second.dirty, true);
+        assert.equal(first.document.getText(), 'same text');
+        assert.equal(second.document.getText(), 'same text');
+        assert.equal(server.documentCreationCount, 0);
+        assert.equal(server.documentByName(PROJECT_A, 'new.tex'), undefined);
+        assert.equal(server.capturedUpdates.length, 0);
+        harness.dispose();
+    });
+
+    it('fails closed for nested creation without a fresh parent-id/path contract', async () => {
+        const server = new DeterministicRealtimeServer();
+        addProject(server, 'existing', PROJECT_A, 'Public Nested New Document', 3);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'public-nested-new-document',
+            projectId: PROJECT_A,
+        });
+        await harness.vfs.init();
+        harness.vfs.root.rootFolder[0].folders.push({
+            _id: `${PROJECT_A}-subfolder`,
+            name: 'sub',
+            docs: [],
+            fileRefs: [],
+            folders: [],
+        });
+        const newUri = harness.uri.with({path: '/Public Nested New Document/sub/new.tex'});
+        const editor = new SimulatedDirtyEditor(newUri, 'nested local text');
+        editor.attach();
+        harness.events.queueWarningResponse(CREATE_NEW_DOCUMENT);
+
+        const result = await editor.saveThroughProvider(
+            harness.provider,
+            harness.events,
+            {create: true, overwrite: false},
+        );
+
+        assert.equal(result.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), 'nested local text');
+        assert.equal(server.projectEntitiesReadCount, 0);
+        assert.equal(server.addDocCallCount, 0);
+        assert.equal(server.uploadFileCallCount, 0);
+        assert.equal(server.documentCreationCount, 0);
+        harness.dispose();
+    });
+
+    it('fails closed for new text on a server without a verified atomic contract', async () => {
+        const server = new DeterministicRealtimeServer();
+        addProject(server, 'existing', PROJECT_A, 'Unverified New Document', 3);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'unverified-new-document',
+            projectId: PROJECT_A,
+        });
+        await harness.vfs.init();
+        harness.vfs.serverUrl = 'https://www.overleaf.com:8443/';
+        const newUri = harness.uri.with({path: '/Unverified New Document/new.tex'});
+        const editor = new SimulatedDirtyEditor(newUri, 'unverified local text');
+        editor.attach();
+        harness.events.queueWarningResponse(CREATE_NEW_DOCUMENT);
+
+        const result = await editor.saveThroughProvider(
+            harness.provider,
+            harness.events,
+            {create: true, overwrite: false},
+        );
+
+        assert.equal(result.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), 'unverified local text');
+        assert.equal(server.projectEntitiesReadCount, 0);
+        assert.equal(server.addDocCallCount, 0);
+        assert.equal(server.uploadFileCallCount, 0);
+        assert.equal(server.documentCreationCount, 0);
+        harness.dispose();
+    });
+
+    it('does not create over a path that appears after fresh preflight but before atomic addDoc', async () => {
+        const server = new DeterministicRealtimeServer();
+        addProject(server, 'existing', PROJECT_A, 'Public New Document Race', 3);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'public-new-document-race',
+            projectId: PROJECT_A,
+        });
+        await harness.vfs.init();
+        const newUri = harness.uri.with({path: '/Public New Document Race/race.tex'});
+        const editor = new SimulatedDirtyEditor(newUri, 'local race text');
+        editor.attach();
+        harness.events.queueWarningResponse(CREATE_NEW_DOCUMENT);
+        const verifyMissing = harness.vfs.verifyFreshMissingPath.bind(harness.vfs);
+        let absenceChecks = 0;
+        harness.vfs.verifyFreshMissingPath = async (...args: unknown[]) => {
+            absenceChecks += 1;
+            await verifyMissing(...args);
+            if (absenceChecks === 1) {
+                const competing = server.createDocument(
+                    PROJECT_A,
+                    `${PROJECT_A}-root`,
+                    'race.tex',
+                    'collaborator bytes',
+                );
+                assert.equal(competing.type, 'success');
+            }
+        };
+
+        const result = await editor.saveThroughProvider(
+            harness.provider,
+            harness.events,
+            {create: true, overwrite: false},
+        );
+
+        assert.equal(result.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), 'local race text');
+        assert.equal(absenceChecks, 1, 'the HTTP preflight is diagnostic; addDoc closes the race');
+        assert.equal(server.projectEntitiesReadCount, 1);
+        assert.equal(server.addDocCallCount, 1, 'the competing name must be rejected at addDoc');
+        assert.equal(server.uploadFileCallCount, 0);
+        assert.equal(server.documentCreationCount, 1, 'only the competing creator may run');
+        assert.equal(server.documentByName(PROJECT_A, 'race.tex')?.content, 'collaborator bytes');
+        assert.equal(server.capturedUpdates.length, 0);
+        harness.dispose();
+    });
+
+    it('never recreates a missing path that was bound to an older remote document', async () => {
+        const server = new DeterministicRealtimeServer();
+        addProject(server, 'existing', PROJECT_A, 'Public Missing Old Path', 3);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'public-old-missing',
+            projectId: PROJECT_A,
+        });
+        await harness.vfs.init();
+        const missingUri = harness.uri.with({path: '/Public Missing Old Path/deleted.tex'});
+        const editor = new SimulatedDirtyEditor(missingUri, 'stale restored text');
+        editor.attach();
+        harness.vfs.documentIdsByPath.set(missingUri.toString(), 'deleted-document-id');
+        harness.events.queueWarningResponse(CREATE_NEW_DOCUMENT);
+
+        const result = await editor.saveThroughProvider(
+            harness.provider,
+            harness.events,
+            {create: true, overwrite: false},
+        );
+
+        assert.equal(result.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), 'stale restored text');
+        assert.equal(server.documentCreationCount, 0);
+        assert.equal(server.documentByName(PROJECT_A, 'deleted.tex'), undefined);
+        assert.equal(server.capturedUpdates.length, 0);
+        harness.dispose();
+    });
 
     it('fails closed when hot exit saves a stale dirty buffer with no trusted base', async () => {
         const advanced = `base\n${OWN_CONFIRMED}\n${COLLABORATOR}\n`;
@@ -161,6 +875,103 @@ describe('stale-buffer rollback safety', () => {
         assert.equal(server.text(PROJECT_A), content);
     });
 
+    it('rejects a remote-superset no-op while the host buffer lacks collaborator text', async () => {
+        const base = 'LEFT middle RIGHT';
+        const local = 'LOCAL middle RIGHT';
+        const remote = 'LOCAL middle REMOTE';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Remote Superset Noop', 6);
+        const harness = createHarness(server);
+        assert.equal(await openAuthoritativeText(harness), base);
+        const editor = new SimulatedDirtyEditor(harness.uri, local);
+        editor.attach();
+        await editor.confirmStagedBase(harness.vfs, base);
+        server.collaboratorUpdate(PROJECT_A, [
+            ...replaceAt(base, 'RIGHT', 'REMOTE'),
+        ]);
+        server.collaboratorUpdate(
+            PROJECT_A,
+            replaceAt('LEFT middle REMOTE', 'LEFT', 'LOCAL'),
+        );
+
+        const result = await editor.save(harness.vfs);
+
+        assert.equal(result.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), local);
+        assert.equal(server.capturedUpdates.length, 0);
+        assert.equal(server.text(PROJECT_A), remote);
+    });
+
+    it('rejects a recovery save when remote advances before the save linearizes', async () => {
+        const base = 'authoritative';
+        const remote = 'authoritative + collaborator';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Reload Noop Race', 4);
+        const harness = createHarness(server);
+        assert.equal(await openAuthoritativeText(harness), base);
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.attach();
+        await editor.confirmStagedBase(harness.vfs, base);
+        editor.edit(base);
+        server.collaboratorUpdate(PROJECT_A, [{p: base.length, i: ' + collaborator'}]);
+
+        const result = await editor.save(harness.vfs);
+
+        assert.equal(result.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), base);
+        assert.equal(server.capturedUpdates.length, 0);
+        assert.equal(server.text(PROJECT_A), remote);
+    });
+
+    it('retains the recovery-save causal base when remote advances strictly afterward', async () => {
+        const base = 'LEFT middle RIGHT';
+        const local = 'LOCAL middle RIGHT';
+        const remote = 'LEFT middle REMOTE';
+        const expected = 'LOCAL middle REMOTE';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Post-linearization Recovery', 4);
+        const harness = createHarness(server);
+        assert.equal(await openAuthoritativeText(harness), base);
+
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.attach();
+        const recoverySave = await editor.save(harness.vfs);
+
+        assert.equal(recoverySave.saved, true);
+        assert.equal(editor.dirty, false);
+        assert.equal(editor.document.getText(), base);
+        assert.equal(server.capturedUpdates.length, 0);
+        assert.equal(server.version(PROJECT_A), 4);
+        const bufferId = harness.vfs.editorBufferIds.get(editor.document);
+        const linearizedBase = harness.vfs.activeEditorBases.get(bufferId);
+        assert.equal(linearizedBase?.version, 4);
+        assert.equal(linearizedBase?.content, base);
+
+        server.collaboratorUpdate(PROJECT_A, replaceAt(base, 'RIGHT', 'REMOTE'));
+        assert.equal(server.text(PROJECT_A), remote);
+        assert.equal(server.version(PROJECT_A), 5);
+        assert.equal(editor.dirty, false);
+        assert.equal(editor.document.getText(), base);
+        assert.equal(await harness.vfs.confirmEditorBase(editor.document), false);
+        assert.strictEqual(harness.vfs.activeEditorBases.get(bufferId), linearizedBase);
+
+        editor.edit(local);
+        const laterSave = await editor.save(harness.vfs);
+
+        assert.equal(laterSave.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), local);
+        assert.equal(server.capturedUpdates.length, 1);
+        const sent = server.capturedUpdates[0].update;
+        assert.equal(sent.v, 5);
+        assert.equal(applyTextOperations(remote, sent.op), expected);
+        assert.equal(server.text(PROJECT_A), expected);
+        assert.match(server.text(PROJECT_A), /LOCAL/);
+        assert.match(server.text(PROJECT_A), /REMOTE/);
+    });
+
     it('sends an ordinary edit made from the exact joined base', async () => {
         const base = 'alpha omega';
         const desired = 'alpha LOCAL omega';
@@ -183,7 +994,7 @@ describe('stale-buffer rollback safety', () => {
         assert.equal(server.logicalApplyCount, 1);
     });
 
-    it('merges non-overlapping collaborator and local edits from a trusted base', async () => {
+    it('merges non-overlapping edits, keeps the stale host dirty, and supports a refreshed second save', async () => {
         const base = 'LEFT middle RIGHT';
         const local = 'LOCAL middle RIGHT';
         const expected = 'LOCAL middle REMOTE';
@@ -199,7 +1010,9 @@ describe('stale-buffer rollback safety', () => {
         const remoteBeforeSave = server.text(PROJECT_A);
         const result = await editor.save(harness.vfs);
 
-        assert.equal(result.saved, true);
+        assert.equal(result.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), local);
         assert.equal(server.capturedUpdates.length, 1);
         assert.equal(
             applyTextOperations(remoteBeforeSave, server.capturedUpdates[0].update.op),
@@ -208,6 +1021,13 @@ describe('stale-buffer rollback safety', () => {
         assert.equal(server.text(PROJECT_A), expected);
         assert.match(server.text(PROJECT_A), /LOCAL/);
         assert.match(server.text(PROJECT_A), /REMOTE/);
+
+        await editor.reloadAuthoritative(harness.vfs, expected);
+        const followUp = `${expected} NEXT`;
+        editor.edit(followUp);
+        assert.equal((await editor.save(harness.vfs)).saved, true);
+        assert.equal(server.capturedUpdates.length, 2);
+        assert.equal(server.text(PROJECT_A), followUp);
     });
 
     it('preserves post-base remote edits for manual, autosave, and compile saveAll writes', async () => {
@@ -238,14 +1058,16 @@ describe('stale-buffer rollback safety', () => {
                 assert.equal(host.autoSaveCalls, 1);
             } else {
                 const saved = await host.saveAll([{editor, vfs: harness.vfs}]);
-                requireSavedCompileInputs(saved);
-                compileCalls += 1;
+                assert.throws(() => requireSavedCompileInputs(saved), /could not be saved safely/);
+                if (saved) { compileCalls += 1; }
                 result = {saved};
                 assert.equal(host.saveAllCalls, 1);
-                assert.equal(compileCalls, 1, 'compile may start only after saveAll succeeds');
+                assert.equal(compileCalls, 0, 'compile must not start while the host lacks merged text');
             }
 
-            assert.equal(result.saved, true, trigger);
+            assert.equal(result.saved, false, trigger);
+            assert.equal(editor.dirty, true, trigger);
+            assert.equal(editor.document.getText(), local, trigger);
             assert.equal(server.capturedUpdates.length, 1, trigger);
             assert.equal(server.text(PROJECT_A), expected, trigger);
             assert.match(server.text(PROJECT_A), new RegExp(`LOCAL-${trigger}`));
@@ -321,7 +1143,9 @@ describe('stale-buffer rollback safety', () => {
         await settleAsyncWork();
         const result = await editor.save(harness.vfs);
 
-        assert.equal(result.saved, true);
+        assert.equal(result.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), local);
         assert.notEqual(harness.socket.publicId, firstPublicId);
         assert.equal(server.capturedUpdates.length, 1);
         assert.equal(server.text(PROJECT_A), expected);
@@ -405,6 +1229,57 @@ describe('stale-buffer rollback safety', () => {
         assert.equal(server.text(PROJECT_A), desired);
     });
 
+    it('accepts a transformed sender confirmation after an intervening collaborator operation', async () => {
+        const base = 'abc';
+        const desired = 'abXc';
+        const expected = 'YabXc';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Transformed Confirmation', 9);
+        const storage = new HarnessStorage();
+        const harness = createHarness(server, storage);
+        assert.equal(await openAuthoritativeText(harness), base);
+        const editor = new SimulatedDirtyEditor(harness.uri, desired);
+        editor.attach();
+        await editor.confirmStagedBase(harness.vfs, base);
+        server.holdNextApplicationAfterAck();
+
+        const saving = editor.save(harness.vfs);
+        await settleAsyncWork();
+        server.collaboratorUpdate(PROJECT_A, [{p: 0, i: 'Y'}]);
+        server.releaseHeldApplicationWithTransform();
+        const result = await saving;
+
+        assert.equal(result.saved, false, 'the host lacks the collaborator prefix and must remain dirty');
+        assert.match(
+            String(result.error),
+            /remote save was confirmed with collaborator text absent from this editor/i,
+        );
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), desired);
+        assert.equal(server.logicalApplyCount, 1);
+        assert.equal(server.senderConfirmationCount, 1);
+        assert.equal(server.text(PROJECT_A), expected);
+        assert.equal(server.capturedUpdates.length, 1);
+        assert.equal(server.capturedUpdates[0].update.v, 9);
+        const bufferId = harness.vfs.editorBufferIds.get(editor.document);
+        assert.equal(harness.vfs.pendingDocumentUpdates.has(bufferId), false);
+        const active = harness.vfs.activeEditorBases.get(bufferId);
+        const persisted = await storage.provenanceStore('window-a').resolveCurrentRecord(
+            active.recordName,
+            {
+                identity: active.identity,
+                bufferIncarnationId: bufferId,
+                baseVersion: 9,
+                baseText: base,
+                dirtyText: desired,
+            },
+        );
+        assert.equal(persisted.kind, 'valid', JSON.stringify(persisted));
+        if (persisted.kind === 'valid') {
+            assert.equal(persisted.record.pendingWrite, undefined);
+        }
+    });
+
     it('does not accept an op-less confirmation without a socket sender witness', async () => {
         const base = 'abc';
         const desired = 'abXc';
@@ -463,7 +1338,8 @@ describe('stale-buffer rollback safety', () => {
 
         editor.hideFromCurrentWindow();
         observerEditor.edit(`${COLLABORATOR}:Y${base}`);
-        assert.equal((await observerEditor.save(observer.vfs)).saved, true);
+        assert.equal((await observerEditor.save(observer.vfs)).saved, false);
+        assert.equal(observerEditor.dirty, true);
         assert.equal(server.text(PROJECT_A), `${COLLABORATOR}:Y${desired}`);
 
         observerEditor.hideFromCurrentWindow();
@@ -472,7 +1348,8 @@ describe('stale-buffer rollback safety', () => {
         await settleAsyncWork();
         const recovered = await editor.save(harness.vfs);
 
-        assert.equal(recovered.saved, true);
+        assert.equal(recovered.saved, false);
+        assert.equal(editor.dirty, true);
         assert.equal(server.capturedUpdates.length, 3, 'one intervening save and one deduplicated retry are expected');
         const retry = server.capturedUpdates[2];
         assert.notEqual(retry.publicId, first.publicId);
@@ -514,7 +1391,8 @@ describe('stale-buffer rollback safety', () => {
         assert.equal((await leftEditor.save(leftWindow.vfs)).saved, true);
         leftEditor.hideFromCurrentWindow();
         rightEditor.attach();
-        assert.equal((await rightEditor.save(rightWindow.vfs)).saved, true);
+        assert.equal((await rightEditor.save(rightWindow.vfs)).saved, false);
+        assert.equal(rightEditor.dirty, true);
         rightEditor.hideFromCurrentWindow();
 
         const projectB = createHarness(server, storage, 'window-left', PROJECT_B);

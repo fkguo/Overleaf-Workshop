@@ -193,11 +193,15 @@ describe('prepareProvenDocumentUpdate', () => {
             );
             assert.equal(independent.status, 'ready', `non-overlap sample ${sample}`);
             if (independent.status === 'ready') {
-                assert.match(independent.prepared.mergedContent, new RegExp(`REMOTE-${sample}`));
-                assert.match(independent.prepared.mergedContent, new RegExp(`LOCAL-${sample}`));
+                const expected = replace(remote, slots[localIndex], localToken);
+                assert.equal(
+                    independent.prepared.mergedContent,
+                    expected,
+                    `exact merged content sample ${sample}`,
+                );
                 assert.equal(
                     apply(remote, independent.prepared.operations),
-                    independent.prepared.mergedContent,
+                    expected,
                     `wire replay sample ${sample}`,
                 );
             }

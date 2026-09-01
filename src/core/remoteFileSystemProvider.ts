@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import * as vscode from 'vscode';
-import { BaseAPI, CompileOutputFileSchema, MemberEntity, ProjectSettingsSchema } from '../api/base';
+import { BaseAPI, CompileOutputFileSchema, Identity, MemberEntity, ProjectSettingsSchema } from '../api/base';
 import {
     OtUpdateErrorSchema,
     PermissionsLevel,
@@ -110,7 +110,7 @@ export interface ProjectEntity {
 
 type DocumentVersionWaiter = {
     expectedVersion: number,
-    resolve: () => void,
+    resolve: (confirmedVersion: number) => void,
     reject: (error: Error) => void,
     timer: NodeJS.Timeout,
 };
@@ -124,7 +124,6 @@ type PendingDocumentUpdate = {
     docId: string,
     bufferId: string,
     provenanceRecordName: string,
-    provenanceRecordsToClear: string[],
     update: UpdateSchema,
     desiredContent: string,
     mergedContent: string,
@@ -132,6 +131,7 @@ type PendingDocumentUpdate = {
     baseContent: string,
     submittedPublicIds: string[],
     socketGeneration: number,
+    confirmationVersion?: number,
 };
 
 type StagedEditorBase = {
@@ -139,6 +139,20 @@ type StagedEditorBase = {
     canonicalEditorUri: string,
     version: number,
     content: string,
+};
+
+type ProviderReadTicket = StagedEditorBase & {
+    token: string,
+    resourceKey: string,
+    publicId: string,
+    socketGeneration: number,
+};
+
+type BoundProviderReadCandidate = {
+    ticket: ProviderReadTicket,
+    bufferId: string,
+    document: vscode.TextDocument,
+    documentVersion: number,
 };
 
 type EditorDocumentBase = {
@@ -175,6 +189,11 @@ type UnboundEditorSaveIntent = {
     resourceKey: string,
     documentVersion: number,
     content: string,
+};
+
+type NewDocumentSaveWitness = UnboundEditorSaveIntent & {
+    bufferId: string,
+    document: vscode.TextDocument,
 };
 
 type ResolvedEditorProvenance = {
@@ -228,6 +247,8 @@ export class VirtualFileSystem extends vscode.Disposable {
     private documentVersionWaiters = new Map<string, Set<DocumentVersionWaiter>>();
     private pendingDocumentUpdates = new Map<string, PendingDocumentUpdate>();
     private stagedEditorBases = new Map<string, StagedEditorBase>();
+    private pendingReadTickets = new Map<string, ProviderReadTicket>();
+    private boundReadCandidates = new Map<string, BoundProviderReadCandidate>();
     private activeEditorBases = new Map<string, EditorDocumentBase>();
     private documentIdsByPath = new Map<string, string>();
     private editorBufferIds = new WeakMap<vscode.TextDocument, string>();
@@ -593,6 +614,26 @@ export class VirtualFileSystem extends vscode.Disposable {
         });
     }
 
+    private stageProviderRead(uri: vscode.Uri, doc: DocumentEntity, content: string) {
+        this.stageEditorBase(uri, doc, content);
+        const resourceKey = this.resourceKey(uri);
+        const sender = this.currentSenderWitness();
+        if (doc.version === undefined || !sender) {
+            this.pendingReadTickets.delete(resourceKey);
+            return;
+        }
+        this.pendingReadTickets.set(resourceKey, {
+            token: randomUUID(),
+            resourceKey,
+            docId: doc._id,
+            canonicalEditorUri: this.canonicalEditorUri(doc._id),
+            version: doc.version,
+            content,
+            publicId: sender.publicId,
+            socketGeneration: sender.generation,
+        });
+    }
+
     private cachedDocumentIdForUri(uri: vscode.Uri): string | undefined {
         if (uri.scheme !== ROOT_NAME || !this.root) { return undefined; }
         let parsed;
@@ -654,7 +695,152 @@ export class VirtualFileSystem extends vscode.Disposable {
         return state;
     }
 
-    /** A clean open remains quarantined until an explicit confirmed reload or save. */
+    /**
+     * Bind one exact provider read to one exact clean TextDocument, but keep it
+     * quarantined until the user explicitly requests a fresh remote recheck.
+     */
+    observeOpenedTextDocument(document: vscode.TextDocument) {
+        const alreadyObserved = this.editorBufferIds.has(document);
+        const buffer = this.observeEditorBuffer(document);
+        if (!buffer || alreadyObserved || document.isClosed || document.isDirty) { return; }
+        const ticket = this.pendingReadTickets.get(buffer.resourceKey);
+        const sender = this.currentSenderWitness();
+        if (!ticket
+            || ticket.resourceKey !== buffer.resourceKey
+            || ticket.docId !== buffer.docId
+            || ticket.canonicalEditorUri !== buffer.canonicalEditorUri
+            || ticket.content !== document.getText()
+            || sender?.publicId !== ticket.publicId
+            || sender.generation !== ticket.socketGeneration) {
+            return;
+        }
+        this.pendingReadTickets.delete(buffer.resourceKey);
+        const candidate: BoundProviderReadCandidate = {
+            ticket,
+            bufferId: buffer.bufferId,
+            document,
+            documentVersion: document.version,
+        };
+        this.boundReadCandidates.set(buffer.bufferId, candidate);
+
+        const enable = vscode.l10n.t('Reload Remote and Enable Editing');
+        const message = vscode.l10n.t(
+            'Confirm the current Overleaf text before editing. Restored unsaved buffers must remain unconfirmed.',
+        );
+        void Promise.resolve(vscode.window.showWarningMessage(
+            message,
+            {modal: true},
+            enable,
+        )).then(async choice => {
+            if (choice !== enable) {
+                if (this.boundReadCandidates.get(buffer.bufferId) === candidate) {
+                    this.boundReadCandidates.delete(buffer.bufferId);
+                }
+                return;
+            }
+            if (!await this.confirmBoundReadCandidate(candidate)) {
+                void vscode.window.showErrorMessage(vscode.l10n.t(
+                    'The editor or remote document changed before it could be enabled. Reload it before editing.',
+                ));
+            }
+        }).catch(error => {
+            if (this.boundReadCandidates.get(buffer.bufferId) === candidate) {
+                this.boundReadCandidates.delete(buffer.bufferId);
+            }
+            console.warn('Unable to confirm the clean Overleaf editor base', error);
+        });
+    }
+
+    private async confirmBoundReadCandidate(candidate: BoundProviderReadCandidate): Promise<boolean> {
+        const {document, ticket, bufferId, documentVersion} = candidate;
+        vscode.workspace.textDocuments.forEach(openDocument => {
+            this.observeEditorBuffer(openDocument);
+        });
+        const buffer = this.editorBuffers.get(bufferId);
+        const sender = this.currentSenderWitness();
+        const hasOtherDirtyAlias = [...this.editorBuffers.values()].some(other =>
+            other.bufferId !== bufferId
+            && other.canonicalEditorUri === ticket.canonicalEditorUri
+            && vscode.workspace.textDocuments.includes(other.document)
+            && !other.document.isClosed
+            && other.document.isDirty
+        );
+        if (this.boundReadCandidates.get(bufferId) !== candidate
+            || buffer?.document !== document
+            || buffer.resourceKey !== ticket.resourceKey
+            || buffer.docId !== ticket.docId
+            || buffer.canonicalEditorUri !== ticket.canonicalEditorUri
+            || this.exactOpenDocument(document.uri) !== document
+            || document.isClosed
+            || document.isDirty
+            || document.version !== documentVersion
+            || document.getText() !== ticket.content
+            || sender?.publicId !== ticket.publicId
+            || sender.generation !== ticket.socketGeneration
+            || hasOtherDirtyAlias) {
+            this.boundReadCandidates.delete(bufferId);
+            return false;
+        }
+
+        let authoritative: {doc: DocumentEntity, content: string};
+        try {
+            authoritative = await this.joinFreshDocumentSession(ticket.docId);
+        } catch {
+            this.boundReadCandidates.delete(bufferId);
+            return false;
+        }
+        const senderAfter = this.currentSenderWitness();
+        const identity = this.documentProvenanceIdentity(ticket.docId, buffer);
+        const hasOtherDirtyAliasAfter = [...this.editorBuffers.values()].some(other =>
+            other.bufferId !== bufferId
+            && other.canonicalEditorUri === ticket.canonicalEditorUri
+            && vscode.workspace.textDocuments.includes(other.document)
+            && !other.document.isClosed
+            && other.document.isDirty
+        );
+        if (this.boundReadCandidates.get(bufferId) !== candidate
+            || this.editorBuffers.get(bufferId)?.document !== document
+            || this.exactOpenDocument(document.uri) !== document
+            || document.isClosed
+            || document.isDirty
+            || document.version !== documentVersion
+            || document.getText() !== ticket.content
+            || authoritative.doc.version !== ticket.version
+            || authoritative.content !== ticket.content
+            || !this.documentMatchesAuthority(
+                authoritative.doc,
+                ticket.version,
+                ticket.content,
+            )
+            || senderAfter?.publicId !== ticket.publicId
+            || senderAfter.generation !== ticket.socketGeneration
+            || hasOtherDirtyAliasAfter
+            || !identity) {
+            this.boundReadCandidates.delete(bufferId);
+            return false;
+        }
+
+        this.activeEditorBases.set(bufferId, {
+            identity,
+            bufferId,
+            version: ticket.version,
+            content: ticket.content,
+        });
+        authoritative.doc.localCache = ticket.content;
+        this.boundReadCandidates.delete(bufferId);
+        return true;
+    }
+
+    observeChangedTextDocument(document: vscode.TextDocument) {
+        const bufferId = this.editorBufferIds.get(document);
+        const candidate = bufferId ? this.boundReadCandidates.get(bufferId) : undefined;
+        if (candidate?.document === document) {
+            this.boundReadCandidates.delete(bufferId!);
+        }
+        this.observeTextDocument(document);
+    }
+
+    /** A clean open remains quarantined until an explicit confirmed reload. */
     observeTextDocument(document: vscode.TextDocument) {
         const buffer = this.observeEditorBuffer(document);
         if (!buffer) { return; }
@@ -664,11 +850,14 @@ export class VirtualFileSystem extends vscode.Disposable {
                 && receipt.document === document
                 && receipt.content === document.getText()
                 && receipt.identity.canonicalEditorUri === buffer.canonicalEditorUri) {
+                const existing = this.activeEditorBases.get(buffer.bufferId);
                 this.activeEditorBases.set(buffer.bufferId, {
                     identity: receipt.identity,
                     bufferId: buffer.bufferId,
                     version: receipt.version,
                     content: receipt.content,
+                    recordName: existing?.recordName,
+                    persistence: existing?.persistence,
                 });
                 this.editorSaveReceipts.delete(buffer.bufferId);
             }
@@ -721,6 +910,8 @@ export class VirtualFileSystem extends vscode.Disposable {
         this.editorSaveIntents.delete(bufferId);
         this.unboundEditorSaveIntents.delete(document);
         this.editorSaveReceipts.delete(bufferId);
+        this.boundReadCandidates.delete(bufferId);
+        this.pendingReadTickets.delete(this.resourceKey(document.uri));
         this.editorBufferIds.delete(document);
     }
 
@@ -755,6 +946,8 @@ export class VirtualFileSystem extends vscode.Disposable {
             version: staged.version,
             content: staged.content,
         });
+        this.pendingReadTickets.delete(buffer.resourceKey);
+        this.boundReadCandidates.delete(buffer.bufferId);
         current.localCache = staged.content;
         return true;
     }
@@ -808,13 +1001,80 @@ export class VirtualFileSystem extends vscode.Disposable {
         return {kind: 'valid', witness};
     }
 
-    private bufferMatchesWitness(witness: EditorBufferWitness): boolean {
+    private resolveNewDocumentWritingBuffer(
+        uri: vscode.Uri,
+        desiredContent: string,
+    ): {kind: 'valid', witness: NewDocumentSaveWitness} | {kind: 'blocked', reason: string} {
+        const resourceKey = this.resourceKey(uri);
+        if (this.documentIdsByPath.has(resourceKey)
+            || [...this.editorBuffers.values()].some(buffer => buffer.resourceKey === resourceKey)) {
+            return {
+                kind: 'blocked',
+                reason: 'the missing path was previously bound to a remote document',
+            };
+        }
+        const matches = vscode.workspace.textDocuments.filter(document =>
+            document.uri.toString() === resourceKey
+            && !document.isClosed
+            && document.isDirty
+            && document.getText() === desiredContent
+        );
+        if (matches.length !== 1) {
+            return {
+                kind: 'blocked',
+                reason: matches.length === 0 ?
+                    'no exact dirty editor buffer proves this new document save' :
+                    'multiple dirty buffers refer to the requested new path',
+            };
+        }
+        const document = matches[0];
+        const intent = this.unboundEditorSaveIntents.get(document);
+        if (!intent
+            || intent.resourceKey !== resourceKey
+            || intent.documentVersion !== document.version
+            || intent.content !== desiredContent) {
+            return {
+                kind: 'blocked',
+                reason: 'no exact onWillSave intent proves this new document write',
+            };
+        }
+        let bufferId = this.editorBufferIds.get(document);
+        if (!bufferId) {
+            bufferId = randomUUID();
+            this.editorBufferIds.set(document, bufferId);
+        }
+        return {kind: 'valid', witness: {...intent, bufferId, document}};
+    }
+
+    private newDocumentBufferMatchesWitness(witness: NewDocumentSaveWitness): boolean {
         return this.editorBufferIds.get(witness.document) === witness.bufferId
-            && vscode.workspace.textDocuments.includes(witness.document)
+            && this.exactOpenDocument(witness.document.uri) === witness.document
             && !witness.document.isClosed
+            && witness.document.isDirty
             && witness.document.uri.toString() === witness.resourceKey
             && witness.document.version === witness.documentVersion
             && witness.document.getText() === witness.content;
+    }
+
+    private bufferMatchesWitness(witness: EditorBufferWitness): boolean {
+        return this.bufferMatchesIncarnation(witness)
+            && vscode.workspace.textDocuments.includes(witness.document)
+            && witness.document.version === witness.documentVersion
+            && witness.document.getText() === witness.content;
+    }
+
+    private bufferMatchesIncarnation(
+        buffer: Pick<EditorBufferState, 'bufferId' | 'document' | 'resourceKey' | 'docId' | 'canonicalEditorUri'>,
+    ): boolean {
+        const current = this.editorBuffers.get(buffer.bufferId);
+        return this.editorBufferIds.get(buffer.document) === buffer.bufferId
+            && current?.document === buffer.document
+            && current.resourceKey === buffer.resourceKey
+            && current.docId === buffer.docId
+            && current.canonicalEditorUri === buffer.canonicalEditorUri
+            && vscode.workspace.textDocuments.includes(buffer.document)
+            && !buffer.document.isClosed
+            && buffer.document.uri.toString() === buffer.resourceKey;
     }
 
     private async resolveEditorProvenance(
@@ -896,12 +1156,6 @@ export class VirtualFileSystem extends vscode.Disposable {
         };
     }
 
-    private async clearProvenanceRecords(recordNames: string[]) {
-        for (const recordName of [...new Set(recordNames)]) {
-            await this.provenanceStore.clearRecord(recordName);
-        }
-    }
-
     private documentMatchesAuthority(
         doc: DocumentEntity,
         expectedVersion: number,
@@ -924,40 +1178,47 @@ export class VirtualFileSystem extends vscode.Disposable {
         recordsToClear: string[] = [],
     ) {
         if (!this.documentMatchesAuthority(doc, expectedVersion, authoritativeContent)
-            || !this.bufferMatchesWitness(witness)) {
+            || !this.bufferMatchesWitness(witness)
+            || authoritativeContent !== witness.content) {
             throw new Error('The remote document moved before its editor base could be committed');
         }
-        const identity = authoritativeContent === witness.content ?
-            this.documentProvenanceIdentity(doc._id, witness) : undefined;
-        if (authoritativeContent === witness.content && !identity) {
+        const identity = this.documentProvenanceIdentity(doc._id, witness);
+        if (!identity) {
             throw new Error('The confirmed sender identity changed before accepting the editor base');
         }
+        const record = recordsToClear.length > 0 ?
+            await this.provenanceStore.createOrUpdateCurrent({
+                identity,
+                bufferIncarnationId: witness.bufferId,
+                baseVersion: expectedVersion,
+                baseText: authoritativeContent,
+                dirtyText: authoritativeContent,
+            }) : undefined;
+        const identityAfterWrite = this.documentProvenanceIdentity(doc._id, witness);
+        if (!this.documentMatchesAuthority(doc, expectedVersion, authoritativeContent)
+            || !this.bufferMatchesWitness(witness)
+            || !identityAfterWrite
+            || !this.sameDocumentProvenanceIdentity(identity, identityAfterWrite)) {
+            throw new Error('The editor or sender changed while its confirmed base was persisted');
+        }
 
-        // Commit the already-authoritative snapshot before storage I/O yields.
-        // A later realtime revision does not invalidate this snapshot as a
-        // common ancestor, and must not make us discard the exact recovery
-        // evidence after it has already been cleared.
         doc.localCache = authoritativeContent;
         this.stageEditorBase(witness.document.uri, doc, authoritativeContent);
-        if (identity) {
-            this.activeEditorBases.set(witness.bufferId, {
-                identity,
-                bufferId: witness.bufferId,
-                version: expectedVersion,
-                content: authoritativeContent,
-            });
-            this.editorSaveReceipts.set(witness.bufferId, {
-                document: witness.document,
-                identity,
-                bufferId: witness.bufferId,
-                version: expectedVersion,
-                content: authoritativeContent,
-            });
-        } else {
-            this.activeEditorBases.delete(witness.bufferId);
-            this.editorSaveReceipts.delete(witness.bufferId);
-        }
-        await this.clearProvenanceRecords(recordsToClear);
+        this.activeEditorBases.set(witness.bufferId, {
+            identity,
+            bufferId: witness.bufferId,
+            version: expectedVersion,
+            content: authoritativeContent,
+            recordName: record?.recordName,
+            persistence: record ? Promise.resolve(record) : undefined,
+        });
+        this.editorSaveReceipts.set(witness.bufferId, {
+            document: witness.document,
+            identity,
+            bufferId: witness.bufferId,
+            version: expectedVersion,
+            content: authoritativeContent,
+        });
     }
 
     private exactOpenDocument(uri: vscode.Uri): vscode.TextDocument | undefined {
@@ -982,6 +1243,19 @@ export class VirtualFileSystem extends vscode.Disposable {
                 && current === originalDocument
                 && this.editorBufferIds.get(current) === originalBufferId ?
                 current : undefined;
+        };
+        const originalBuffer = originalBufferId ? this.editorBuffers.get(originalBufferId) : undefined;
+        const originalDocId = originalBuffer && originalBuffer.document === originalDocument ?
+            originalBuffer.docId : undefined;
+        const stillOriginalBuffer = (): EditorBufferState | undefined => {
+            const document = stillOriginalDocument();
+            const buffer = originalBufferId ? this.editorBuffers.get(originalBufferId) : undefined;
+            return document
+                && originalDocId
+                && buffer?.document === document
+                && buffer.docId === originalDocId
+                && buffer.resourceKey === key ?
+                buffer : undefined;
         };
         const saveCopy = vscode.l10n.t('Save Recovery Copy...');
         const reloadRemote = vscode.l10n.t('Reload Remote');
@@ -1027,21 +1301,43 @@ export class VirtualFileSystem extends vscode.Disposable {
                     );
                     return;
                 }
+                const buffer = stillOriginalBuffer();
+                const sender = this.currentSenderWitness();
+                if (!buffer || !sender) {
+                    void vscode.window.showErrorMessage(
+                        vscode.l10n.t('The blocked editor has no current remote identity; no editor was reloaded.'),
+                    );
+                    return;
+                }
                 const blockedVersion = document.version;
                 const blockedText = document.getText();
                 const editor = await vscode.window.showTextDocument(document, {preserveFocus: false});
-                const authoritativeText = new TextDecoder().decode(await this.openFile(uri));
+                const authoritative = await this.joinFreshDocumentSession(buffer.docId);
+                const authoritativeVersion = authoritative.doc.version;
+                const authoritativeText = authoritative.content;
+                const senderAfterJoin = this.currentSenderWitness();
                 const editTarget = stillOriginalDocument();
+                const bufferAfterJoin = stillOriginalBuffer();
                 if (!editTarget
                     || editTarget !== document
                     || editor.document !== document
+                    || bufferAfterJoin?.docId !== buffer.docId
                     || document.version !== blockedVersion
-                    || document.getText() !== blockedText) {
+                    || document.getText() !== blockedText
+                    || authoritativeVersion === undefined
+                    || senderAfterJoin?.publicId !== sender.publicId
+                    || senderAfterJoin.generation !== sender.generation
+                    || !this.documentMatchesAuthority(
+                        authoritative.doc,
+                        authoritativeVersion,
+                        authoritativeText,
+                    )) {
                     void vscode.window.showErrorMessage(
                         vscode.l10n.t('The blocked editor changed before reload; no text was replaced.'),
                     );
                     return;
                 }
+                this.stageEditorBase(uri, authoritative.doc, authoritativeText);
                 const replaced = await editor.edit(edit => {
                     edit.replace(
                         new vscode.Range(
@@ -1056,6 +1352,20 @@ export class VirtualFileSystem extends vscode.Disposable {
                     || document.getText() !== authoritativeText) {
                     void vscode.window.showErrorMessage(
                         vscode.l10n.t('The blocked editor could not be replaced safely; it was not saved.'),
+                    );
+                    return;
+                }
+                const senderBeforeSave = this.currentSenderWitness();
+                if (stillOriginalBuffer()?.docId !== buffer.docId
+                    || senderBeforeSave?.publicId !== sender.publicId
+                    || senderBeforeSave.generation !== sender.generation
+                    || !this.documentMatchesAuthority(
+                        authoritative.doc,
+                        authoritativeVersion,
+                        authoritativeText,
+                    )) {
+                    void vscode.window.showErrorMessage(
+                        vscode.l10n.t('The remote document changed during reload; the replacement remains unsaved.'),
                     );
                     return;
                 }
@@ -1087,6 +1397,8 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     private invalidateDocumentSessions(project?: ProjectEntity) {
+        this.pendingReadTickets.clear();
+        this.boundReadCandidates.clear();
         this.documentMap(project).forEach((doc) => {
             doc.version = undefined;
             doc.remoteCache = undefined;
@@ -1096,6 +1408,12 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     private invalidateDocumentSession(docId: string, error: Error) {
+        for (const [resourceKey, ticket] of this.pendingReadTickets) {
+            if (ticket.docId === docId) { this.pendingReadTickets.delete(resourceKey); }
+        }
+        for (const [bufferId, candidate] of this.boundReadCandidates) {
+            if (candidate.ticket.docId === docId) { this.boundReadCandidates.delete(bufferId); }
+        }
         const documents = new Set<DocumentEntity>();
         [this.root, this.joiningProject, this.previousRoot].forEach(project => {
             const doc = this.documentMap(project).get(docId);
@@ -1205,7 +1523,7 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     private waitForDocumentVersion(docId: string, expectedVersion: number, timeoutMs = 15000) {
         let waiter!: DocumentVersionWaiter;
-        const promise = new Promise<void>((resolve, reject) => {
+        const promise = new Promise<number>((resolve, reject) => {
             waiter = {
                 expectedVersion,
                 resolve,
@@ -1243,7 +1561,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         waiters?.forEach((waiter) => {
             if (version >= waiter.expectedVersion) {
                 this.removeDocumentVersionWaiter(docId, waiter);
-                waiter.resolve();
+                waiter.resolve(version);
             }
         });
     }
@@ -1302,6 +1620,123 @@ export class VirtualFileSystem extends vscode.Disposable {
             return [];
         })();
         return {parentFolder, fileName, fileEntity, fileType, fileId};
+    }
+
+    private resolveUriInProject(project: ProjectEntity, uri: vscode.Uri) {
+        const {pathParts} = parseUri(uri);
+        let parentFolder = project.rootFolder[0];
+        if (!parentFolder) {
+            throw vscode.FileSystemError.FileNotFound(uri);
+        }
+        for (const folderName of pathParts.slice(0, -1)) {
+            const child = parentFolder.folders.find(folder => folder.name === folderName);
+            if (!child) {
+                throw vscode.FileSystemError.FileNotFound(uri);
+            }
+            parentFolder = child;
+        }
+        const fileName = pathParts.at(-1) ?? '';
+        for (const candidateType of Object.keys(FolderKeys)) {
+            const fileEntity = parentFolder[FolderKeys[candidateType]]?.find(
+                entity => entity.name === fileName,
+            );
+            if (fileEntity) {
+                return {
+                    parentFolder,
+                    fileName,
+                    fileEntity,
+                    fileType: candidateType as FileType,
+                };
+            }
+        }
+        return {parentFolder, fileName, fileEntity: undefined, fileType: undefined};
+    }
+
+    private async verifyFreshMissingPath(
+        uri: vscode.Uri,
+        expectedParentFolderId: string,
+        expectedFileName: string,
+        identity?: Identity,
+    ): Promise<void> {
+        const sender = this.currentSenderWitness();
+        if (!sender) {
+            throw new Error('No accepted realtime identity can verify the new path');
+        }
+        const {pathParts} = parseUri(uri);
+        const rootFolderId = this.root?.rootFolder[0]?._id;
+        if (pathParts.length !== 1
+            || pathParts[0] !== expectedFileName
+            || rootFolderId !== expectedParentFolderId) {
+            throw new Error('Safe new-document creation is limited to the verified project root');
+        }
+        const response = await this.api.projectEntitiesJson(
+            identity ?? await GlobalStateManager.authenticate(this.context, this.serverName),
+            this.projectId,
+        );
+        const senderAfter = this.currentSenderWitness();
+        if (senderAfter?.publicId !== sender.publicId
+            || senderAfter.generation !== sender.generation
+            || this.protocolVersion !== SUPPORTED_WRITE_PROTOCOL_VERSION) {
+            throw new Error('The project or sender identity changed while verifying the new path');
+        }
+        if (response.type !== 'success'
+            || !Array.isArray(response.entities)
+            || response.entities.some(entity =>
+                typeof entity?.path !== 'string'
+                || (entity.type !== 'doc' && entity.type !== 'file')
+            )) {
+            throw new Error('The server returned no trustworthy project-entity snapshot');
+        }
+        const project = this.root;
+        if (!project) {
+            throw new Error('The current project tree is unavailable while verifying the new path');
+        }
+        const resolved = this.resolveUriInProject(project, uri);
+        if (resolved.parentFolder._id !== expectedParentFolderId
+            || resolved.fileName !== expectedFileName) {
+            throw new Error('The remote parent folder changed while verifying the new path');
+        }
+        const expectedPath = `/${pathParts.join('/')}`;
+        if (resolved.fileEntity
+            || resolved.fileType
+            || response.entities.some(entity => entity.path === expectedPath)) {
+            throw vscode.FileSystemError.FileExists(uri);
+        }
+    }
+
+    private async verifyFreshCreatedDocumentPath(
+        uri: vscode.Uri,
+        expectedFileName: string,
+        identity: Identity,
+    ): Promise<void> {
+        const sender = this.currentSenderWitness();
+        if (!sender) {
+            throw new Error('No accepted realtime identity can verify the created document');
+        }
+        const {pathParts} = parseUri(uri);
+        if (pathParts.length !== 1 || pathParts[0] !== expectedFileName) {
+            throw new Error('The created document no longer has the verified root path');
+        }
+        const response = await this.api.projectEntitiesJson(identity, this.projectId);
+        const senderAfter = this.currentSenderWitness();
+        if (senderAfter?.publicId !== sender.publicId
+            || senderAfter.generation !== sender.generation
+            || this.protocolVersion !== SUPPORTED_WRITE_PROTOCOL_VERSION) {
+            throw new Error('The project or sender identity changed while verifying the created document');
+        }
+        if (response.type !== 'success'
+            || !Array.isArray(response.entities)
+            || response.entities.some(entity =>
+                typeof entity?.path !== 'string'
+                || (entity.type !== 'doc' && entity.type !== 'file')
+            )) {
+            throw new Error('The server returned no trustworthy project-entity snapshot');
+        }
+        const expectedPath = `/${pathParts.join('/')}`;
+        const matches = response.entities.filter(entity => entity.path === expectedPath);
+        if (matches.length !== 1 || matches[0].type !== 'doc') {
+            throw new Error('The server did not retain exactly one text document at the created path');
+        }
     }
 
     _resolveById(entityId: string, root?: FolderEntity, path?:string):{
@@ -1531,7 +1966,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             const sender = this.currentSenderWitness();
             const matchingPending = [...this.pendingDocumentUpdates.values()].filter(pending =>
                 pending.docId === update.doc
-                && pending.update.v === update.v
+                && update.v >= pending.update.v
                 && pending.socketGeneration === sender?.generation
                 && pending.submittedPublicIds.includes(sender?.publicId ?? '')
             );
@@ -1768,12 +2203,12 @@ export class VirtualFileSystem extends vscode.Disposable {
             const doc = fileEntity as DocumentEntity;
             if (doc.remoteCache!==undefined) {
                 const content = doc.remoteCache;
-                this.stageEditorBase(uri, doc, content);
+                this.stageProviderRead(uri, doc, content);
                 EventBus.fire('fileWillOpenEvent', {uri});
                 return new TextEncoder().encode(content);
             } else {
                 const {doc: joinedDoc, content} = await this.ensureDocumentSession(doc._id);
-                this.stageEditorBase(uri, joinedDoc, content);
+                this.stageProviderRead(uri, joinedDoc, content);
                 EventBus.fire('fileWillOpenEvent', {uri});
                 return new TextEncoder().encode(content);
             }
@@ -1876,6 +2311,177 @@ export class VirtualFileSystem extends vscode.Disposable {
             {type: vscode.FileChangeType.Created, uri: uri},
         ]);
         this.markSourceDirty();
+    }
+
+    private async createVerifiedNewDocument(
+        uri: vscode.Uri,
+        content: Uint8Array,
+        witness: NewDocumentSaveWitness,
+        parentFolderId: string,
+        fileName: string,
+    ): Promise<void> {
+        let hostedOverleaf = false;
+        try {
+            const server = new URL(this.serverUrl);
+            hostedOverleaf = server.href === 'https://www.overleaf.com/';
+        } catch {
+            hostedOverleaf = false;
+        }
+        if (!hostedOverleaf) {
+            this.blockDocumentWrite(
+                uri,
+                content,
+                'this server has no verified atomic new-document contract',
+            );
+        }
+        const rootFolderId = this.root?.rootFolder[0]?._id;
+        if (parseUri(uri).pathParts.length !== 1 || parentFolderId !== rootFolderId) {
+            this.blockDocumentWrite(
+                uri,
+                content,
+                'safe new-document creation is limited to the verified project root',
+            );
+        }
+        const create = vscode.l10n.t('Create New Remote Document');
+        const choice = await vscode.window.showWarningMessage(
+            vscode.l10n.t(
+                'Create {name} as a new Overleaf document? Do not continue for a restored tab whose remote file was deleted or renamed.',
+                {name: fileName},
+            ),
+            {modal: true},
+            create,
+        );
+        if (choice !== create || !this.newDocumentBufferMatchesWitness(witness)) {
+            this.blockDocumentWrite(
+                uri,
+                content,
+                'new remote document creation was not explicitly confirmed for this editor',
+            );
+        }
+
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        await this.verifyFreshMissingPath(uri, parentFolderId, fileName, identity);
+        if (!this.newDocumentBufferMatchesWitness(witness)) {
+            this.blockDocumentWrite(
+                uri,
+                content,
+                'the new-document buffer changed during remote path verification',
+            );
+        }
+        if (!this.newDocumentBufferMatchesWitness(witness)
+            || this.documentIdsByPath.has(witness.resourceKey)) {
+            this.blockDocumentWrite(
+                uri,
+                content,
+                'the new-document identity changed immediately before creation',
+            );
+        }
+
+        // Official hosted Overleaf serializes addDoc under the project-structure
+        // lock and rejects an exact same-name doc, file, or folder before insert.
+        // uploadFile is an upsert and must never be used for this safety path.
+        // No await is permitted between the final buffer/identity check above
+        // and invoking this atomic no-overwrite side effect.
+        const response = await this.api.addDoc(
+            identity,
+            this.projectId,
+            parentFolderId,
+            fileName,
+        );
+        if (response.type !== 'success') {
+            throw this.mutationError(`Unable to create ${fileName}`, response.message);
+        }
+        if (!this.isCreatedEntity(response.entity, ['doc'])
+            || response.entity.name !== fileName) {
+            throw this.mutationError(`Unable to create ${fileName}`, 'The server returned no document');
+        }
+
+        const liveParent = await this.currentFolder(parentFolderId, `Unable to create ${fileName}`);
+        const alreadyCached = Boolean(this.resolveCachedEntity(response.entity._id));
+        this.insertEntity(liveParent, response.entity._type, response.entity);
+        if (!alreadyCached) {
+            this.notify([{type: vscode.FileChangeType.Created, uri}]);
+        }
+        this.markSourceDirty();
+
+        const created = await this._resolveUri(uri);
+        const cachedCreated = this.resolveCachedEntity(response.entity._id);
+        if (created.fileType !== 'doc'
+            || !created.fileEntity
+            || created.fileEntity._id !== response.entity._id
+            || cachedCreated?.fileType !== 'doc'
+            || cachedCreated.path !== `/${fileName}`) {
+            this.blockDocumentWrite(
+                uri,
+                content,
+                'the server did not create an editable text document',
+            );
+        }
+        const authoritative = await this.joinFreshDocumentSession(created.fileEntity._id);
+        const authoritativeVersion = authoritative.doc.version;
+        if (authoritativeVersion === undefined || authoritative.content !== '') {
+            this.blockDocumentWrite(
+                uri,
+                content,
+                'the atomic new document did not expose its exact empty base',
+            );
+        }
+        await this.verifyFreshCreatedDocumentPath(uri, fileName, identity);
+        const buffer = this.observeEditorBuffer(witness.document);
+        if (!buffer
+            || buffer.bufferId !== witness.bufferId
+            || !this.newDocumentBufferMatchesWitness(witness)) {
+            this.blockDocumentWrite(
+                uri,
+                content,
+                'the created document no longer belongs to the saving editor',
+            );
+        }
+        const editorWitness: EditorBufferWitness = {
+            ...buffer,
+            documentVersion: witness.documentVersion,
+            content: witness.content,
+        };
+        const identityAfterVerification = this.documentProvenanceIdentity(
+            authoritative.doc._id,
+            editorWitness,
+        );
+        const current = this.currentDocument(authoritative.doc._id);
+        if (!this.bufferMatchesWitness(editorWitness)
+            || !identityAfterVerification
+            || current !== authoritative.doc
+            || current.version === undefined
+            || current.version < authoritativeVersion
+            || (current.version === authoritativeVersion && current.remoteCache !== '')) {
+            this.blockDocumentWrite(
+                uri,
+                content,
+                'the created document base, editor, or sender changed before authorization',
+            );
+        }
+        if (witness.content === '') {
+            await this.acceptEditorBase(
+                editorWitness,
+                authoritative.doc,
+                authoritativeVersion,
+                '',
+            );
+            this.editorSaveIntents.delete(buffer.bufferId);
+            this.unboundEditorSaveIntents.delete(witness.document);
+            return;
+        }
+
+        // The empty document at authoritativeVersion is an actual server
+        // revision and remains a valid causal base if later OT arrives. Do not
+        // issue a clean receipt until the initial bytes are revision-bound and
+        // confirmed through the ordinary document-update path.
+        this.activeEditorBases.set(buffer.bufferId, {
+            identity: identityAfterVerification,
+            bufferId: buffer.bufferId,
+            version: authoritativeVersion,
+            content: '',
+        });
+        await this.writeFileNow(uri, content, false, true);
     }
 
     async refreshLinkedFile(uri: vscode.Uri) {
@@ -2091,11 +2697,17 @@ export class VirtualFileSystem extends vscode.Disposable {
     async writeFile(uri: vscode.Uri, content:Uint8Array, create:boolean, overwrite:boolean) {
         await this.assertProjectWritable('Unable to write file');
         const resolved = await this._resolveUri(uri);
-        const key = resolved.fileType === 'doc' && resolved.fileEntity ?
-            `doc:${resolved.fileEntity._id}` :
-            `path:${this.projectId}:${parseUri(uri).pathParts.join('/')}`;
-        const previous = this.documentWrites.get(key) ?? Promise.resolve();
-        const operation = previous.catch(() => {}).then(
+        const keys = [
+            `path:${this.projectId}:${parseUri(uri).pathParts.join('/')}`,
+            ...(resolved.fileType === 'doc' && resolved.fileEntity ?
+                [`doc:${resolved.fileEntity._id}`] : []),
+        ];
+        const previous = [...new Set(
+            keys.map(key => this.documentWrites.get(key)).filter(
+                (value): value is Promise<void> => value !== undefined,
+            ),
+        )];
+        const operation = Promise.all(previous.map(value => value.catch(() => {}))).then(
             () => this.writeFileNow(uri, content, create, overwrite),
         ).catch((error) => {
             if (error instanceof SocketRequestError && error.outcomeUnknown) {
@@ -2103,13 +2715,15 @@ export class VirtualFileSystem extends vscode.Disposable {
             }
             throw error;
         });
-        this.documentWrites.set(key, operation);
+        keys.forEach(key => this.documentWrites.set(key, operation));
         try {
             await operation;
         } finally {
-            if (this.documentWrites.get(key) === operation) {
-                this.documentWrites.delete(key);
-            }
+            keys.forEach(key => {
+                if (this.documentWrites.get(key) === operation) {
+                    this.documentWrites.delete(key);
+                }
+            });
         }
     }
 
@@ -2155,6 +2769,151 @@ export class VirtualFileSystem extends vscode.Disposable {
             && JSON.stringify(record.pendingWrite) === JSON.stringify(this.pendingWritePayload(pending));
     }
 
+    private async reconcileConfirmedPending(
+        pending: PendingDocumentUpdate,
+        authoritative: {doc: DocumentEntity, content: string},
+        submissionWitness: EditorBufferWitness,
+    ): Promise<{
+        submissionWitnessStillMatches: boolean,
+        currentMatchesAuthoritative: boolean,
+    }> {
+        const authoritativeVersion = authoritative.doc.version;
+        if (authoritativeVersion === undefined) {
+            throw new Error('The confirmed write has no authoritative revision');
+        }
+        if (pending.confirmationVersion === undefined) {
+            throw new Error('The confirmed write has no observed sender-confirmation revision');
+        }
+        if (authoritativeVersion < pending.confirmationVersion + 1) {
+            throw new Error('The authoritative revision is behind the observed sender confirmation');
+        }
+        if (!desiredChangesArePresent(
+            pending.baseContent,
+            authoritative.content,
+            pending.desiredContent,
+        )) {
+            throw new Error('The confirmed write is absent from the authoritative snapshot');
+        }
+        if (this.pendingDocumentUpdates.get(pending.bufferId) !== pending) {
+            throw new Error('The in-memory pending intent changed before reconciliation');
+        }
+        const live = this.editorBuffers.get(pending.bufferId);
+        const sameBufferIncarnation = Boolean(live && this.bufferMatchesIncarnation(live));
+        const liveText = sameBufferIncarnation ? live!.document.getText() : authoritative.content;
+        let baseVersion = pending.baseVersion;
+        let baseContent = pending.baseContent;
+        if (!sameBufferIncarnation || liveText === authoritative.content) {
+            baseVersion = authoritativeVersion;
+            baseContent = authoritative.content;
+        } else if (pending.mergedContent === pending.desiredContent
+            && authoritativeVersion === pending.update.v + 1
+            && authoritative.content === pending.desiredContent) {
+            // With no intervening transform, the submitted desired text is an
+            // actual server revision and is a valid ancestor of later typing.
+            baseVersion = authoritativeVersion;
+            baseContent = authoritative.content;
+        }
+
+        const identitySource = live ?? submissionWitness;
+        const identity = this.documentProvenanceIdentity(pending.docId, identitySource);
+        if (!identity) {
+            throw new Error('The sender identity changed before confirmed-state reconciliation');
+        }
+        const reconciled = await this.provenanceStore.reconcilePendingWrite(
+            pending.provenanceRecordName,
+            this.pendingWritePayload(pending),
+            {
+                identity,
+                bufferIncarnationId: pending.bufferId,
+                baseVersion,
+                baseText: baseContent,
+                dirtyText: liveText,
+            },
+        );
+
+        // The server outcome is now represented durably without pendingWrite.
+        // Never retain an in-memory retry intent after this durability point.
+        if (this.pendingDocumentUpdates.get(pending.bufferId) === pending) {
+            this.pendingDocumentUpdates.delete(pending.bufferId);
+        }
+
+        if (sameBufferIncarnation) {
+            const active: EditorDocumentBase = {
+                identity,
+                bufferId: pending.bufferId,
+                version: baseVersion,
+                content: baseContent,
+                recordName: reconciled.recordName,
+                persistence: Promise.resolve(reconciled),
+            };
+            this.activeEditorBases.set(pending.bufferId, active);
+
+            // Close the small window in which the editor could advance while
+            // the atomic reconciliation write was in flight.
+            const latestLive = this.editorBuffers.get(pending.bufferId);
+            if (latestLive && this.bufferMatchesIncarnation(latestLive)) {
+                const latestText = latestLive.document.getText();
+                if (latestText !== liveText) {
+                    const latestRecord = await this.provenanceStore.createOrUpdateCurrent({
+                        identity,
+                        bufferIncarnationId: pending.bufferId,
+                        baseVersion,
+                        baseText: baseContent,
+                        dirtyText: latestText,
+                    });
+                    active.recordName = latestRecord.recordName;
+                    active.persistence = Promise.resolve(latestRecord);
+                }
+                if (latestLive.document.getText() === authoritative.content
+                    && this.documentMatchesAuthority(
+                        authoritative.doc,
+                        authoritativeVersion,
+                        authoritative.content,
+                    )) {
+                    this.editorSaveReceipts.set(pending.bufferId, {
+                        document: latestLive.document,
+                        identity,
+                        bufferId: pending.bufferId,
+                        version: authoritativeVersion,
+                        content: authoritative.content,
+                    });
+                } else {
+                    this.editorSaveReceipts.delete(pending.bufferId);
+                }
+            }
+        } else {
+            this.activeEditorBases.delete(pending.bufferId);
+            this.editorSaveReceipts.delete(pending.bufferId);
+        }
+
+        if (this.documentMatchesAuthority(
+            authoritative.doc,
+            authoritativeVersion,
+            authoritative.content,
+        )) {
+            this.stageEditorBase(submissionWitness.document.uri, authoritative.doc, authoritative.content);
+            const currentEditor = this.editorBuffers.get(pending.bufferId)?.document;
+            if (currentEditor && currentEditor.getText() === authoritative.content) {
+                authoritative.doc.localCache = authoritative.content;
+            }
+        }
+
+        const current = this.editorBuffers.get(pending.bufferId);
+        return {
+            submissionWitnessStillMatches: this.bufferMatchesWitness(submissionWitness),
+            currentMatchesAuthoritative: Boolean(
+                current
+                && this.bufferMatchesIncarnation(current)
+                && current.document.getText() === authoritative.content
+                && this.documentMatchesAuthority(
+                    authoritative.doc,
+                    authoritativeVersion,
+                    authoritative.content,
+                )
+            ),
+        };
+    }
+
     /**
      * Retry an outcome-unknown write only inside the same extension-host
      * session, from its exact durable intent, and under a fresh socket public
@@ -2172,8 +2931,15 @@ export class VirtualFileSystem extends vscode.Disposable {
         const pending = this.pendingDocumentUpdates.get(witness.bufferId);
         if (!pending) { return false; }
         if (pending.docId !== docId
-            || pending.bufferId !== witness.bufferId
-            || pending.desiredContent !== desiredContent) {
+            || pending.bufferId !== witness.bufferId) {
+            this.blockDocumentWrite(
+                uri,
+                content,
+                'an outcome-unknown write belongs to a different remote document',
+            );
+        }
+        if (pending.confirmationVersion === undefined
+            && pending.desiredContent !== desiredContent) {
             this.blockDocumentWrite(
                 uri,
                 content,
@@ -2208,6 +2974,29 @@ export class VirtualFileSystem extends vscode.Disposable {
                 content,
                 'the durable pending-write record no longer matches the exact submitted operation',
             );
+        }
+
+        if (pending.confirmationVersion !== undefined) {
+            let authoritative: {doc: DocumentEntity, content: string};
+            try {
+                authoritative = await this.joinFreshDocumentSession(docId);
+                const state = await this.reconcileConfirmedPending(
+                    pending,
+                    authoritative,
+                    witness,
+                );
+                // If the exact bytes being saved are already authoritative,
+                // this retry is a zero-wire completion. Otherwise continue
+                // through the ordinary exact-base authorization for new input.
+                return state.currentMatchesAuthoritative;
+            } catch (error) {
+                this.showDocumentRecovery(
+                    uri,
+                    content,
+                    `the confirmed server outcome could not be reconciled durably: ${String(error)}`,
+                );
+                throw error;
+            }
         }
 
         await this.ensureDocumentSession(docId);
@@ -2256,13 +3045,14 @@ export class VirtualFileSystem extends vscode.Disposable {
 
         const versionWaiter = this.waitForDocumentVersion(docId, pending.update.v);
         try {
-            await Promise.all([
+            const [, confirmationVersion] = await Promise.all([
                 this.socket.applyOtUpdate(docId, retryUpdate, {
                     publicId: retryPublicId,
                     generation: retryGeneration,
                 }),
                 versionWaiter.promise,
             ]);
+            retryPending.confirmationVersion = confirmationVersion;
         } catch (error) {
             versionWaiter.cancel();
             const outcomeUnknown = !(error instanceof SocketRequestError) || error.outcomeUnknown;
@@ -2315,13 +3105,6 @@ export class VirtualFileSystem extends vscode.Disposable {
             authoritative.content,
             pending.desiredContent,
         )) {
-            await this.provenanceStore.markPendingWrite(
-                retryPending.provenanceRecordName,
-                this.pendingWritePayload(retryPending, 'acknowledged-remote-diverged', {
-                    authoritativeVersion: authoritative.doc.version ?? -1,
-                }),
-            );
-            this.pendingDocumentUpdates.delete(witness.bufferId);
             this.blockDocumentWrite(
                 uri,
                 content,
@@ -2336,36 +3119,53 @@ export class VirtualFileSystem extends vscode.Disposable {
                 'the confirmed retry returned without an authoritative revision',
             );
         }
-        await this.acceptEditorBase(
+        const reconciled = await this.reconcileConfirmedPending(
+            retryPending,
+            authoritative,
             witness,
-            authoritative.doc,
-            authoritativeVersion,
-            authoritative.content,
-            retryPending.provenanceRecordsToClear,
         );
-        this.pendingDocumentUpdates.delete(witness.bufferId);
         setTimeout(() => {
             this.notify([{type: vscode.FileChangeType.Changed, uri}]);
         }, 10);
         authoritative.doc.lastVersion = pending.update.v;
-        return true;
-    }
-
-    private async writeFileNow(uri: vscode.Uri, content:Uint8Array, create:boolean, overwrite:boolean) {
-        const {fileType, fileEntity} = await this._resolveUri(uri);
-
-        // if non-exists --> create it
-        if (!fileType && create) {
+        if (reconciled.submissionWitnessStillMatches
+            && !reconciled.currentMatchesAuthoritative) {
             this.blockDocumentWrite(
                 uri,
                 content,
-                'the remote path is missing and an editor save cannot be distinguished from a stale deleted or renamed document',
+                'the remote save was confirmed with collaborator text absent from this editor',
+            );
+        }
+        return true;
+    }
+
+    private async writeFileNow(uri: vscode.Uri, content:Uint8Array, create:boolean, _overwrite:boolean) {
+        const {parentFolder, fileName, fileType, fileEntity} = await this._resolveUri(uri);
+
+        // if non-exists --> create it
+        if (!fileType && create) {
+            const desiredContent = new TextDecoder().decode(content);
+            const resolution = this.resolveNewDocumentWritingBuffer(uri, desiredContent);
+            if (resolution.kind === 'blocked') {
+                this.blockDocumentWrite(uri, content, resolution.reason);
+            }
+            return this.createVerifiedNewDocument(
+                uri,
+                content,
+                resolution.witness,
+                parentFolder._id,
+                fileName,
             );
         }
 
-        // if exists but not doc --> create new
-        if (fileType && fileType!=='doc' && create) {
-            return this.createFile(uri, content, overwrite);
+        // A text-editor save must never reach uploadFile. The upload endpoint is
+        // an upsert, so re-resolving a non-doc path through createFile would
+        // reopen a remote delete/create race and could replace a collaborator's
+        // entity.
+        if (fileType && fileType!=='doc') {
+            throw vscode.FileSystemError.Unavailable(
+                vscode.l10n.t('Only Overleaf text documents can be written without replacement.'),
+            );
         }
 
         // if exists and is doc --> update
@@ -2423,6 +3223,13 @@ export class VirtualFileSystem extends vscode.Disposable {
             );
 
             if (authorization.status === 'noop') {
+                if (witness.content !== remoteContent) {
+                    this.blockDocumentWrite(
+                        uri,
+                        content,
+                        'the remote document contains confirmed text absent from this editor',
+                    );
+                }
                 try {
                     await this.acceptEditorBase(
                         witness,
@@ -2484,7 +3291,6 @@ export class VirtualFileSystem extends vscode.Disposable {
                 docId: doc._id,
                 bufferId: witness.bufferId,
                 provenanceRecordName: provenance.value.record.recordName,
-                provenanceRecordsToClear: provenance.value.recordsToClear,
                 update,
                 desiredContent: _content,
                 mergedContent: mergeRes,
@@ -2534,10 +3340,11 @@ export class VirtualFileSystem extends vscode.Disposable {
             const sentVersion = sessionVersion;
             const versionWaiter = this.waitForDocumentVersion(doc._id, sentVersion);
             try {
-                await Promise.all([
+                const [, confirmationVersion] = await Promise.all([
                     this.socket.applyOtUpdate(doc._id, update, sender),
                     versionWaiter.promise,
                 ]);
+                pending.confirmationVersion = confirmationVersion;
             } catch (error) {
                 versionWaiter.cancel();
                 const outcomeUnknown = !(error instanceof SocketRequestError) || error.outcomeUnknown;
@@ -2592,13 +3399,6 @@ export class VirtualFileSystem extends vscode.Disposable {
                 authoritative.content,
                 pending.desiredContent,
             )) {
-                await this.provenanceStore.markPendingWrite(
-                    pending.provenanceRecordName,
-                    this.pendingWritePayload(pending, 'acknowledged-remote-diverged', {
-                        authoritativeVersion: authoritative.doc.version ?? -1,
-                    }),
-                );
-                this.pendingDocumentUpdates.delete(witness.bufferId);
                 this.blockDocumentWrite(
                     uri,
                     content,
@@ -2607,37 +3407,44 @@ export class VirtualFileSystem extends vscode.Disposable {
             }
             const authoritativeVersion = authoritative.doc.version;
             if (authoritativeVersion === undefined) {
-                this.pendingDocumentUpdates.delete(witness.bufferId);
                 this.blockDocumentWrite(
                     uri,
                     content,
                     'the acknowledged write returned without an authoritative revision',
                 );
             }
+            let reconciled: {
+                submissionWitnessStillMatches: boolean,
+                currentMatchesAuthoritative: boolean,
+            };
             try {
-                await this.acceptEditorBase(
+                reconciled = await this.reconcileConfirmedPending(
+                    pending,
+                    authoritative,
                     witness,
-                    authoritative.doc,
-                    authoritativeVersion,
-                    authoritative.content,
-                    pending.provenanceRecordsToClear,
                 );
             } catch (error) {
-                this.pendingDocumentUpdates.delete(witness.bufferId);
                 this.showDocumentRecovery(
                     uri,
                     content,
-                    `the acknowledged write could not clear its recovery record: ${String(error)}`,
+                    `the acknowledged write could not persist its confirmed state: ${String(error)}`,
                 );
                 throw error;
             }
-            this.pendingDocumentUpdates.delete(witness.bufferId);
             setTimeout(() => {
                 this.notify([
                     {type: vscode.FileChangeType.Changed, uri: uri}
                 ]);
             }, 10);
             authoritative.doc.lastVersion = sentVersion;
+            if (reconciled.submissionWitnessStillMatches
+                && !reconciled.currentMatchesAuthoritative) {
+                this.blockDocumentWrite(
+                    uri,
+                    content,
+                    'the remote save was confirmed with collaborator text absent from this editor',
+                );
+            }
             return;
         }
         if (!fileType) {
@@ -3380,6 +4187,18 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider, vsco
         vfs?.observeTextDocument(document);
     }
 
+    private observeOpenedTextDocument(document: vscode.TextDocument) {
+        if (document.uri.scheme !== ROOT_NAME) { return; }
+        const vfs = this.vfss[this.vfsKey(document.uri)];
+        vfs?.observeOpenedTextDocument(document);
+    }
+
+    private observeChangedTextDocument(document: vscode.TextDocument) {
+        if (document.uri.scheme !== ROOT_NAME) { return; }
+        const vfs = this.vfss[this.vfsKey(document.uri)];
+        vfs?.observeChangedTextDocument(document);
+    }
+
     private forgetTextDocument(document: vscode.TextDocument) {
         if (document.uri.scheme !== ROOT_NAME) { return; }
         const vfs = this.vfss[this.vfsKey(document.uri)];
@@ -3461,10 +4280,10 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider, vsco
                 return this.prefetch(uri);
             }),
             vscode.workspace.onDidOpenTextDocument(document => {
-                this.observeTextDocument(document);
+                this.observeOpenedTextDocument(document);
             }),
             vscode.workspace.onDidChangeTextDocument(event => {
-                this.observeTextDocument(event.document);
+                this.observeChangedTextDocument(event.document);
             }),
             vscode.workspace.onWillSaveTextDocument(event => {
                 if (event.document.uri.scheme !== ROOT_NAME) { return; }

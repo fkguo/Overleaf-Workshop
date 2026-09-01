@@ -81,6 +81,7 @@ export type RealtimeFatalErrorCode =
     | 'force_disconnect'
     | 'protocol_changed'
     | 'project_unavailable'
+    | 'sender_changed'
     | 'unsupported_history_ot';
 
 export class RealtimeFatalError extends Error {
@@ -133,6 +134,12 @@ type ProjectJoinResponse = {
     protocolVersion?: number,
 };
 
+type ProjectJoinResponseWitness = {
+    projectId?: string,
+    publicId?: string,
+    protocolVersion?: number,
+};
+
 function deferred<T>(): Deferred<T> {
     let resolve!: (value: T) => void;
     let reject!: (reason?: unknown) => void;
@@ -168,7 +175,10 @@ export class SocketIOAPI {
     private transportConnectedSignal = deferred<number>();
     private connectionAcceptedSignal = deferred<{generation: number, publicId: string}>();
     private connectionAcceptedGeneration?: number;
-    private v2ProjectResponse?: Deferred<ProjectJoinResponse> & {generation: number};
+    private v2ProjectResponse?: Deferred<ProjectJoinResponse> & {
+        generation: number,
+        witness?: ProjectJoinResponseWitness,
+    };
     private documentMembershipQueue: Promise<void> = Promise.resolve();
     private legacyV1Rejected = false;
     private legacyProbeAttempted = false;
@@ -590,17 +600,32 @@ export class SocketIOAPI {
         return queued;
     }
 
-    private acceptPublicId(socket: any, publicId: unknown) {
+    private acceptPublicId(socket: any, publicId: unknown): boolean {
         if (
             socket !== this.socket ||
             socket === this.retiredSocket ||
             !this.transportConnected
-        ) { return; }
+        ) { return false; }
         const normalizedPublicId = String(publicId ?? '');
         const activeScheme = this._socketInitScheme ?? this.scheme;
         // The HTTP-backed Invisible Mode has no realtime public id, but its
         // synthetic transport still needs an accepted project-session barrier.
-        if (!normalizedPublicId && activeScheme !== 'Alt') { return; }
+        if (!normalizedPublicId && activeScheme !== 'Alt') { return false; }
+        if (
+            this.connectionAcceptedGeneration === this.socketGeneration &&
+            this.currentPublicId !== normalizedPublicId
+        ) {
+            this.terminateRealtime(
+                'sender_changed',
+                `Realtime sender changed from ${String(this.currentPublicId)} to ${normalizedPublicId} within one socket generation`,
+                {
+                    generation: this.socketGeneration,
+                    expectedPublicId: this.currentPublicId,
+                    receivedPublicId: normalizedPublicId,
+                },
+            );
+            return false;
+        }
         const alreadyAccepted =
             this.connectionAcceptedGeneration === this.socketGeneration &&
             this.currentPublicId === normalizedPublicId;
@@ -610,9 +635,18 @@ export class SocketIOAPI {
             generation: this.socketGeneration,
             publicId: normalizedPublicId,
         });
+        const projectResponse = this.v2ProjectResponse;
+        if (
+            projectResponse?.generation === this.socketGeneration &&
+            projectResponse.witness !== undefined &&
+            projectResponse.witness.publicId === undefined
+        ) {
+            projectResponse.witness.publicId = normalizedPublicId;
+        }
         if (!alreadyAccepted) {
             this._handlers.forEach(handler => handler.onConnectionAccepted?.(normalizedPublicId));
         }
+        return true;
     }
 
     private finalizeProjectJoin(
@@ -621,6 +655,9 @@ export class SocketIOAPI {
         expectedProjectId: string,
         fallbackPublicId?: string,
     ): ProjectEntity {
+        if (this.terminalFailure) {
+            throw this.terminalFailure;
+        }
         const receivedProjectId = response.project?._id;
         if (receivedProjectId !== expectedProjectId) {
             throw this.terminateRealtime(
@@ -644,6 +681,20 @@ export class SocketIOAPI {
             );
         }
         if (
+            this.connectionAcceptedGeneration !== generation ||
+            this.currentPublicId !== publicId
+        ) {
+            throw this.terminateRealtime(
+                'sender_changed',
+                'Realtime sender identity changed before project join completion',
+                {
+                    generation,
+                    expectedPublicId: publicId,
+                    receivedPublicId: this.currentPublicId,
+                },
+            );
+        }
+        if (
             this.lastKnownProtocolVersion !== undefined &&
             response.protocolVersion !== undefined &&
             this.lastKnownProtocolVersion !== response.protocolVersion
@@ -660,7 +711,6 @@ export class SocketIOAPI {
         }
         const permissionsLevel = response.permissionsLevel ??
             (activeScheme === 'Alt' ? this.currentPermissionsLevel ?? this.lastKnownPermissionsLevel : undefined);
-        this.currentPublicId = publicId;
         this.currentPermissionsLevel = permissionsLevel;
         if (permissionsLevel !== undefined) {
             this.lastKnownPermissionsLevel = permissionsLevel;
@@ -853,8 +903,57 @@ export class SocketIOAPI {
                     permissionsLevel: res?.permissionsLevel,
                     protocolVersion: typeof res?.protocolVersion === 'number' ? res.protocolVersion : undefined,
                 };
-                this.acceptPublicId(socketAtInit, response.publicId);
-                this.ensureV2ProjectResponse().resolve(response);
+                const pendingResponse = this.ensureV2ProjectResponse();
+                const witness: ProjectJoinResponseWitness = {
+                    projectId: response.project?._id,
+                    publicId: response.publicId ?? this.currentPublicId,
+                    protocolVersion: response.protocolVersion,
+                };
+                const priorWitness = pendingResponse.witness;
+                if (priorWitness) {
+                    if (priorWitness.projectId !== witness.projectId) {
+                        this.terminateRealtime(
+                            'project_unavailable',
+                            'Realtime project identity changed within one socket generation',
+                            {
+                                generation: this.socketGeneration,
+                                expectedProjectId: priorWitness.projectId,
+                                receivedProjectId: witness.projectId,
+                            },
+                        );
+                        return;
+                    }
+                    if (priorWitness.publicId !== witness.publicId) {
+                        this.terminateRealtime(
+                            'sender_changed',
+                            'Realtime sender identity changed within one socket generation',
+                            {
+                                generation: this.socketGeneration,
+                                expectedPublicId: priorWitness.publicId,
+                                receivedPublicId: witness.publicId,
+                            },
+                        );
+                        return;
+                    }
+                    if (priorWitness.protocolVersion !== witness.protocolVersion) {
+                        this.terminateRealtime(
+                            'protocol_changed',
+                            'Realtime protocol changed within one socket generation',
+                            {
+                                generation: this.socketGeneration,
+                                expectedProtocolVersion: priorWitness.protocolVersion,
+                                receivedProtocolVersion: witness.protocolVersion,
+                            },
+                        );
+                        return;
+                    }
+                } else {
+                    pendingResponse.witness = witness;
+                }
+                if (response.publicId !== undefined && !this.acceptPublicId(socketAtInit, response.publicId)) {
+                    return;
+                }
+                pendingResponse.resolve(response);
             });
         }
     }
@@ -957,10 +1056,12 @@ export class SocketIOAPI {
                 case handlers.onFileChanged: {
                     const socketAtRegistration = this.socket;
                     socketAtRegistration.on('otUpdateApplied', (update: UpdateSchema) => {
+                        if (socketAtRegistration !== this.socket
+                            || socketAtRegistration === this.retiredSocket) {
+                            return;
+                        }
                         const session = this.projectSession;
-                        const sender = socketAtRegistration === this.socket
-                            && socketAtRegistration !== this.retiredSocket
-                            && session?.generation === this.socketGeneration ? {
+                        const sender = session?.generation === this.socketGeneration ? {
                                 publicId: session.publicId,
                                 generation: session.generation,
                             } : undefined;
@@ -1032,6 +1133,9 @@ export class SocketIOAPI {
      */
     async joinProject(project_id:string, timeoutMs: number = ACK_TIMEOUT_MS): Promise<ProjectEntity> {
         const generation = await this.waitUntilConnected();
+        if (this.terminalFailure) {
+            throw this.terminalFailure;
+        }
         const activeScheme = this._socketInitScheme ?? this.scheme;
         switch(activeScheme) {
             case 'Alt':
