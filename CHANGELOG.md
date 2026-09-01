@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.14] - 2026-09-01
+### Fixed
+- Bind document saves to the exact editor buffer and acknowledged Overleaf revision that produced them.
+- Preserve concurrent collaborator edits by transforming recorded local changes only through a complete, validated realtime OT chain.
+- Reject stale, ambiguous, conflicting, malformed, or disconnected save ancestry without sending a remote update.
+- Retain and deduplicate writes whose server outcome is unknown instead of replaying them as new edits after reconnecting.
+- Block unsupported new-document mutations and whole-file upload fallbacks from the text-editor save path.
+
 ## [0.15.13] - 2026-08-31
 ### Fixed
 - Normalize restored project URIs so the explorer, editors, and workspace history reuse one realtime project session.
