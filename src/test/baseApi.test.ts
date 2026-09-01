@@ -19,6 +19,21 @@ class CapturingAPI extends BaseAPI {
     }
 }
 
+class DocumentResponseAPI extends BaseAPI {
+    constructor(private readonly response: string) {
+        super('https://www.overleaf.com/');
+    }
+
+    protected async request(
+        _type: any,
+        _route: string,
+        _body?: any,
+        callback?: (res?: string) => object | undefined,
+    ): Promise<any> {
+        return {type: 'success', ...callback?.(this.response)};
+    }
+}
+
 describe('BaseAPI route construction', () => {
     const identity = {csrfToken: 'csrf', cookies: 'session=cookie'};
 
@@ -62,4 +77,36 @@ describe('BaseAPI route construction', () => {
         assert.equal(api.route, 'project/project/output/cached/output.overleaf.json');
         assert.deepEqual(api.requestOptions, {timeoutMs: 5000, maxRetries: 0});
     });
+
+    it('preserves the document identity and name returned by the server', async () => {
+        const api = new DocumentResponseAPI(JSON.stringify({
+            _id: 'server-document-id',
+            name: 'server-normalized-name.tex',
+        }));
+
+        const response = await api.addDoc(identity, 'project', 'folder', 'requested-name.tex');
+
+        assert.deepEqual(response.entity, {
+            _type: 'doc',
+            _id: 'server-document-id',
+            name: 'server-normalized-name.tex',
+        });
+    });
+
+    for (const invalid of [
+        {},
+        {_id: '', name: 'document.tex'},
+        {_id: 'document-id', name: ''},
+        {_id: 7, name: 'document.tex'},
+        {_id: 'document-id', name: 7},
+    ]) {
+        it(`rejects an invalid document identity response ${JSON.stringify(invalid)}`, async () => {
+            const api = new DocumentResponseAPI(JSON.stringify(invalid));
+
+            await assert.rejects(
+                api.addDoc(identity, 'project', 'folder', 'requested-name.tex'),
+                /invalid document identity/i,
+            );
+        });
+    }
 });

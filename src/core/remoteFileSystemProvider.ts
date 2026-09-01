@@ -18,10 +18,13 @@ import { SCMCollectionProvider } from '../scm/scmCollectionProvider';
 import { ExtendedBaseAPI, ProjectLinkedFileProvider, UrlLinkedFileProvider } from '../api/extendedBase';
 import { assertCurrentConnection, SocketRequestError, withTimeout } from '../api/socketRequest';
 import {
+    applyTextOperations,
     buildRecoveryUpdate,
-    desiredChangesArePresent,
+    CausalDocumentEvidence,
     isSenderConfirmation,
+    operationsFromObservedTextChanges,
     prepareProvenDocumentUpdate,
+    TextOperation,
 } from './documentUpdate';
 import { randomUUID } from 'crypto';
 import { resolveSynctexOutputIdentity } from '../compile/synctex';
@@ -162,6 +165,26 @@ type EditorDocumentBase = {
     content: string,
     recordName?: string,
     persistence?: Promise<DocumentProvenanceRecord>,
+    causality: LocalEditorCausality,
+};
+
+type LocalEditorCausality = {
+    socketGeneration: number,
+    remoteEpoch: string,
+    documentVersion: number,
+    content: string,
+    operations: TextOperation[],
+    valid: boolean,
+};
+
+type RemoteDocumentCausality = {
+    socketGeneration: number,
+    epoch: string,
+    anchorVersion: number,
+    headVersion: number,
+    headContent: string,
+    updates: Map<number, TextOperation[]>,
+    valid: boolean,
 };
 
 type EditorBufferState = {
@@ -189,11 +212,6 @@ type UnboundEditorSaveIntent = {
     resourceKey: string,
     documentVersion: number,
     content: string,
-};
-
-type NewDocumentSaveWitness = UnboundEditorSaveIntent & {
-    bufferId: string,
-    document: vscode.TextDocument,
 };
 
 type ResolvedEditorProvenance = {
@@ -250,11 +268,13 @@ export class VirtualFileSystem extends vscode.Disposable {
     private pendingReadTickets = new Map<string, ProviderReadTicket>();
     private boundReadCandidates = new Map<string, BoundProviderReadCandidate>();
     private activeEditorBases = new Map<string, EditorDocumentBase>();
+    private remoteDocumentCausality = new Map<string, RemoteDocumentCausality>();
     private documentIdsByPath = new Map<string, string>();
     private editorBufferIds = new WeakMap<vscode.TextDocument, string>();
     private editorBuffers = new Map<string, EditorBufferState>();
     private editorSaveIntents = new Map<string, EditorBufferWitness>();
     private unboundEditorSaveIntents = new WeakMap<vscode.TextDocument, UnboundEditorSaveIntent>();
+    private unboundEditorIncarnations = new WeakSet<vscode.TextDocument>();
     private editorSaveReceipts = new Map<string, EditorSaveReceipt>();
     private recoveryNotifications = new Set<string>();
     private freshConnectionRequested = false;
@@ -570,6 +590,102 @@ export class VirtualFileSystem extends vscode.Disposable {
         return {publicId: session.publicId, generation: session.generation};
     }
 
+    private startRemoteCausality(
+        docId: string,
+        version: number,
+        content: string,
+        socketGeneration: number,
+    ): RemoteDocumentCausality {
+        const ledger: RemoteDocumentCausality = {
+            socketGeneration,
+            epoch: randomUUID(),
+            anchorVersion: version,
+            headVersion: version,
+            headContent: content,
+            updates: new Map(),
+            valid: true,
+        };
+        this.remoteDocumentCausality.set(docId, ledger);
+        return ledger;
+    }
+
+    private invalidateRemoteCausality(docId: string) {
+        const ledger = this.remoteDocumentCausality.get(docId);
+        if (ledger) { ledger.valid = false; }
+    }
+
+    private createLocalEditorCausality(
+        document: vscode.TextDocument,
+        docId: string,
+        version: number,
+        content: string,
+    ): LocalEditorCausality {
+        const sender = this.currentSenderWitness();
+        const remote = this.remoteDocumentCausality.get(docId);
+        const valid = Boolean(
+            sender
+            && remote
+            && remote.valid
+            && remote.socketGeneration === sender.generation
+            && remote.headVersion === version
+            && remote.headContent === content
+            && document.getText() === content
+        );
+        return {
+            socketGeneration: sender?.generation ?? -1,
+            remoteEpoch: remote?.epoch ?? '',
+            documentVersion: document.version,
+            content,
+            operations: [],
+            valid,
+        };
+    }
+
+    private causalEvidenceForWrite(
+        docId: string,
+        base: {version: number, content: string},
+        remoteVersion: number,
+        desiredContent: string,
+        witness: EditorBufferWitness,
+    ): CausalDocumentEvidence | undefined {
+        const sender = this.currentSenderWitness();
+        const active = this.activeEditorBases.get(witness.bufferId);
+        const local = active?.causality;
+        const remote = this.remoteDocumentCausality.get(docId);
+        if (!sender
+            || !active
+            || active.identity.docId !== docId
+            || active.version !== base.version
+            || active.content !== base.content
+            || !local
+            || !local.valid
+            || local.socketGeneration !== sender.generation
+            || local.documentVersion !== witness.documentVersion
+            || local.content !== desiredContent
+            || !remote
+            || !remote.valid
+            || remote.socketGeneration !== sender.generation
+            || remote.epoch !== local.remoteEpoch
+            || remote.anchorVersion > base.version
+            || remote.headVersion !== remoteVersion
+            || remote.headContent !== this.currentDocument(docId).remoteCache) {
+            return undefined;
+        }
+        const remoteUpdates = [];
+        for (let version = base.version; version < remoteVersion; version += 1) {
+            const operations = remote.updates.get(version);
+            if (!operations) { return undefined; }
+            remoteUpdates.push({
+                version,
+                operations: operations.map(operation => ({...operation})),
+            });
+        }
+        return {
+            localOperations: local.operations.map(operation => ({...operation})),
+            remoteUpdates,
+        };
+    }
+
     private documentProvenanceIdentity(
         docId: string,
         buffer: Pick<EditorBufferState, 'bufferId' | 'canonicalEditorUri'>,
@@ -661,6 +777,21 @@ export class VirtualFileSystem extends vscode.Disposable {
     private observeEditorBuffer(document: vscode.TextDocument): EditorBufferState | undefined {
         const resourceKey = this.resourceKey(document.uri);
         const staged = this.stagedEditorBases.get(resourceKey);
+        const existingBufferId = this.editorBufferIds.get(document);
+        const existingBuffer = existingBufferId ? this.editorBuffers.get(existingBufferId) : undefined;
+        if (this.unboundEditorIncarnations.has(document)
+            || (document.isDirty
+                && (!existingBuffer
+                    || existingBuffer.document !== document
+                    || existingBuffer.resourceKey !== resourceKey)
+                && !staged)) {
+            // A dirty editor incarnation which was not bound while clean cannot
+            // acquire a remote identity later from a mutable path cache. A
+            // collaborator may create or rename a different document onto that
+            // path between onWillSave and writeFile.
+            this.unboundEditorIncarnations.add(document);
+            return undefined;
+        }
         const docId = staged?.docId
             ?? this.documentIdsByPath.get(resourceKey)
             ?? this.cachedDocumentIdForUri(document.uri);
@@ -825,17 +956,50 @@ export class VirtualFileSystem extends vscode.Disposable {
             bufferId,
             version: ticket.version,
             content: ticket.content,
+            causality: this.createLocalEditorCausality(
+                document,
+                ticket.docId,
+                ticket.version,
+                ticket.content,
+            ),
         });
         authoritative.doc.localCache = ticket.content;
         this.boundReadCandidates.delete(bufferId);
         return true;
     }
 
-    observeChangedTextDocument(document: vscode.TextDocument) {
+    observeChangedTextDocument(event: vscode.TextDocumentChangeEvent) {
+        const document = event.document;
         const bufferId = this.editorBufferIds.get(document);
         const candidate = bufferId ? this.boundReadCandidates.get(bufferId) : undefined;
         if (candidate?.document === document) {
             this.boundReadCandidates.delete(bufferId!);
+        }
+        const buffer = this.observeEditorBuffer(document);
+        const active = buffer ? this.activeEditorBases.get(buffer.bufferId) : undefined;
+        if (active) {
+            const causality = active.causality;
+            const sender = this.currentSenderWitness();
+            const changes = event.contentChanges.map(change => ({
+                rangeOffset: change.rangeOffset,
+                rangeLength: change.rangeLength,
+                text: change.text,
+            }));
+            const operations = causality.valid
+                && sender?.generation === causality.socketGeneration
+                && document.version === causality.documentVersion + 1 ?
+                operationsFromObservedTextChanges(
+                    causality.content,
+                    changes,
+                    document.getText(),
+                ) : undefined;
+            if (!operations) {
+                causality.valid = false;
+            } else {
+                causality.operations.push(...operations);
+            }
+            causality.documentVersion = document.version;
+            causality.content = document.getText();
         }
         this.observeTextDocument(document);
     }
@@ -858,6 +1022,12 @@ export class VirtualFileSystem extends vscode.Disposable {
                     content: receipt.content,
                     recordName: existing?.recordName,
                     persistence: existing?.persistence,
+                    causality: this.createLocalEditorCausality(
+                        document,
+                        receipt.identity.docId,
+                        receipt.version,
+                        receipt.content,
+                    ),
                 });
                 this.editorSaveReceipts.delete(buffer.bufferId);
             }
@@ -902,13 +1072,32 @@ export class VirtualFileSystem extends vscode.Disposable {
         this.unboundEditorSaveIntents.delete(document);
     }
 
+    private matchesUnboundEditorSave(uri: vscode.Uri, content: Uint8Array): boolean {
+        const resourceKey = this.resourceKey(uri);
+        const desiredContent = new TextDecoder().decode(content);
+        return vscode.workspace.textDocuments.some(document => {
+            if (!this.unboundEditorIncarnations.has(document)
+                || document.isClosed
+                || document.uri.toString() !== resourceKey) {
+                return false;
+            }
+            const intent = this.unboundEditorSaveIntents.get(document);
+            return intent?.resourceKey === resourceKey
+                && intent.documentVersion === document.version
+                && intent.content === desiredContent
+                && document.isDirty
+                && document.getText() === desiredContent;
+        });
+    }
+
     forgetTextDocument(document: vscode.TextDocument) {
+        this.unboundEditorSaveIntents.delete(document);
+        this.unboundEditorIncarnations.delete(document);
         const bufferId = this.editorBufferIds.get(document);
         if (!bufferId) { return; }
         this.editorBuffers.delete(bufferId);
         this.activeEditorBases.delete(bufferId);
         this.editorSaveIntents.delete(bufferId);
-        this.unboundEditorSaveIntents.delete(document);
         this.editorSaveReceipts.delete(bufferId);
         this.boundReadCandidates.delete(bufferId);
         this.pendingReadTickets.delete(this.resourceKey(document.uri));
@@ -945,6 +1134,12 @@ export class VirtualFileSystem extends vscode.Disposable {
             bufferId: buffer.bufferId,
             version: staged.version,
             content: staged.content,
+            causality: this.createLocalEditorCausality(
+                document,
+                staged.docId,
+                staged.version,
+                staged.content,
+            ),
         });
         this.pendingReadTickets.delete(buffer.resourceKey);
         this.boundReadCandidates.delete(buffer.bufferId);
@@ -999,61 +1194,6 @@ export class VirtualFileSystem extends vscode.Disposable {
             return {kind: 'blocked', reason: 'the editor buffer changed before save authorization'};
         }
         return {kind: 'valid', witness};
-    }
-
-    private resolveNewDocumentWritingBuffer(
-        uri: vscode.Uri,
-        desiredContent: string,
-    ): {kind: 'valid', witness: NewDocumentSaveWitness} | {kind: 'blocked', reason: string} {
-        const resourceKey = this.resourceKey(uri);
-        if (this.documentIdsByPath.has(resourceKey)
-            || [...this.editorBuffers.values()].some(buffer => buffer.resourceKey === resourceKey)) {
-            return {
-                kind: 'blocked',
-                reason: 'the missing path was previously bound to a remote document',
-            };
-        }
-        const matches = vscode.workspace.textDocuments.filter(document =>
-            document.uri.toString() === resourceKey
-            && !document.isClosed
-            && document.isDirty
-            && document.getText() === desiredContent
-        );
-        if (matches.length !== 1) {
-            return {
-                kind: 'blocked',
-                reason: matches.length === 0 ?
-                    'no exact dirty editor buffer proves this new document save' :
-                    'multiple dirty buffers refer to the requested new path',
-            };
-        }
-        const document = matches[0];
-        const intent = this.unboundEditorSaveIntents.get(document);
-        if (!intent
-            || intent.resourceKey !== resourceKey
-            || intent.documentVersion !== document.version
-            || intent.content !== desiredContent) {
-            return {
-                kind: 'blocked',
-                reason: 'no exact onWillSave intent proves this new document write',
-            };
-        }
-        let bufferId = this.editorBufferIds.get(document);
-        if (!bufferId) {
-            bufferId = randomUUID();
-            this.editorBufferIds.set(document, bufferId);
-        }
-        return {kind: 'valid', witness: {...intent, bufferId, document}};
-    }
-
-    private newDocumentBufferMatchesWitness(witness: NewDocumentSaveWitness): boolean {
-        return this.editorBufferIds.get(witness.document) === witness.bufferId
-            && this.exactOpenDocument(witness.document.uri) === witness.document
-            && !witness.document.isClosed
-            && witness.document.isDirty
-            && witness.document.uri.toString() === witness.resourceKey
-            && witness.document.version === witness.documentVersion
-            && witness.document.getText() === witness.content;
     }
 
     private bufferMatchesWitness(witness: EditorBufferWitness): boolean {
@@ -1211,6 +1351,12 @@ export class VirtualFileSystem extends vscode.Disposable {
             content: authoritativeContent,
             recordName: record?.recordName,
             persistence: record ? Promise.resolve(record) : undefined,
+            causality: this.createLocalEditorCausality(
+                witness.document,
+                doc._id,
+                expectedVersion,
+                authoritativeContent,
+            ),
         });
         this.editorSaveReceipts.set(witness.bufferId, {
             document: witness.document,
@@ -1400,6 +1546,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         this.pendingReadTickets.clear();
         this.boundReadCandidates.clear();
         this.documentMap(project).forEach((doc) => {
+            this.invalidateRemoteCausality(doc._id);
             doc.version = undefined;
             doc.remoteCache = undefined;
             doc.lastVersion = undefined;
@@ -1408,6 +1555,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     private invalidateDocumentSession(docId: string, error: Error) {
+        this.invalidateRemoteCausality(docId);
         for (const [resourceKey, ticket] of this.pendingReadTickets) {
             if (ticket.docId === docId) { this.pendingReadTickets.delete(resourceKey); }
         }
@@ -1484,22 +1632,20 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     private handleOtUpdateError(error: OtUpdateErrorSchema) {
         if (this.disposed || (error.projectId && error.projectId !== this.projectId)) { return; }
-        const rejection = new SocketRequestError(
+        // Official otUpdateError is broadcast to the whole document room and
+        // contains no sender publicId or operation identity. It cannot prove
+        // that this client's pending operation failed; it may describe a
+        // collaborator operation while ours is already queued behind it.
+        const uncertainty = new SocketRequestError(
             'server_error',
-            `Overleaf rejected a document update: ${error.message}`,
-            false,
+            `An Overleaf document update failed with unknown local outcome: ${error.message}`,
+            true,
             error.details,
         );
         if (error.docId) {
-            for (const [bufferId, pending] of this.pendingDocumentUpdates) {
-                if (pending.docId === error.docId) {
-                    this.pendingDocumentUpdates.delete(bufferId);
-                }
-            }
-            this.invalidateDocumentSession(error.docId, rejection);
+            this.invalidateDocumentSession(error.docId, uncertainty);
             return;
         }
-        this.pendingDocumentUpdates.clear();
         [this.root, this.joiningProject, this.previousRoot].forEach(project =>
             this.invalidateDocumentSessions(project)
         );
@@ -1650,93 +1796,6 @@ export class VirtualFileSystem extends vscode.Disposable {
             }
         }
         return {parentFolder, fileName, fileEntity: undefined, fileType: undefined};
-    }
-
-    private async verifyFreshMissingPath(
-        uri: vscode.Uri,
-        expectedParentFolderId: string,
-        expectedFileName: string,
-        identity?: Identity,
-    ): Promise<void> {
-        const sender = this.currentSenderWitness();
-        if (!sender) {
-            throw new Error('No accepted realtime identity can verify the new path');
-        }
-        const {pathParts} = parseUri(uri);
-        const rootFolderId = this.root?.rootFolder[0]?._id;
-        if (pathParts.length !== 1
-            || pathParts[0] !== expectedFileName
-            || rootFolderId !== expectedParentFolderId) {
-            throw new Error('Safe new-document creation is limited to the verified project root');
-        }
-        const response = await this.api.projectEntitiesJson(
-            identity ?? await GlobalStateManager.authenticate(this.context, this.serverName),
-            this.projectId,
-        );
-        const senderAfter = this.currentSenderWitness();
-        if (senderAfter?.publicId !== sender.publicId
-            || senderAfter.generation !== sender.generation
-            || this.protocolVersion !== SUPPORTED_WRITE_PROTOCOL_VERSION) {
-            throw new Error('The project or sender identity changed while verifying the new path');
-        }
-        if (response.type !== 'success'
-            || !Array.isArray(response.entities)
-            || response.entities.some(entity =>
-                typeof entity?.path !== 'string'
-                || (entity.type !== 'doc' && entity.type !== 'file')
-            )) {
-            throw new Error('The server returned no trustworthy project-entity snapshot');
-        }
-        const project = this.root;
-        if (!project) {
-            throw new Error('The current project tree is unavailable while verifying the new path');
-        }
-        const resolved = this.resolveUriInProject(project, uri);
-        if (resolved.parentFolder._id !== expectedParentFolderId
-            || resolved.fileName !== expectedFileName) {
-            throw new Error('The remote parent folder changed while verifying the new path');
-        }
-        const expectedPath = `/${pathParts.join('/')}`;
-        if (resolved.fileEntity
-            || resolved.fileType
-            || response.entities.some(entity => entity.path === expectedPath)) {
-            throw vscode.FileSystemError.FileExists(uri);
-        }
-    }
-
-    private async verifyFreshCreatedDocumentPath(
-        uri: vscode.Uri,
-        expectedFileName: string,
-        identity: Identity,
-    ): Promise<void> {
-        const sender = this.currentSenderWitness();
-        if (!sender) {
-            throw new Error('No accepted realtime identity can verify the created document');
-        }
-        const {pathParts} = parseUri(uri);
-        if (pathParts.length !== 1 || pathParts[0] !== expectedFileName) {
-            throw new Error('The created document no longer has the verified root path');
-        }
-        const response = await this.api.projectEntitiesJson(identity, this.projectId);
-        const senderAfter = this.currentSenderWitness();
-        if (senderAfter?.publicId !== sender.publicId
-            || senderAfter.generation !== sender.generation
-            || this.protocolVersion !== SUPPORTED_WRITE_PROTOCOL_VERSION) {
-            throw new Error('The project or sender identity changed while verifying the created document');
-        }
-        if (response.type !== 'success'
-            || !Array.isArray(response.entities)
-            || response.entities.some(entity =>
-                typeof entity?.path !== 'string'
-                || (entity.type !== 'doc' && entity.type !== 'file')
-            )) {
-            throw new Error('The server returned no trustworthy project-entity snapshot');
-        }
-        const expectedPath = `/${pathParts.join('/')}`;
-        const matches = response.entities.filter(entity => entity.path === expectedPath);
-        if (matches.length !== 1 || matches[0].type !== 'doc') {
-            throw new Error('The server did not retain exactly one text document at the created path');
-        }
     }
 
     _resolveById(entityId: string, root?: FolderEntity, path?:string):{
@@ -1956,11 +2015,45 @@ export class VirtualFileSystem extends vscode.Disposable {
         ];
     }
 
+    private normalizeRealtimeTextOperations(update: UpdateSchema): TextOperation[] {
+        if (!Array.isArray(update.op)) {
+            throw new Error('Realtime update has no text operation');
+        }
+        return update.op.map(operation => {
+            if (typeof operation.i === 'string' && operation.d === undefined) {
+                return {p: operation.p, i: operation.i};
+            }
+            if (typeof operation.d === 'string' && operation.i === undefined) {
+                return {
+                    p: operation.p,
+                    d: Buffer.from(operation.d, 'ascii').toString('utf-8'),
+                };
+            }
+            throw new Error('Malformed realtime text operation');
+        });
+    }
+
+    private sameTextOperations(left: TextOperation[], right: TextOperation[]): boolean {
+        return left.length === right.length && left.every((operation, index) => {
+            const other = right[index];
+            return operation.p === other.p
+                && operation.i === other.i
+                && operation.d === other.d;
+        });
+    }
+
     private applyDocumentUpdate(update: UpdateSchema, eventSender?: ProjectSenderWitness) {
         const res = this._resolveById(update.doc);
         if (res===undefined) { return; }
 
         const doc = res.fileEntity as DocumentEntity;
+        if (!Number.isInteger(update.v) || update.v < 0) {
+            this.invalidateDocumentSession(
+                doc._id,
+                new Error('Document update has an invalid revision'),
+            );
+            return;
+        }
         const senderConfirmation = isSenderConfirmation(update);
         if (senderConfirmation) {
             const sender = this.currentSenderWitness();
@@ -1991,10 +2084,44 @@ export class VirtualFileSystem extends vscode.Disposable {
             // The update is already represented by a newer joinDoc snapshot.
             if (senderConfirmation) {
                 this.resolveDocumentVersionWaiters(doc._id, update.v);
+                return;
+            }
+            const ledger = this.remoteDocumentCausality.get(doc._id);
+            if (!ledger
+                || !ledger.valid
+                || ledger.socketGeneration !== this.socket.generation
+                || ledger.headVersion !== doc.version
+                || ledger.headContent !== doc.remoteCache) {
+                this.invalidateDocumentSession(
+                    doc._id,
+                    new Error('A stale document update has no exact causal epoch'),
+                );
+                return;
+            }
+            if (update.v < ledger.anchorVersion) {
+                return;
+            }
+            let duplicate: TextOperation[];
+            try {
+                duplicate = this.normalizeRealtimeTextOperations(update);
+            } catch (error) {
+                this.invalidateDocumentSession(
+                    doc._id,
+                    error instanceof Error ? error : new Error(String(error)),
+                );
+                return;
+            }
+            const recorded = ledger.updates.get(update.v);
+            if (!recorded || !this.sameTextOperations(recorded, duplicate)) {
+                this.invalidateDocumentSession(
+                    doc._id,
+                    new Error('Conflicting operations were observed for one document revision'),
+                );
             }
             return;
         }
         if (update.v > doc.version) {
+            this.invalidateRemoteCausality(doc._id);
             doc.remoteCache = undefined;
             doc.version = undefined;
             doc.lastVersion = undefined;
@@ -2002,17 +2129,38 @@ export class VirtualFileSystem extends vscode.Disposable {
             return;
         }
 
+        const beforeVersion = doc.version;
+        const beforeContent = doc.remoteCache;
         doc.version += 1;
-        if (update.op && doc.remoteCache!==undefined) {
-            let content = doc.remoteCache;
-            update.op.forEach((op) => {
-                if (op.i) {
-                    content = content.slice(0, op.p) + op.i + content.slice(op.p);
-                } else if (op.d) {
-                    const deleteUtf8 = Buffer.from(op.d, 'ascii').toString('utf-8');
-                    content = content.slice(0, op.p) + content.slice(op.p+deleteUtf8.length);
+        if (update.op && beforeContent !== undefined) {
+            let operations: TextOperation[];
+            let content: string;
+            try {
+                operations = this.normalizeRealtimeTextOperations(update);
+                content = applyTextOperations(beforeContent, operations);
+            } catch (error) {
+                this.invalidateDocumentSession(
+                    doc._id,
+                    error instanceof Error ? error : new Error(String(error)),
+                );
+                return;
+            }
+            const ledger = this.remoteDocumentCausality.get(doc._id);
+            if (ledger?.valid) {
+                if (ledger.socketGeneration !== this.socket.generation
+                    || ledger.headVersion !== beforeVersion
+                    || ledger.headContent !== beforeContent
+                    || ledger.updates.has(beforeVersion)) {
+                    ledger.valid = false;
+                } else {
+                    ledger.updates.set(
+                        beforeVersion,
+                        operations.map(operation => ({...operation})),
+                    );
+                    ledger.headVersion = beforeVersion + 1;
+                    ledger.headContent = content;
                 }
-            });
+            }
             const _uri = this.pathToUri(res.path).toString();
             const _doc = vscode.workspace.textDocuments.find((doc) => doc.uri.toString()===_uri);
             // if doc dirty, local cache should diverge from remote cache
@@ -2022,6 +2170,11 @@ export class VirtualFileSystem extends vscode.Disposable {
             this.notify([
                 {type: vscode.FileChangeType.Changed, uri: this.pathToUri(res.path)}
             ]);
+        } else {
+            // A sender confirmation proves an outcome for pending recovery, but
+            // it carries no operation and therefore cannot extend a causal OT
+            // ancestry for a later edit.
+            this.invalidateRemoteCausality(doc._id);
         }
         if (senderConfirmation) {
             this.resolveDocumentVersionWaiters(doc._id, update.v);
@@ -2313,177 +2466,6 @@ export class VirtualFileSystem extends vscode.Disposable {
         this.markSourceDirty();
     }
 
-    private async createVerifiedNewDocument(
-        uri: vscode.Uri,
-        content: Uint8Array,
-        witness: NewDocumentSaveWitness,
-        parentFolderId: string,
-        fileName: string,
-    ): Promise<void> {
-        let hostedOverleaf = false;
-        try {
-            const server = new URL(this.serverUrl);
-            hostedOverleaf = server.href === 'https://www.overleaf.com/';
-        } catch {
-            hostedOverleaf = false;
-        }
-        if (!hostedOverleaf) {
-            this.blockDocumentWrite(
-                uri,
-                content,
-                'this server has no verified atomic new-document contract',
-            );
-        }
-        const rootFolderId = this.root?.rootFolder[0]?._id;
-        if (parseUri(uri).pathParts.length !== 1 || parentFolderId !== rootFolderId) {
-            this.blockDocumentWrite(
-                uri,
-                content,
-                'safe new-document creation is limited to the verified project root',
-            );
-        }
-        const create = vscode.l10n.t('Create New Remote Document');
-        const choice = await vscode.window.showWarningMessage(
-            vscode.l10n.t(
-                'Create {name} as a new Overleaf document? Do not continue for a restored tab whose remote file was deleted or renamed.',
-                {name: fileName},
-            ),
-            {modal: true},
-            create,
-        );
-        if (choice !== create || !this.newDocumentBufferMatchesWitness(witness)) {
-            this.blockDocumentWrite(
-                uri,
-                content,
-                'new remote document creation was not explicitly confirmed for this editor',
-            );
-        }
-
-        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-        await this.verifyFreshMissingPath(uri, parentFolderId, fileName, identity);
-        if (!this.newDocumentBufferMatchesWitness(witness)) {
-            this.blockDocumentWrite(
-                uri,
-                content,
-                'the new-document buffer changed during remote path verification',
-            );
-        }
-        if (!this.newDocumentBufferMatchesWitness(witness)
-            || this.documentIdsByPath.has(witness.resourceKey)) {
-            this.blockDocumentWrite(
-                uri,
-                content,
-                'the new-document identity changed immediately before creation',
-            );
-        }
-
-        // Official hosted Overleaf serializes addDoc under the project-structure
-        // lock and rejects an exact same-name doc, file, or folder before insert.
-        // uploadFile is an upsert and must never be used for this safety path.
-        // No await is permitted between the final buffer/identity check above
-        // and invoking this atomic no-overwrite side effect.
-        const response = await this.api.addDoc(
-            identity,
-            this.projectId,
-            parentFolderId,
-            fileName,
-        );
-        if (response.type !== 'success') {
-            throw this.mutationError(`Unable to create ${fileName}`, response.message);
-        }
-        if (!this.isCreatedEntity(response.entity, ['doc'])
-            || response.entity.name !== fileName) {
-            throw this.mutationError(`Unable to create ${fileName}`, 'The server returned no document');
-        }
-
-        const liveParent = await this.currentFolder(parentFolderId, `Unable to create ${fileName}`);
-        const alreadyCached = Boolean(this.resolveCachedEntity(response.entity._id));
-        this.insertEntity(liveParent, response.entity._type, response.entity);
-        if (!alreadyCached) {
-            this.notify([{type: vscode.FileChangeType.Created, uri}]);
-        }
-        this.markSourceDirty();
-
-        const created = await this._resolveUri(uri);
-        const cachedCreated = this.resolveCachedEntity(response.entity._id);
-        if (created.fileType !== 'doc'
-            || !created.fileEntity
-            || created.fileEntity._id !== response.entity._id
-            || cachedCreated?.fileType !== 'doc'
-            || cachedCreated.path !== `/${fileName}`) {
-            this.blockDocumentWrite(
-                uri,
-                content,
-                'the server did not create an editable text document',
-            );
-        }
-        const authoritative = await this.joinFreshDocumentSession(created.fileEntity._id);
-        const authoritativeVersion = authoritative.doc.version;
-        if (authoritativeVersion === undefined || authoritative.content !== '') {
-            this.blockDocumentWrite(
-                uri,
-                content,
-                'the atomic new document did not expose its exact empty base',
-            );
-        }
-        await this.verifyFreshCreatedDocumentPath(uri, fileName, identity);
-        const buffer = this.observeEditorBuffer(witness.document);
-        if (!buffer
-            || buffer.bufferId !== witness.bufferId
-            || !this.newDocumentBufferMatchesWitness(witness)) {
-            this.blockDocumentWrite(
-                uri,
-                content,
-                'the created document no longer belongs to the saving editor',
-            );
-        }
-        const editorWitness: EditorBufferWitness = {
-            ...buffer,
-            documentVersion: witness.documentVersion,
-            content: witness.content,
-        };
-        const identityAfterVerification = this.documentProvenanceIdentity(
-            authoritative.doc._id,
-            editorWitness,
-        );
-        const current = this.currentDocument(authoritative.doc._id);
-        if (!this.bufferMatchesWitness(editorWitness)
-            || !identityAfterVerification
-            || current !== authoritative.doc
-            || current.version === undefined
-            || current.version < authoritativeVersion
-            || (current.version === authoritativeVersion && current.remoteCache !== '')) {
-            this.blockDocumentWrite(
-                uri,
-                content,
-                'the created document base, editor, or sender changed before authorization',
-            );
-        }
-        if (witness.content === '') {
-            await this.acceptEditorBase(
-                editorWitness,
-                authoritative.doc,
-                authoritativeVersion,
-                '',
-            );
-            this.editorSaveIntents.delete(buffer.bufferId);
-            this.unboundEditorSaveIntents.delete(witness.document);
-            return;
-        }
-
-        // The empty document at authoritativeVersion is an actual server
-        // revision and remains a valid causal base if later OT arrives. Do not
-        // issue a clean receipt until the initial bytes are revision-bound and
-        // confirmed through the ordinary document-update path.
-        this.activeEditorBases.set(buffer.bufferId, {
-            identity: identityAfterVerification,
-            bufferId: buffer.bufferId,
-            version: authoritativeVersion,
-            content: '',
-        });
-        await this.writeFileNow(uri, content, false, true);
-    }
-
     async refreshLinkedFile(uri: vscode.Uri) {
         await this.assertProjectWritable('Unable to refresh linked file');
         const {fileType, fileEntity} = await this._resolveUri(uri);
@@ -2663,6 +2645,12 @@ export class VirtualFileSystem extends vscode.Disposable {
             doc.version = res.version;
             doc.remoteCache = remoteContent;
             doc.lastVersion = undefined;
+            this.startRemoteCausality(
+                docId,
+                res.version,
+                remoteContent,
+                connectionGeneration,
+            );
 
             const responseUpdates = res.updates.filter((update: any) =>
                 update && typeof update.v === 'number' && (update.op === undefined || Array.isArray(update.op)),
@@ -2695,6 +2683,13 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async writeFile(uri: vscode.Uri, content:Uint8Array, create:boolean, overwrite:boolean) {
+        if (this.matchesUnboundEditorSave(uri, content)) {
+            this.blockDocumentWrite(
+                uri,
+                content,
+                'this dirty editor was never bound to a remote document identity',
+            );
+        }
         await this.assertProjectWritable('Unable to write file');
         const resolved = await this._resolveUri(uri);
         const keys = [
@@ -2787,13 +2782,6 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (authoritativeVersion < pending.confirmationVersion + 1) {
             throw new Error('The authoritative revision is behind the observed sender confirmation');
         }
-        if (!desiredChangesArePresent(
-            pending.baseContent,
-            authoritative.content,
-            pending.desiredContent,
-        )) {
-            throw new Error('The confirmed write is absent from the authoritative snapshot');
-        }
         if (this.pendingDocumentUpdates.get(pending.bufferId) !== pending) {
             throw new Error('The in-memory pending intent changed before reconciliation');
         }
@@ -2845,6 +2833,12 @@ export class VirtualFileSystem extends vscode.Disposable {
                 content: baseContent,
                 recordName: reconciled.recordName,
                 persistence: Promise.resolve(reconciled),
+                causality: this.createLocalEditorCausality(
+                    live!.document,
+                    pending.docId,
+                    baseVersion,
+                    baseContent,
+                ),
             };
             this.activeEditorBases.set(pending.bufferId, active);
 
@@ -3100,17 +3094,6 @@ export class VirtualFileSystem extends vscode.Disposable {
             );
             throw error;
         }
-        if (!desiredChangesArePresent(
-            pending.baseContent,
-            authoritative.content,
-            pending.desiredContent,
-        )) {
-            this.blockDocumentWrite(
-                uri,
-                content,
-                'the confirmed retry is no longer present in the authoritative document',
-            );
-        }
         const authoritativeVersion = authoritative.doc.version;
         if (authoritativeVersion === undefined) {
             this.blockDocumentWrite(
@@ -3140,21 +3123,21 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     private async writeFileNow(uri: vscode.Uri, content:Uint8Array, create:boolean, _overwrite:boolean) {
+        if (this.matchesUnboundEditorSave(uri, content)) {
+            this.blockDocumentWrite(
+                uri,
+                content,
+                'this dirty editor was never bound to a remote document identity',
+            );
+        }
         const {parentFolder, fileName, fileType, fileEntity} = await this._resolveUri(uri);
 
         // if non-exists --> create it
         if (!fileType && create) {
-            const desiredContent = new TextDecoder().decode(content);
-            const resolution = this.resolveNewDocumentWritingBuffer(uri, desiredContent);
-            if (resolution.kind === 'blocked') {
-                this.blockDocumentWrite(uri, content, resolution.reason);
-            }
-            return this.createVerifiedNewDocument(
+            this.blockDocumentWrite(
                 uri,
                 content,
-                resolution.witness,
-                parentFolder._id,
-                fileName,
+                'the official protocol cannot atomically bind a new path, document identity, and initial text',
             );
         }
 
@@ -3220,6 +3203,13 @@ export class VirtualFileSystem extends vscode.Disposable {
                 sessionVersion,
                 remoteContent,
                 _content,
+                exactBase ? this.causalEvidenceForWrite(
+                    docId,
+                    exactBase,
+                    sessionVersion,
+                    _content,
+                    witness,
+                ) : undefined,
             );
 
             if (authorization.status === 'noop') {
@@ -3257,7 +3247,10 @@ export class VirtualFileSystem extends vscode.Disposable {
                     'pending-write': 'a previous write has an unknown or unreconciled outcome',
                     'version-regression': 'the remote revision moved behind this editor base',
                     'content-version-mismatch': 'the remote text changed without a matching revision advance',
-                    'merge-conflict': 'remote and local edits overlap relative to the exact editor base',
+                    'missing-local-causality': 'the editor change events do not prove the exact local operation',
+                    'missing-remote-causality': 'the remote operation ancestry is incomplete for this editor base',
+                    'invalid-causal-operations': 'the observed operation chain cannot be replayed exactly',
+                    'causal-conflict': 'remote and local operations overlap or share a boundary',
                 } as const;
                 this.blockDocumentWrite(uri, content, reasons[authorization.reason]);
             }
@@ -3393,17 +3386,6 @@ export class VirtualFileSystem extends vscode.Disposable {
                     'the acknowledged write could not be reconciled with a fresh remote snapshot',
                 );
                 throw error;
-            }
-            if (!desiredChangesArePresent(
-                pending.baseContent,
-                authoritative.content,
-                pending.desiredContent,
-            )) {
-                this.blockDocumentWrite(
-                    uri,
-                    content,
-                    'the acknowledged write was followed by remote changes; reload before another write',
-                );
             }
             const authoritativeVersion = authoritative.doc.version;
             if (authoritativeVersion === undefined) {
@@ -4193,10 +4175,10 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider, vsco
         vfs?.observeOpenedTextDocument(document);
     }
 
-    private observeChangedTextDocument(document: vscode.TextDocument) {
-        if (document.uri.scheme !== ROOT_NAME) { return; }
-        const vfs = this.vfss[this.vfsKey(document.uri)];
-        vfs?.observeChangedTextDocument(document);
+    private observeChangedTextDocument(event: vscode.TextDocumentChangeEvent) {
+        if (event.document.uri.scheme !== ROOT_NAME) { return; }
+        const vfs = this.vfss[this.vfsKey(event.document.uri)];
+        vfs?.observeChangedTextDocument(event);
     }
 
     private forgetTextDocument(document: vscode.TextDocument) {
@@ -4283,7 +4265,7 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider, vsco
                 this.observeOpenedTextDocument(document);
             }),
             vscode.workspace.onDidChangeTextDocument(event => {
-                this.observeChangedTextDocument(event.document);
+                this.observeChangedTextDocument(event);
             }),
             vscode.workspace.onWillSaveTextDocument(event => {
                 if (event.document.uri.scheme !== ROOT_NAME) { return; }

@@ -634,8 +634,12 @@ export class BaseAPI {
     async addDoc(identity:Identity, projectId:string, parentFolderId:string, filename:string) {
         this.setIdentity(identity);
         return this.request('POST', `project/${projectId}/doc`, {parent_folder_id:parentFolderId, name:filename}, (res) => {
-            const {_id} = JSON.parse(res!) as any;
-            const entity = {_type:'doc', _id, name:filename} as FileEntity;
+            const {_id, name} = JSON.parse(res!) as any;
+            if (typeof _id !== 'string' || _id.length === 0
+                || typeof name !== 'string' || name.length === 0) {
+                throw new Error('The server returned an invalid document identity');
+            }
+            const entity = {_type:'doc', _id, name} as FileEntity;
             return {entity};
         }, {'X-Csrf-Token': identity.csrfToken});
     }

@@ -5,7 +5,6 @@ import {
     DocumentProvenanceStore,
     ProvenanceStorage,
 } from '../../core/documentProvenance';
-import {prepareDocumentUpdate} from '../../core/documentUpdate';
 
 export type TextOperation = {
     p: number,
@@ -35,11 +34,22 @@ type EventHandlers = {
         generation: number,
     }) => void,
     onDisconnected?: () => void,
+    onOtUpdateError?: (error: {
+        message: string,
+        projectId?: string,
+        docId?: string,
+        details?: unknown,
+    }) => void,
     onFileChanged?: (update: {
         doc: string,
         v: number,
         op?: TextOperation[],
     }, sender?: {publicId: string, generation: number}) => void,
+    onFileCreated?: (
+        parentFolderId: string,
+        type: 'doc' | 'file' | 'folder' | 'outputs',
+        entity: {_id: string, name: string, _type?: 'doc' | 'file' | 'folder' | 'outputs'},
+    ) => void,
 };
 
 type StoredDocument = {
@@ -50,6 +60,10 @@ type StoredDocument = {
     applications: Array<{
         version: number,
         publicId: string,
+    }>,
+    history: Array<{
+        version: number,
+        operations: TextOperation[],
     }>,
 };
 
@@ -82,6 +96,136 @@ export function applyTextOperations(content: string, operations: TextOperation[]
         }
     }
     return result;
+}
+
+function oracleAppend(destination: TextOperation[], component: TextOperation): void {
+    if (component.i === '' || component.d === '') { return; }
+    const current = clone(component);
+    const last = destination.at(-1);
+    if (!last) {
+        destination.push(current);
+    } else if (last.i !== undefined && current.i !== undefined
+        && last.p <= current.p && current.p <= last.p + last.i.length) {
+        destination[destination.length - 1] = {
+            p: last.p,
+            i: last.i.slice(0, current.p - last.p)
+                + current.i
+                + last.i.slice(current.p - last.p),
+        };
+    } else if (last.d !== undefined && current.d !== undefined
+        && current.p <= last.p && last.p <= current.p + current.d.length) {
+        destination[destination.length - 1] = {
+            p: current.p,
+            d: current.d.slice(0, last.p - current.p)
+                + last.d
+                + current.d.slice(last.p - current.p),
+        };
+    } else {
+        destination.push(current);
+    }
+}
+
+function oracleTransformPosition(position: number, other: TextOperation, insertAfter = false): number {
+    if (other.i !== undefined) {
+        return other.p < position || (other.p === position && insertAfter) ?
+            position + other.i.length : position;
+    }
+    assert.notEqual(other.d, undefined);
+    const deletion = other.d!;
+    if (position <= other.p) { return position; }
+    if (position <= other.p + deletion.length) { return other.p; }
+    return position - deletion.length;
+}
+
+function oracleTransformComponent(
+    destination: TextOperation[],
+    component: TextOperation,
+    other: TextOperation,
+    side: 'left' | 'right',
+): void {
+    if (component.i !== undefined) {
+        oracleAppend(destination, {
+            p: oracleTransformPosition(component.p, other, side === 'right'),
+            i: component.i,
+        });
+        return;
+    }
+    assert.notEqual(component.d, undefined);
+    const deletion = component.d!;
+    if (other.i !== undefined) {
+        let remainder = deletion;
+        if (component.p < other.p) {
+            oracleAppend(destination, {
+                p: component.p,
+                d: remainder.slice(0, other.p - component.p),
+            });
+            remainder = remainder.slice(other.p - component.p);
+        }
+        if (remainder) {
+            oracleAppend(destination, {p: component.p + other.i.length, d: remainder});
+        }
+        return;
+    }
+    assert.notEqual(other.d, undefined);
+    const otherDeletion = other.d!;
+    if (component.p >= other.p + otherDeletion.length) {
+        oracleAppend(destination, {p: component.p - otherDeletion.length, d: deletion});
+    } else if (component.p + deletion.length <= other.p) {
+        oracleAppend(destination, component);
+    } else {
+        let remainder = '';
+        if (component.p < other.p) {
+            remainder = deletion.slice(0, other.p - component.p);
+        }
+        if (component.p + deletion.length > other.p + otherDeletion.length) {
+            remainder += deletion.slice(other.p + otherDeletion.length - component.p);
+        }
+        const start = Math.max(component.p, other.p);
+        const end = Math.min(component.p + deletion.length, other.p + otherDeletion.length);
+        assert.equal(
+            deletion.slice(start - component.p, end - component.p),
+            otherDeletion.slice(start - other.p, end - other.p),
+        );
+        if (remainder) {
+            oracleAppend(destination, {
+                p: oracleTransformPosition(component.p, other),
+                d: remainder,
+            });
+        }
+    }
+}
+
+function oracleTransformPair(
+    leftInput: TextOperation[],
+    rightInput: TextOperation[],
+): [TextOperation[], TextOperation[]] {
+    let left = clone(leftInput);
+    const transformedRight: TextOperation[] = [];
+    for (const inputRight of rightInput) {
+        let right: TextOperation | undefined = clone(inputRight);
+        const transformedLeft: TextOperation[] = [];
+        let index = 0;
+        while (index < left.length && right) {
+            const nextRight: TextOperation[] = [];
+            oracleTransformComponent(transformedLeft, left[index], right, 'left');
+            oracleTransformComponent(nextRight, right, left[index], 'right');
+            index += 1;
+            if (nextRight.length === 1) {
+                right = nextRight[0];
+            } else if (nextRight.length === 0) {
+                left.slice(index).forEach(component => oracleAppend(transformedLeft, component));
+                right = undefined;
+            } else {
+                const [restLeft, splitRight] = oracleTransformPair(left.slice(index), nextRight);
+                restLeft.forEach(component => oracleAppend(transformedLeft, component));
+                splitRight.forEach(component => oracleAppend(transformedRight, component));
+                right = undefined;
+            }
+        }
+        if (right) { oracleAppend(transformedRight, right); }
+        left = transformedLeft;
+    }
+    return [left, transformedRight];
 }
 
 class UriStub {
@@ -203,13 +347,22 @@ const workspaceDocuments: Array<{
 
 type HarnessTextDocument = typeof workspaceDocuments[number];
 
+type HarnessTextChange = {
+    rangeOffset: number,
+    rangeLength: number,
+    text: string,
+};
+
 type DeferredWarningResponse = {
     resolve(response: string | undefined): void,
 };
 
 class ProductionWorkspaceEventHarness {
     private readonly didOpenListeners = new Set<(document: HarnessTextDocument) => void>();
-    private readonly didChangeListeners = new Set<(event: {document: HarnessTextDocument}) => void>();
+    private readonly didChangeListeners = new Set<(event: {
+        document: HarnessTextDocument,
+        contentChanges: HarnessTextChange[],
+    }) => void>();
     private readonly willSaveListeners = new Set<(event: {document: HarnessTextDocument}) => void>();
     private readonly didSaveListeners = new Set<(document: HarnessTextDocument) => void>();
     private readonly didCloseListeners = new Set<(document: HarnessTextDocument) => void>();
@@ -225,7 +378,10 @@ class ProductionWorkspaceEventHarness {
         return this.subscribe(this.didOpenListeners, listener);
     }
 
-    onDidChange(listener: (event: {document: HarnessTextDocument}) => void) {
+    onDidChange(listener: (event: {
+        document: HarnessTextDocument,
+        contentChanges: HarnessTextChange[],
+    }) => void) {
         return this.subscribe(this.didChangeListeners, listener);
     }
 
@@ -245,8 +401,8 @@ class ProductionWorkspaceEventHarness {
         this.didOpenListeners.forEach(listener => listener(document));
     }
 
-    fireDidChange(document: HarnessTextDocument): void {
-        this.didChangeListeners.forEach(listener => listener({document}));
+    fireDidChange(document: HarnessTextDocument, contentChanges: HarnessTextChange[]): void {
+        this.didChangeListeners.forEach(listener => listener({document, contentChanges}));
     }
 
     fireWillSave(document: HarnessTextDocument): void {
@@ -359,7 +515,10 @@ const vscodeStub = {
         registerFileSystemProvider: () => new DisposableStub(),
         onDidOpenTextDocument: (listener: (document: HarnessTextDocument) => void) =>
             productionWorkspaceEvents.onDidOpen(listener),
-        onDidChangeTextDocument: (listener: (event: {document: HarnessTextDocument}) => void) =>
+        onDidChangeTextDocument: (listener: (event: {
+            document: HarnessTextDocument,
+            contentChanges: HarnessTextChange[],
+        }) => void) =>
             productionWorkspaceEvents.onDidChange(listener),
         onWillSaveTextDocument: (listener: (event: {document: HarnessTextDocument}) => void) =>
             productionWorkspaceEvents.onWillSave(listener),
@@ -772,7 +931,8 @@ export class DeterministicRealtimeServer {
     private readonly projects = new Map<string, StoredProject>();
     private readonly sockets = new Set<DeterministicSocket>();
     private publicIdSequence = 0;
-    private nextUpdateFault: 'before-apply' | 'after-apply' | undefined;
+    private nextUpdateFault: 'before-apply' | 'after-apply' | 'partial-enqueue' | undefined;
+    private readonly retainedPayloads: Array<() => void> = [];
     private holdNextQueuedApplication = false;
     private heldApplication: (() => void) | undefined;
     private transformHeldApplication = false;
@@ -795,6 +955,7 @@ export class DeterministicRealtimeServer {
                 content: spec.content,
                 version: spec.version ?? 1,
                 applications: [],
+                history: [],
             },
             additionalDocuments: [],
         });
@@ -895,6 +1056,7 @@ export class DeterministicRealtimeServer {
             content,
             version: 0,
             applications: [],
+            history: [],
         };
         project.additionalDocuments.push(document);
         return {
@@ -919,6 +1081,25 @@ export class DeterministicRealtimeServer {
         this.nextUpdateFault = 'after-apply';
     }
 
+    failNextNotificationEnqueue(): void {
+        this.nextUpdateFault = 'partial-enqueue';
+    }
+
+    broadcastDocumentUpdateError(projectId: string, docId: string, message: string): void {
+        const affected = [...this.sockets].filter(socket =>
+            socket.projectId === projectId
+            && socket.isConnected
+            && socket.joinedDocuments.has(docId)
+        );
+        affected.forEach(socket => socket.handlers.onOtUpdateError?.({
+            message,
+            projectId,
+            docId,
+            details: {project_id: projectId, doc_id: docId, error: message},
+        }));
+        affected.forEach(socket => socket.disconnect());
+    }
+
     holdNextApplicationAfterAck(): void {
         assert.equal(this.holdNextQueuedApplication, false, 'An application hold is already armed');
         assert.equal(this.heldApplication, undefined, 'A queued application is already held');
@@ -941,6 +1122,7 @@ export class DeterministicRealtimeServer {
         const document = this.document(projectId, docId);
         const version = document.version;
         document.content = applyTextOperations(document.content, operations);
+        document.history.push({version, operations: clone(operations)});
         document.version += 1;
         for (const socket of this.sockets) {
             if (
@@ -957,12 +1139,34 @@ export class DeterministicRealtimeServer {
         }
     }
 
+    broadcastUncommittedDocumentUpdate(
+        projectId: string,
+        docId: string,
+        version: number,
+        operations: TextOperation[],
+    ): void {
+        for (const socket of this.sockets) {
+            if (
+                socket.projectId === projectId &&
+                socket.isConnected &&
+                socket.joinedDocuments.has(docId)
+            ) {
+                socket.handlers.onFileChanged?.({
+                    doc: docId,
+                    v: version,
+                    op: clone(operations),
+                }, {publicId: socket.publicId, generation: socket.generation});
+            }
+        }
+    }
+
     async receiveUpdate(
         sender: DeterministicSocket,
         docId: string,
         update: CapturedUpdate['update'],
     ): Promise<void> {
         const captured = clone(update);
+        const sourcePublicId = sender.publicId;
         this.capturedUpdates.push({
             projectId: sender.projectId,
             docId,
@@ -982,7 +1186,7 @@ export class DeterministicRealtimeServer {
         }
 
         if (updateFault === 'after-apply') {
-            this.applyQueuedUpdate(sender, docId, captured, true);
+            this.applyQueuedUpdate(sender, docId, captured, true, undefined, sourcePublicId);
             // Let the request report its outcome-unknown transport error before
             // the VFS version waiter sees any secondary disconnect signal.
             sender.dropAcknowledgementConnection();
@@ -993,19 +1197,53 @@ export class DeterministicRealtimeServer {
             );
         }
 
+        if (updateFault === 'partial-enqueue') {
+            const document = this.document(sender.projectId, docId);
+            const queuedBaseContent = document.content;
+            const queuedDesiredContent = applyTextOperations(document.content, captured.op);
+            this.retainedPayloads.push(() => this.applyQueuedUpdate(
+                sender,
+                docId,
+                captured,
+                true,
+                {
+                    baseVersion: captured.v,
+                    baseContent: queuedBaseContent,
+                    desiredContent: queuedDesiredContent,
+                },
+                sourcePublicId,
+            ));
+            // The official server forces transport disconnect before attempting
+            // its callback, so this partial Redis enqueue has no delivered ACK.
+            sender.disconnect();
+            throw new SocketRequestError(
+                'disconnected',
+                'The payload was queued but its notification enqueue failed',
+                true,
+            );
+        }
+
+        while (this.retainedPayloads.length > 0) {
+            this.retainedPayloads.shift()!();
+        }
+
         // Overleaf's applyOtUpdate callback acknowledges queueing. The later
         // otUpdateApplied event is the sender's authoritative commit boundary.
         // Keep those phases independently observable in every normal fixture run.
         this.queueAcknowledgementCount += 1;
         const document = this.document(sender.projectId, docId);
-        const queuedBaseContent = document.content;
-        const queuedDesiredContent = applyTextOperations(document.content, captured.op);
+        const queued = captured.v === document.version ? {
+            baseVersion: captured.v,
+            baseContent: document.content,
+            desiredContent: applyTextOperations(document.content, captured.op),
+        } : undefined;
         const apply = () => this.applyQueuedUpdate(
             sender,
             docId,
             captured,
             false,
-            {baseContent: queuedBaseContent, desiredContent: queuedDesiredContent},
+            queued,
+            sourcePublicId,
         );
         if (this.holdNextQueuedApplication) {
             this.holdNextQueuedApplication = false;
@@ -1020,7 +1258,8 @@ export class DeterministicRealtimeServer {
         docId: string,
         update: CapturedUpdate['update'],
         omitSenderConfirmation: boolean,
-        queued?: {baseContent: string, desiredContent: string},
+        queued?: {baseVersion: number, baseContent: string, desiredContent: string},
+        sourcePublicId = sender.publicId,
     ): void {
         const document = this.document(sender.projectId, docId);
         let effectiveUpdate = update;
@@ -1030,7 +1269,9 @@ export class DeterministicRealtimeServer {
                 update.dupIfSource?.includes(application.publicId)
             );
             if (duplicate) {
-                if (!omitSenderConfirmation) {
+                if (!omitSenderConfirmation
+                    && sender.isConnected
+                    && sender.publicId === sourcePublicId) {
                     this.senderConfirmationCount += 1;
                     sender.handlers.onFileChanged?.(
                         {doc: docId, v: Math.max(update.v, document.version - 1)},
@@ -1047,29 +1288,35 @@ export class DeterministicRealtimeServer {
                 );
             }
             this.transformHeldApplication = false;
-            const transformed = prepareDocumentUpdate(
-                queued.baseContent,
-                document.content,
-                queued.desiredContent,
-            );
-            if (!transformed.mergeApplied || transformed.operations.length === 0) {
+            const intervening = document.history
+                .filter(entry => entry.version >= queued.baseVersion && entry.version < document.version)
+                .sort((left, right) => left.version - right.version);
+            if (intervening.length !== document.version - queued.baseVersion) {
                 throw new SocketRequestError(
                     'server_error',
-                    'Queued update could not be transformed deterministically',
+                    'Queued update has incomplete remote ancestry',
                     false,
+                );
+            }
+            let transformedOperations = clone(update.op ?? []);
+            for (const entry of intervening) {
+                [, transformedOperations] = oracleTransformPair(
+                    entry.operations,
+                    transformedOperations,
                 );
             }
             effectiveUpdate = {
                 ...update,
                 v: document.version,
-                op: transformed.operations,
+                op: transformedOperations,
             };
         }
 
         const version = document.version;
         document.content = applyTextOperations(document.content, effectiveUpdate.op);
+        document.history.push({version, operations: clone(effectiveUpdate.op ?? [])});
         document.version += 1;
-        document.applications.push({version, publicId: sender.publicId});
+        document.applications.push({version, publicId: sourcePublicId});
         this.logicalApplyCount += 1;
 
         for (const socket of this.sockets) {
@@ -1202,11 +1449,32 @@ export async function createEventWiredProviderProject(options: {
     };
 }
 
+function oneTextChange(before: string, after: string): HarnessTextChange {
+    let prefix = 0;
+    while (prefix < before.length
+        && prefix < after.length
+        && before[prefix] === after[prefix]) {
+        prefix += 1;
+    }
+    let suffix = 0;
+    while (suffix < before.length - prefix
+        && suffix < after.length - prefix
+        && before[before.length - suffix - 1] === after[after.length - suffix - 1]) {
+        suffix += 1;
+    }
+    return {
+        rangeOffset: prefix,
+        rangeLength: before.length - prefix - suffix,
+        text: after.slice(prefix, after.length - suffix),
+    };
+}
+
 export class SimulatedDirtyEditor {
     dirty = true;
     closed = false;
     version = 1;
     private currentText: string;
+    private pendingChange?: HarnessTextChange;
     readonly document: {
         uri: UriStub,
         readonly isDirty: boolean,
@@ -1268,7 +1536,12 @@ export class SimulatedDirtyEditor {
         this.currentText = desiredText;
         this.dirty = desiredText !== baseText;
         this.version += 1;
-        vfs.observeTextDocument(this.document);
+        const change = oneTextChange(baseText, desiredText);
+        vfs.observeChangedTextDocument({
+            document: this.document,
+            contentChanges: [change],
+        });
+        this.pendingChange = undefined;
     }
 
     async reloadAuthoritative(vfs: any, authoritativeText: string): Promise<void> {
@@ -1296,9 +1569,11 @@ export class SimulatedDirtyEditor {
     }
 
     edit(text: string): void {
+        const before = this.currentText;
         this.currentText = text;
         this.dirty = true;
         this.version += 1;
+        this.pendingChange = oneTextChange(before, text);
     }
 
     openClean(events: ProductionWorkspaceEventHarness, text = this.currentText): void {
@@ -1312,14 +1587,34 @@ export class SimulatedDirtyEditor {
 
     editThroughEvents(text: string, events: ProductionWorkspaceEventHarness): void {
         this.edit(text);
-        events.fireDidChange(this.document);
+        events.fireDidChange(this.document, [this.pendingChange!]);
+        this.pendingChange = undefined;
+    }
+
+    replaceRangeThroughEvents(
+        rangeOffset: number,
+        rangeLength: number,
+        text: string,
+        events: ProductionWorkspaceEventHarness,
+    ): void {
+        const before = this.currentText;
+        assert.ok(rangeOffset >= 0 && rangeOffset + rangeLength <= before.length);
+        this.currentText = before.slice(0, rangeOffset)
+            + text
+            + before.slice(rangeOffset + rangeLength);
+        this.dirty = true;
+        this.version += 1;
+        events.fireDidChange(this.document, [{rangeOffset, rangeLength, text}]);
+        this.pendingChange = undefined;
     }
 
     refreshThroughEvents(text: string, events: ProductionWorkspaceEventHarness): void {
+        const before = this.currentText;
         this.currentText = text;
         this.dirty = false;
         this.version += 1;
-        events.fireDidChange(this.document);
+        events.fireDidChange(this.document, [oneTextChange(before, text)]);
+        this.pendingChange = undefined;
     }
 
     closeThroughEvents(events: ProductionWorkspaceEventHarness): void {
@@ -1333,9 +1628,15 @@ export class SimulatedDirtyEditor {
         provider: any,
         events: ProductionWorkspaceEventHarness,
         options: {create: boolean, overwrite: boolean} = {create: false, overwrite: true},
+        afterWillSave?: () => void | Promise<void>,
     ): Promise<{saved: boolean, error?: unknown}> {
         try {
+            if (this.pendingChange) {
+                events.fireDidChange(this.document, [this.pendingChange]);
+                this.pendingChange = undefined;
+            }
             events.fireWillSave(this.document);
+            await afterWillSave?.();
             await provider.writeFile(
                 this.uri,
                 new TextEncoder().encode(this.currentText),
@@ -1351,7 +1652,15 @@ export class SimulatedDirtyEditor {
 
     async save(vfs: any): Promise<{saved: boolean, error?: unknown}> {
         try {
-            vfs.observeTextDocument(this.document);
+            if (this.pendingChange) {
+                vfs.observeChangedTextDocument({
+                    document: this.document,
+                    contentChanges: [this.pendingChange],
+                });
+                this.pendingChange = undefined;
+            } else {
+                vfs.observeTextDocument(this.document);
+            }
             vfs.observeWillSaveTextDocument(this.document);
             await vfs.writeFile(this.uri, new TextEncoder().encode(this.currentText), false, true);
             this.dirty = false;

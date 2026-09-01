@@ -179,6 +179,7 @@ class TestTextDocument {
     isClosed = false;
     version = 1;
     saveHandler?: () => Promise<boolean>;
+    private lastChange?: {rangeOffset: number, rangeLength: number, text: string};
 
     constructor(readonly uri: TestUri, private text: string) {}
 
@@ -188,6 +189,24 @@ class TestTextDocument {
 
     setDirtyText(text: string): void {
         if (this.text !== text) {
+            const before = this.text;
+            let prefix = 0;
+            while (prefix < before.length
+                && prefix < text.length
+                && before[prefix] === text[prefix]) {
+                prefix += 1;
+            }
+            let suffix = 0;
+            while (suffix < before.length - prefix
+                && suffix < text.length - prefix
+                && before[before.length - suffix - 1] === text[text.length - suffix - 1]) {
+                suffix += 1;
+            }
+            this.lastChange = {
+                rangeOffset: prefix,
+                rangeLength: before.length - prefix - suffix,
+                text: text.slice(prefix, text.length - suffix),
+            };
             this.text = text;
             this.version += 1;
         }
@@ -196,6 +215,13 @@ class TestTextDocument {
 
     markClean(): void {
         this.isDirty = false;
+        this.lastChange = undefined;
+    }
+
+    takeContentChanges(): Array<{rangeOffset: number, rangeLength: number, text: string}> {
+        const change = this.lastChange;
+        this.lastChange = undefined;
+        return change ? [change] : [];
     }
 
     positionAt(offset: number): number {
@@ -330,11 +356,13 @@ function makeHarness(options: HarnessOptions = {}): Harness {
         pendingReadTickets: new Map(),
         boundReadCandidates: new Map(),
         activeEditorBases: new Map(),
+        remoteDocumentCausality: new Map(),
         documentIdsByPath: new Map([[uri.toString(), docId]]),
         editorBufferIds: new WeakMap(),
         editorBuffers: new Map(),
         editorSaveIntents: new Map(),
         unboundEditorSaveIntents: new WeakMap(),
+        unboundEditorIncarnations: new WeakSet(),
         editorSaveReceipts: new Map(),
         recoveryNotifications: new Set(),
         provenanceStore: store,
@@ -373,10 +401,12 @@ function makeHarness(options: HarnessOptions = {}): Harness {
         joinFreshDocumentSession: async () => {
             doc.version = remoteVersion;
             doc.remoteCache = remoteText;
+            vfs.startRemoteCausality(docId, remoteVersion, remoteText, 1);
             return {doc, content: remoteText};
         },
         showDocumentRecovery: () => {},
     });
+    vfs.startRemoteCausality(docId, remoteVersion, remoteText, 1);
     const identity: DocumentProvenanceIdentity = {
         canonicalServerUrl: 'https://example.test',
         userId,
@@ -409,11 +439,22 @@ function makeHarness(options: HarnessOptions = {}): Harness {
 
 async function write(harness: Harness, text: string): Promise<void> {
     harness.document.setDirtyText(text);
-    harness.vfs.observeTextDocument(harness.document);
+    const contentChanges = harness.document.takeContentChanges();
+    if (contentChanges.length > 0) {
+        harness.vfs.observeChangedTextDocument({document: harness.document, contentChanges});
+    } else {
+        harness.vfs.observeTextDocument(harness.document);
+    }
     harness.vfs.observeWillSaveTextDocument(harness.document);
     await harness.vfs.writeFileNow(harness.uri, new TextEncoder().encode(text), false, true);
     harness.document.markClean();
     harness.vfs.observeTextDocument(harness.document);
+}
+
+function observeDirtyChange(harness: Harness): void {
+    const contentChanges = harness.document.takeContentChanges();
+    assert.equal(contentChanges.length, 1, 'the fixture must expose one actual editor change');
+    harness.vfs.observeChangedTextDocument({document: harness.document, contentChanges});
 }
 
 async function confirmBase(harness: Harness, text: string): Promise<string> {
@@ -887,6 +928,57 @@ describe('remote document exact-base write gate', () => {
         }
     });
 
+    it('blocks a multi-change editor transaction without sending OT', async () => {
+        const harness = makeHarness({remoteText: 'abc', remoteVersion: 7});
+        await confirmBase(harness, 'abc');
+        harness.document.setDirtyText('XabcY');
+        harness.document.takeContentChanges();
+        harness.vfs.observeChangedTextDocument({
+            document: harness.document,
+            contentChanges: [
+                {rangeOffset: 0, rangeLength: 0, text: 'X'},
+                {rangeOffset: 3, rangeLength: 0, text: 'Y'},
+            ],
+        });
+        harness.vfs.observeWillSaveTextDocument(harness.document);
+
+        await assert.rejects(
+            harness.vfs.writeFileNow(
+                harness.uri,
+                new TextEncoder().encode('XabcY'),
+                false,
+                true,
+            ),
+            /editor change events do not prove the exact local operation/i,
+        );
+        assert.equal(harness.submissions.length, 0);
+        assert.equal(harness.getRemoteText(), 'abc');
+        assert.equal(harness.document.isDirty, true);
+    });
+
+    it('blocks a missed editor version without sending OT', async () => {
+        const harness = makeHarness({remoteText: 'abc', remoteVersion: 7});
+        await confirmBase(harness, 'abc');
+        harness.document.setDirtyText('abcL');
+        const contentChanges = harness.document.takeContentChanges();
+        harness.document.version += 1;
+        harness.vfs.observeChangedTextDocument({document: harness.document, contentChanges});
+        harness.vfs.observeWillSaveTextDocument(harness.document);
+
+        await assert.rejects(
+            harness.vfs.writeFileNow(
+                harness.uri,
+                new TextEncoder().encode('abcL'),
+                false,
+                true,
+            ),
+            /editor change events do not prove the exact local operation/i,
+        );
+        assert.equal(harness.submissions.length, 0);
+        assert.equal(harness.getRemoteText(), 'abc');
+        assert.equal(harness.document.isDirty, true);
+    });
+
     it('promotes only an explicitly confirmed clean provider read and persists the later dirty editor text', async () => {
         const harness = makeHarness({remoteText: 'clean base', remoteVersion: 7});
         harness.vfs.stageEditorBase(harness.uri, harness.doc, 'clean base');
@@ -895,7 +987,7 @@ describe('remote document exact-base write gate', () => {
         assert.equal(harness.vfs.activeEditorBases.has(bufferId), false);
         assert.equal(await harness.vfs.confirmEditorBase(harness.document), true);
         harness.document.setDirtyText('dirty edit');
-        harness.vfs.observeTextDocument(harness.document);
+        observeDirtyChange(harness);
         await harness.store.flush();
 
         const active = harness.vfs.activeEditorBases.get(bufferId);
@@ -979,7 +1071,7 @@ describe('remote document exact-base write gate', () => {
         const harness = makeHarness({remoteText: 'hello', remoteVersion: 7});
         const bufferId = await confirmBase(harness, 'hello');
         harness.document.setDirtyText('hello world');
-        harness.vfs.observeTextDocument(harness.document);
+        observeDirtyChange(harness);
         harness.vfs.observeWillSaveTextDocument(harness.document);
         let advanced = false;
         harness.storage.afterWrite = (_name, bytes) => {
@@ -994,7 +1086,7 @@ describe('remote document exact-base write gate', () => {
                 || record.baseText !== 'hello world') { return; }
             advanced = true;
             harness.document.setDirtyText('hello world + next local edit');
-            harness.vfs.observeTextDocument(harness.document);
+            observeDirtyChange(harness);
         };
 
         await harness.vfs.writeFileNow(
@@ -1012,7 +1104,6 @@ describe('remote document exact-base write gate', () => {
         assert.equal(active?.version, 8);
         assert.equal(active?.content, 'hello world');
 
-        harness.vfs.observeTextDocument(harness.document);
         await harness.store.flush();
         assert.equal(typeof active?.recordName, 'string');
         const persisted = await harness.store.resolveCurrentRecord(active.recordName, {
@@ -1026,14 +1117,18 @@ describe('remote document exact-base write gate', () => {
 
         harness.storage.afterWrite = undefined;
         harness.vfs.observeWillSaveTextDocument(harness.document);
-        await harness.vfs.writeFileNow(
-            harness.uri,
-            new TextEncoder().encode('hello world + next local edit'),
-            false,
-            true,
+        await assert.rejects(
+            harness.vfs.writeFileNow(
+                harness.uri,
+                new TextEncoder().encode('hello world + next local edit'),
+                false,
+                true,
+            ),
+            /editor change events do not prove the exact local operation/i,
         );
-        assert.equal(harness.submissions.length, 2, 'only the later edit may produce the second OT');
-        assert.equal(harness.getRemoteText(), 'hello world + next local edit');
+        assert.equal(harness.submissions.length, 1, 'the cleanup-window edit must not be inferred from snapshots');
+        assert.equal(harness.getRemoteText(), 'hello world');
+        assert.equal(harness.document.isDirty, true);
     });
 
     it('retries confirmed-state persistence without resending the acknowledged OT', async () => {
@@ -1197,6 +1292,11 @@ describe('remote document exact-base write gate', () => {
             remoteText: 'local edit',
             remoteVersion: 8,
         });
+        afterAckLoss.vfs.stageEditorBase(
+            afterAckLoss.uri,
+            afterAckLoss.doc,
+            'local edit',
+        );
         await write(afterAckLoss, 'local edit');
         assert.equal(afterAckLoss.submissions.length, 0);
         const retainedForeignRecords = await appliedStorage.list();

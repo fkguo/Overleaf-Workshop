@@ -137,6 +137,32 @@ describe('requestWithAck', () => {
         );
     });
 
+    it('keeps disconnect outcome-unknown when a server-error ACK closure runs late', async () => {
+        const socket = new FakeSocket();
+        const request = requestWithAck(
+            socket,
+            'applyOtUpdate',
+            ['doc-id', {v: 1, op: [{p: 0, i: 'x'}]}],
+            50,
+            3,
+            generation => generation === 3,
+        );
+        const lateAcknowledgement = socket.acks[1];
+        assert.equal(typeof lateAcknowledgement, 'function');
+
+        socket.disconnect();
+        lateAcknowledgement('notification queue failed');
+
+        await assert.rejects(
+            request,
+            (error: unknown) => error instanceof SocketRequestError
+                && error.code === 'disconnected'
+                && error.outcomeUnknown,
+        );
+        assert.equal(Object.keys(socket.acks).length, 0);
+        assert.equal(socket.listenerCount('disconnect'), 0);
+    });
+
     it('ignores a late acknowledgement from an older generation', async () => {
         const socket = new FakeSocket();
         let currentGeneration = 4;
