@@ -7,6 +7,7 @@ import {
     createVirtualProject,
     DeterministicRealtimeServer,
     HarnessStorage,
+    LooseJoinDocResponse,
     openAuthoritativeText,
     resetHarnessDocuments,
     resetHarnessRuntime,
@@ -59,9 +60,219 @@ function replaceAt(content: string, from: string, to: string): TextOperation[] {
     ];
 }
 
+async function assertJoinCatchUpFailsClosed(
+    label: string,
+    response: LooseJoinDocResponse,
+): Promise<void> {
+    const authoritative = 'aXbc';
+    const local = 'LOCAL';
+    const server = new DeterministicRealtimeServer();
+    addProject(server, authoritative, PROJECT_A, label, 10);
+    const harness = await createEventWiredProviderProject({
+        server,
+        storage: new HarnessStorage(),
+        windowId: label,
+        projectId: PROJECT_A,
+    });
+    server.injectNextJoinDocResponse(PROJECT_A, 'same-doc-id', response);
+    server.injectNextJoinDocResponse(PROJECT_A, 'same-doc-id', response);
+
+    try {
+        let staleRead: string | undefined;
+        try {
+            staleRead = new TextDecoder().decode(await harness.provider.readFile(harness.uri));
+        } catch {
+            staleRead = undefined;
+        }
+        const editor = new SimulatedDirtyEditor(harness.uri, staleRead ?? local);
+        if (staleRead === undefined) {
+            editor.attach();
+        } else {
+            // On the vulnerable implementation the malformed catch-up is
+            // silently dropped on both joins, binding abc@9 before this edit.
+            // Continue through the public lifecycle so the regression observes
+            // the resulting stale wire attempt before asserting failure.
+            harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
+            editor.openClean(harness.events);
+            await settleAsyncWork();
+            await settleAsyncWork();
+            editor.editThroughEvents(local, harness.events);
+        }
+        const result = await editor.saveThroughProvider(harness.provider, harness.events);
+
+        assert.equal(staleRead, undefined);
+        assert.equal(result.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), local);
+        assert.equal(server.joinDocCallCount, 1);
+        assert.equal(server.capturedUpdates.length, 0);
+        assert.equal(server.text(PROJECT_A), authoritative);
+        assert.equal(server.version(PROJECT_A), 10);
+    } finally {
+        harness.dispose();
+    }
+}
+
 describe('stale-buffer rollback safety', () => {
     beforeEach(() => resetHarnessDocuments());
     after(() => resetHarnessRuntime());
+
+    it('rejects a string-version join catch-up before a dirty public save can emit OT', async () => {
+        await assertJoinCatchUpFailsClosed('malformed-join-version', {
+            docLines: ['abc'],
+            version: 9,
+            updates: [{v: '9', op: [{p: 1, i: 'X'}]}],
+            ranges: {},
+        });
+    });
+
+    it('rejects a malformed outer join catch-up before a dirty public save can emit OT', async () => {
+        await assertJoinCatchUpFailsClosed('malformed-join-outer', {
+            docLines: ['abc'],
+            version: 9,
+            updates: [null],
+            ranges: {},
+        });
+    });
+
+    it('rejects a revision gap in join catch-up before a dirty public save can emit OT', async () => {
+        await assertJoinCatchUpFailsClosed('gapped-join-catch-up', {
+            docLines: ['abc'],
+            version: 9,
+            updates: [{doc: 'same-doc-id', v: 10, op: [{p: 1, i: 'X'}]}],
+            ranges: {},
+        });
+    });
+
+    it('rejects conflicting duplicate join revisions before a dirty public save can emit OT', async () => {
+        await assertJoinCatchUpFailsClosed('duplicate-join-catch-up', {
+            docLines: ['abc'],
+            version: 9,
+            updates: [
+                {doc: 'same-doc-id', v: 9, op: [{p: 1, i: 'X'}]},
+                {doc: 'same-doc-id', v: 9, op: [{p: 1, i: 'Y'}]},
+            ],
+            ranges: {},
+        });
+    });
+
+    it('rejects malformed join operation components before a dirty public save can emit OT', async () => {
+        await assertJoinCatchUpFailsClosed('malformed-join-component', {
+            docLines: ['abc'],
+            version: 9,
+            updates: [{doc: 'same-doc-id', v: 9, op: [{p: '1', i: 'X'}]}],
+            ranges: {},
+        });
+    });
+
+    it('rejects join catch-up that cannot replay against its snapshot', async () => {
+        await assertJoinCatchUpFailsClosed('unreplayable-join-catch-up', {
+            docLines: ['abc'],
+            version: 9,
+            updates: [{doc: 'same-doc-id', v: 9, op: [{p: 0, d: 'zzz'}]}],
+            ranges: {},
+        });
+    });
+
+    it('rejects an operation revision that predates the join snapshot', async () => {
+        await assertJoinCatchUpFailsClosed('pre-anchor-join-operation', {
+            docLines: ['abc'],
+            version: 9,
+            updates: [{v: 8, op: [{p: 0, d: 'zzz'}]}],
+            ranges: {},
+        });
+    });
+
+    it('rejects an op-less revision that predates the join snapshot', async () => {
+        await assertJoinCatchUpFailsClosed('pre-anchor-join-confirmation', {
+            docLines: ['abc'],
+            version: 9,
+            updates: [{v: 8}],
+            ranges: {},
+        });
+    });
+
+    it('replays a response/live duplicate once as the public editor authority', async () => {
+        const authoritative = 'aXbc';
+        const desired = 'aXbc!';
+        const response: LooseJoinDocResponse = {
+            docLines: ['abc'],
+            version: 9,
+            updates: [{v: 9, op: [{p: 1, i: 'X'}]}],
+            ranges: {},
+        };
+        const server = new DeterministicRealtimeServer();
+        addProject(server, authoritative, PROJECT_A, 'Valid Join Catch-Up', 10);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'valid-join-catch-up',
+            projectId: PROJECT_A,
+        });
+        server.injectNextJoinDocResponse(PROJECT_A, 'same-doc-id', response);
+        server.injectNextJoinDocResponse(PROJECT_A, 'same-doc-id', response);
+        server.injectNextJoinLiveUpdate(PROJECT_A, 'same-doc-id', {
+            doc: 'same-doc-id',
+            v: 9,
+            op: [{p: 1, i: 'X'}],
+        });
+        server.injectNextJoinLiveUpdate(PROJECT_A, 'same-doc-id', {
+            doc: 'same-doc-id',
+            v: 9,
+            op: [{p: 1, i: 'X'}],
+        });
+
+        try {
+            assert.equal(
+                new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
+                authoritative,
+            );
+            harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
+            const editor = new SimulatedDirtyEditor(harness.uri, authoritative);
+            editor.openClean(harness.events);
+            await settleAsyncWork();
+            await settleAsyncWork();
+
+            editor.editThroughEvents(desired, harness.events);
+            const result = await editor.saveThroughProvider(harness.provider, harness.events);
+
+            assert.equal(result.saved, true);
+            assert.equal(editor.dirty, false);
+            assert.equal(server.capturedUpdates.length, 1);
+            assert.equal(server.capturedUpdates[0].update.v, 10);
+            assert.deepEqual(server.capturedUpdates[0].update.op, [{p: 4, i: '!'}]);
+            assert.equal(server.text(PROJECT_A), desired);
+            assert.equal(server.version(PROJECT_A), 11);
+        } finally {
+            harness.dispose();
+        }
+    });
+
+    it('keeps direct VFS document creation unavailable without remote mutation', async () => {
+        const server = new DeterministicRealtimeServer();
+        addProject(server, 'authoritative', PROJECT_A, 'Direct Creation Disabled', 7);
+        const harness = createHarness(server);
+
+        for (const [name, content] of [
+            ['empty.tex', new Uint8Array(0)],
+            ['nonempty.tex', new TextEncoder().encode('local text')],
+        ] as const) {
+            const uri = harness.uri.with({path: `/Direct Creation Disabled/${name}`});
+            await assert.rejects(
+                harness.vfs.createFile(uri, content, true),
+                (error: any) => error?.code === 'Unavailable',
+            );
+        }
+
+        assert.equal(server.addDocCallCount, 0);
+        assert.equal(server.uploadFileCallCount, 0);
+        assert.equal(server.documentCreationCount, 0);
+        assert.equal(server.projectEntitiesReadCount, 0);
+        assert.equal(server.joinDocCallCount, 0);
+        assert.equal(server.capturedUpdates.length, 0);
+        assert.equal(server.text(PROJECT_A), 'authoritative');
+        assert.equal(server.version(PROJECT_A), 7);
+    });
 
     it('wires a clean provider read through open, edit, and public writeFile', async () => {
         const base = 'alpha omega';

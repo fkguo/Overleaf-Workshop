@@ -25,6 +25,20 @@ export type CapturedUpdate = {
     },
 };
 
+export type LooseJoinDocResponse = {
+    docLines?: unknown,
+    version?: unknown,
+    updates?: unknown,
+    ranges?: unknown,
+    [key: string]: unknown,
+};
+
+type InjectedJoinLiveUpdate = {
+    doc: string,
+    v: number,
+    op?: TextOperation[],
+};
+
 type EventHandlers = {
     onConnectionAccepted?: (publicId: string) => void,
     onProjectJoined?: (session: {
@@ -873,6 +887,18 @@ class DeterministicSocket {
     async joinDoc(docId: string) {
         const document = this.server.document(this.projectId, docId);
         this.joinedDocuments.add(docId);
+        this.server.joinDocCallCount += 1;
+        const injected = this.server.consumeNextJoinDocResponse(this.projectId, docId);
+        const liveUpdate = this.server.consumeNextJoinLiveUpdate(this.projectId, docId);
+        if (liveUpdate) {
+            this.handlers.onFileChanged?.(
+                liveUpdate,
+                {publicId: this.publicId, generation: this.generation},
+            );
+        }
+        if (injected !== undefined) {
+            return injected;
+        }
         return {
             docLines: document.content.split('\n'),
             version: document.version,
@@ -928,6 +954,7 @@ export class DeterministicRealtimeServer {
     addDocCallCount = 0;
     uploadFileCallCount = 0;
     projectEntitiesReadCount = 0;
+    joinDocCallCount = 0;
     private readonly projects = new Map<string, StoredProject>();
     private readonly sockets = new Set<DeterministicSocket>();
     private publicIdSequence = 0;
@@ -936,6 +963,16 @@ export class DeterministicRealtimeServer {
     private holdNextQueuedApplication = false;
     private heldApplication: (() => void) | undefined;
     private transformHeldApplication = false;
+    private readonly nextJoinDocResponses: Array<{
+        projectId: string,
+        docId: string,
+        response: LooseJoinDocResponse,
+    }> = [];
+    private readonly nextJoinLiveUpdates: Array<{
+        projectId: string,
+        docId: string,
+        update: InjectedJoinLiveUpdate,
+    }> = [];
 
     addProject(spec: {
         projectId: string,
@@ -976,6 +1013,40 @@ export class DeterministicRealtimeServer {
 
     removeSocket(socket: DeterministicSocket): void {
         this.sockets.delete(socket);
+    }
+
+    injectNextJoinDocResponse(
+        projectId: string,
+        docId: string,
+        response: LooseJoinDocResponse,
+    ): void {
+        this.nextJoinDocResponses.push({projectId, docId, response: clone(response)});
+    }
+
+    consumeNextJoinDocResponse(projectId: string, docId: string): LooseJoinDocResponse | undefined {
+        const injected = this.nextJoinDocResponses[0];
+        if (!injected || injected.projectId !== projectId || injected.docId !== docId) {
+            return undefined;
+        }
+        this.nextJoinDocResponses.shift();
+        return clone(injected.response);
+    }
+
+    injectNextJoinLiveUpdate(
+        projectId: string,
+        docId: string,
+        update: InjectedJoinLiveUpdate,
+    ): void {
+        this.nextJoinLiveUpdates.push({projectId, docId, update: clone(update)});
+    }
+
+    consumeNextJoinLiveUpdate(projectId: string, docId: string): InjectedJoinLiveUpdate | undefined {
+        const injected = this.nextJoinLiveUpdates[0];
+        if (!injected || injected.projectId !== projectId || injected.docId !== docId) {
+            return undefined;
+        }
+        this.nextJoinLiveUpdates.shift();
+        return clone(injected.update);
     }
 
     projectSnapshot(projectId: string) {

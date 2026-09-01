@@ -119,8 +119,16 @@ type DocumentVersionWaiter = {
 };
 
 type ReceivedDocumentUpdate = {
-    update: UpdateSchema,
+    update: unknown,
     sender?: ProjectSenderWitness,
+};
+
+type PreparedDocumentJoin = {
+    anchorVersion: number,
+    anchorContent: string,
+    headVersion: number,
+    headContent: string,
+    updates: Map<number, TextOperation[]>,
 };
 
 type PendingDocumentUpdate = {
@@ -240,6 +248,10 @@ export class File implements vscode.FileStat {
     }
 }
 
+function isPlainObject(value: unknown): value is {[key: string]: unknown} {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 export function parseUri(uri: vscode.Uri) {
     return parseProjectUri(uri.authority, uri.path, uri.query);
 }
@@ -261,7 +273,11 @@ export class VirtualFileSystem extends vscode.Disposable {
     private connectionRequested = false;
     private documentWrites = new Map<string, Promise<void>>();
     private documentJoinTasks = new Map<string, Promise<{doc: DocumentEntity, content: string}>>();
-    private joiningDocuments = new Map<string, {generation: number, updates: ReceivedDocumentUpdate[]}>();
+    private joiningDocuments = new Map<string, {
+        generation: number,
+        updates: ReceivedDocumentUpdate[],
+        invalid?: Error,
+    }>();
     private documentVersionWaiters = new Map<string, Set<DocumentVersionWaiter>>();
     private pendingDocumentUpdates = new Map<string, PendingDocumentUpdate>();
     private stagedEditorBases = new Map<string, StagedEditorBase>();
@@ -606,6 +622,26 @@ export class VirtualFileSystem extends vscode.Disposable {
             valid: true,
         };
         this.remoteDocumentCausality.set(docId, ledger);
+        return ledger;
+    }
+
+    private startPreparedRemoteCausality(
+        docId: string,
+        prepared: PreparedDocumentJoin,
+        socketGeneration: number,
+    ): RemoteDocumentCausality {
+        const ledger = this.startRemoteCausality(
+            docId,
+            prepared.anchorVersion,
+            prepared.anchorContent,
+            socketGeneration,
+        );
+        ledger.headVersion = prepared.headVersion;
+        ledger.headContent = prepared.headContent;
+        ledger.updates = new Map([...prepared.updates].map(([version, operations]) => [
+            version,
+            operations.map(operation => ({...operation})),
+        ]));
         return ledger;
     }
 
@@ -2020,10 +2056,19 @@ export class VirtualFileSystem extends vscode.Disposable {
             throw new Error('Realtime update has no text operation');
         }
         return update.op.map(operation => {
-            if (typeof operation.i === 'string' && operation.d === undefined) {
+            if (!isPlainObject(operation)
+                || !Number.isInteger(operation.p)
+                || (operation.p as number) < 0) {
+                throw new Error('Malformed realtime text operation');
+            }
+            if (typeof operation.i === 'string'
+                && operation.i.length > 0
+                && operation.d === undefined) {
                 return {p: operation.p, i: operation.i};
             }
-            if (typeof operation.d === 'string' && operation.i === undefined) {
+            if (typeof operation.d === 'string'
+                && operation.d.length > 0
+                && operation.i === undefined) {
                 return {
                     p: operation.p,
                     d: Buffer.from(operation.d, 'ascii').toString('utf-8'),
@@ -2033,6 +2078,25 @@ export class VirtualFileSystem extends vscode.Disposable {
         });
     }
 
+    private snapshotReceivedDocumentUpdate(
+        update: unknown,
+        sender?: ProjectSenderWitness,
+    ): ReceivedDocumentUpdate {
+        if (!isPlainObject(update)) {
+            return {update, sender: sender ? {...sender} : undefined};
+        }
+        const snapshot: {[key: string]: unknown} = {...update};
+        if (Array.isArray(update.op)) {
+            snapshot.op = update.op.map(operation =>
+                isPlainObject(operation) ? {...operation} : operation
+            );
+        }
+        return {
+            update: snapshot,
+            sender: sender ? {...sender} : undefined,
+        };
+    }
+
     private sameTextOperations(left: TextOperation[], right: TextOperation[]): boolean {
         return left.length === right.length && left.every((operation, index) => {
             const other = right[index];
@@ -2040,6 +2104,101 @@ export class VirtualFileSystem extends vscode.Disposable {
                 && operation.i === other.i
                 && operation.d === other.d;
         });
+    }
+
+    private prepareDocumentJoin(
+        docId: string,
+        response: unknown,
+        receivedUpdates: readonly ReceivedDocumentUpdate[],
+    ): PreparedDocumentJoin {
+        if (!isPlainObject(response)
+            || !Array.isArray(response.docLines)
+            || !response.docLines.every(line => typeof line === 'string')
+            || typeof response.version !== 'number'
+            || !Number.isInteger(response.version)
+            || response.version < 0
+            || !Array.isArray(response.updates)) {
+            throw new Error('Document join response has an invalid snapshot');
+        }
+
+        const anchorVersion = response.version;
+        const anchorContent = response.docLines.join('\n');
+        const responseUpdates = response.updates.map(update => ({update}));
+        const normalized = [...responseUpdates, ...receivedUpdates].map((received, index) => {
+            const update = received.update;
+            if (!isPlainObject(update)
+                || typeof update.v !== 'number'
+                || !Number.isInteger(update.v)
+                || update.v < 0) {
+                throw new Error(`Document join update ${index} has an invalid revision`);
+            }
+            const fromJoinResponse = index < responseUpdates.length;
+            if ((fromJoinResponse && update.doc !== undefined && update.doc !== docId)
+                || (!fromJoinResponse && update.doc !== docId)) {
+                throw new Error(`Document join update ${index} has an invalid document identity`);
+            }
+            if (update.v < anchorVersion) {
+                throw new Error(`Document join update ${index} predates its snapshot revision`);
+            }
+            if (update.op === undefined) {
+                return {version: update.v, operations: undefined};
+            }
+            if (!Array.isArray(update.op)) {
+                throw new Error(`Document join update ${index} has a malformed operation`);
+            }
+            const operations = this.normalizeRealtimeTextOperations({
+                ...update,
+                doc: docId,
+                v: update.v,
+                op: update.op,
+            } as UpdateSchema);
+            return {version: update.v, operations};
+        });
+
+        const uniqueUpdates = new Map<number, TextOperation[]>();
+        for (const update of normalized) {
+            if (update.operations === undefined) {
+                throw new Error('Document join contains an unproven sender confirmation');
+            }
+            const duplicate = uniqueUpdates.get(update.version);
+            if (duplicate) {
+                if (!this.sameTextOperations(duplicate, update.operations)) {
+                    throw new Error('Document join contains conflicting duplicate revisions');
+                }
+                continue;
+            }
+            uniqueUpdates.set(
+                update.version,
+                update.operations.map(operation => ({...operation})),
+            );
+        }
+
+        let headVersion = anchorVersion;
+        let headContent = anchorContent;
+        const causalUpdates = new Map<number, TextOperation[]>();
+        const revisions = [...uniqueUpdates.keys()].sort(
+            (left, right) => left - right,
+        );
+        for (const revision of revisions) {
+            if (revision !== headVersion) {
+                throw new Error('Document join catch-up revisions are not contiguous');
+            }
+            const operations = uniqueUpdates.get(revision)!;
+            headContent = applyTextOperations(headContent, operations);
+            causalUpdates.set(
+                revision,
+                operations.map(operation => ({...operation})),
+            );
+            headVersion += 1;
+        }
+
+        return {
+            anchorVersion,
+            anchorContent,
+            headVersion,
+            headContent,
+            updates: causalUpdates,
+        };
     }
 
     private applyDocumentUpdate(update: UpdateSchema, eventSender?: ProjectSenderWitness) {
@@ -2278,9 +2437,17 @@ export class VirtualFileSystem extends vscode.Disposable {
                 }
             },
             onFileChanged: (update:UpdateSchema, sender?: ProjectSenderWitness) => {
+                if (!isPlainObject(update) || typeof update.doc !== 'string') {
+                    const error = new Error('Realtime document update has no valid document identity');
+                    this.joiningDocuments.forEach(joining => {
+                        joining.invalid = error;
+                    });
+                    this.invalidateDocumentSessions(this.root);
+                    return;
+                }
                 const joining = this.joiningDocuments.get(update.doc);
                 if (joining && joining.generation === this.socket.generation) {
-                    joining.updates.push({update, sender});
+                    joining.updates.push(this.snapshotReceivedDocumentUpdate(update, sender));
                     return;
                 }
                 this.applyDocumentUpdate(update, sender);
@@ -2406,64 +2573,16 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
-    async createFile(uri: vscode.Uri, content:Uint8Array, overwrite?:boolean) {
-        await this.assertProjectWritable('Unable to create file');
-        const {parentFolder, fileName, fileEntity} = await this._resolveUri(uri);
-        if (fileEntity) {
-            if (!overwrite) {
-                throw vscode.FileSystemError.FileExists(uri);
-            }
-            throw this.mutationError(
-                `Unable to overwrite ${fileName}`,
-                'Safe overwrite is not supported for remote file uploads',
-            );
-        }
-
-        const parentFolderId = parentFolder._id;
-        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-        if (content.length===0) {
-            const response = await this.api.addDoc(identity, this.projectId, parentFolderId, fileName);
-            if (response.type !== 'success') {
-                if (await this.cachedFileMatches(uri, parentFolderId, fileName, ['doc'], content)) { return; }
-                throw this.mutationError(`Unable to create ${fileName}`, response.message);
-            }
-            if (!this.isCreatedEntity(response.entity, ['doc'])) {
-                throw this.mutationError(`Unable to create ${fileName}`, 'The server returned no document');
-            }
-            const liveParent = await this.currentFolder(parentFolderId, `Unable to create ${fileName}`);
-            const alreadyCached = Boolean(this.resolveCachedEntity(response.entity._id));
-            this.insertEntity(liveParent, response.entity._type, response.entity);
-            if (alreadyCached) { return; }
-        } else {
-            const response = await this.api.uploadFile(
-                identity,
-                this.projectId,
-                parentFolderId,
-                fileName,
-                content,
-            );
-            if (response.type !== 'success') {
-                if (await this.cachedFileMatches(
-                    uri,
-                    parentFolderId,
-                    fileName,
-                    ['doc', 'file'],
-                    content,
-                )) { return; }
-                throw this.mutationError(`Unable to upload ${fileName}`, response.message);
-            }
-            if (!this.isCreatedEntity(response.entity, ['doc', 'file'])) {
-                throw this.mutationError(`Unable to upload ${fileName}`, 'The server returned no file');
-            }
-            const liveParent = await this.currentFolder(parentFolderId, `Unable to upload ${fileName}`);
-            const alreadyCached = Boolean(this.resolveCachedEntity(response.entity._id));
-            this.insertEntity(liveParent, response.entity._type, response.entity);
-            if (alreadyCached) { return; }
-        }
-        this.notify([
-            {type: vscode.FileChangeType.Created, uri: uri},
-        ]);
-        this.markSourceDirty();
+    async createFile(
+        _uri: vscode.Uri,
+        _content: Uint8Array,
+        _overwrite?: boolean,
+    ): Promise<void> {
+        throw vscode.FileSystemError.Unavailable(
+            vscode.l10n.t(
+                'Direct remote file creation is disabled because no safe atomic creation contract is available.',
+            ),
+        );
     }
 
     async refreshLinkedFile(uri: vscode.Uri) {
@@ -2625,14 +2744,23 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     private async performDocumentJoin(docId: string): Promise<{doc: DocumentEntity, content: string}> {
         // init() is a project-ready barrier. joinDoc then creates a fresh document
-        // session for the current socket generation and supplies its authoritative
-        // version/content.
+        // session for the current socket generation. The snapshot and every
+        // catch-up packet are validated and replayed before any session state is
+        // committed.
         await this.init();
         const connectionGeneration = await this.socket.waitUntilConnected();
-        const joining = {generation: connectionGeneration, updates: [] as ReceivedDocumentUpdate[]};
+        const joining: {
+            generation: number,
+            updates: ReceivedDocumentUpdate[],
+            invalid?: Error,
+        } = {generation: connectionGeneration, updates: []};
         this.joiningDocuments.set(docId, joining);
         try {
-            const res = await this.socket.joinDoc(docId);
+            const joiningSender = this.currentSenderWitness();
+            if (!joiningSender || joiningSender.generation !== connectionGeneration) {
+                throw new Error('Document join started without a current sender witness');
+            }
+            const response: unknown = await this.socket.joinDoc(docId);
             assertCurrentConnection(
                 connectionGeneration,
                 this.socket.generation,
@@ -2641,31 +2769,64 @@ export class VirtualFileSystem extends vscode.Disposable {
             // The project tree may have been replaced while the async join was in
             // progress. Commit session state only to the current entity generation.
             const doc = this.currentDocument(docId);
-            const remoteContent = res.docLines.join('\n');
-            doc.version = res.version;
-            doc.remoteCache = remoteContent;
-            doc.lastVersion = undefined;
-            this.startRemoteCausality(
+            const queuedUpdateCount = joining.updates.length;
+            if (joining.invalid) { throw joining.invalid; }
+            const prepared = this.prepareDocumentJoin(
                 docId,
-                res.version,
-                remoteContent,
+                response,
+                joining.updates.slice(),
+            );
+            const sender = this.currentSenderWitness();
+            assertCurrentConnection(
+                connectionGeneration,
+                this.socket.generation,
+                this.socket.isConnected,
+            );
+            if (this.joiningDocuments.get(docId) !== joining
+                || joining.updates.length !== queuedUpdateCount
+                || this.currentDocument(docId) !== doc
+                || joining.invalid
+                || sender?.publicId !== joiningSender.publicId
+                || sender.generation !== joiningSender.generation) {
+                throw new Error('Document join authority changed before the causal state could be committed');
+            }
+
+            const ledger = this.startPreparedRemoteCausality(
+                docId,
+                prepared,
                 connectionGeneration,
             );
-
-            const responseUpdates = res.updates.filter((update: any) =>
-                update && typeof update.v === 'number' && (update.op === undefined || Array.isArray(update.op)),
-            ).map((update: UpdateSchema): ReceivedDocumentUpdate => ({
-                update: {...update, doc: update.doc || docId},
-            }));
-            [...responseUpdates, ...joining.updates]
-                .sort((left, right) => left.update.v - right.update.v)
-                .forEach(received => this.applyDocumentUpdate(received.update, received.sender));
-
-            const current = this.currentDocument(docId);
-            if (current.version === undefined || current.remoteCache === undefined) {
-                throw new Error('Document updates could not be reconciled with the join snapshot');
+            doc.version = prepared.headVersion;
+            doc.remoteCache = prepared.headContent;
+            doc.lastVersion = undefined;
+            if (!ledger.valid
+                || ledger.socketGeneration !== connectionGeneration
+                || ledger.anchorVersion !== prepared.anchorVersion
+                || ledger.headVersion !== doc.version
+                || ledger.headContent !== doc.remoteCache
+                || ledger.updates.size !== prepared.updates.size
+                || [...prepared.updates].some(([version, operations]) => {
+                    const recorded = ledger.updates.get(version);
+                    return !recorded || !this.sameTextOperations(recorded, operations);
+                })) {
+                throw new Error('Document join replay does not match its authoritative causal witness');
             }
-            return {doc: current, content: current.remoteCache};
+            this.joiningDocuments.delete(docId);
+            if (prepared.headVersion !== prepared.anchorVersion) {
+                this.markSourceDirty();
+                const resolved = this._resolveById(docId);
+                if (resolved) {
+                    this.notify([{
+                        type: vscode.FileChangeType.Changed,
+                        uri: this.pathToUri(resolved.path),
+                    }]);
+                }
+            }
+            return {doc, content: prepared.headContent};
+        } catch (error) {
+            const failure = error instanceof Error ? error : new Error(String(error));
+            this.invalidateDocumentSession(docId, failure);
+            throw failure;
         } finally {
             if (this.joiningDocuments.get(docId) === joining) {
                 this.joiningDocuments.delete(docId);
