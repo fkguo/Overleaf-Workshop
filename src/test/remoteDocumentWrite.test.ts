@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import {strict as assert} from 'assert';
 import {SocketRequestError} from '../api/socketRequest';
+import {RealtimeFatalError} from '../api/socketio';
 import {
     DocumentProvenanceIdentity,
     DocumentProvenanceStore,
@@ -46,6 +47,8 @@ class ValueStub {
     constructor(..._args: unknown[]) {}
 }
 
+const openTextDocuments: any[] = [];
+
 const vscodeStub = {
     Disposable: DisposableStub,
     EventEmitter: EventEmitterStub,
@@ -82,12 +85,14 @@ const vscodeStub = {
     },
     workspace: {
         workspaceFolders: undefined,
-        textDocuments: [],
-        fs: {writeFile: async () => {}},
+        textDocuments: openTextDocuments,
+        fs: {writeFile: async (..._args: any[]) => {}},
         getConfiguration: () => ({get: (_key: string, fallback: unknown) => fallback}),
         onDidOpenTextDocument: () => new DisposableStub(),
         onDidChangeTextDocument: () => new DisposableStub(),
+        onWillSaveTextDocument: () => new DisposableStub(),
         onDidSaveTextDocument: () => new DisposableStub(),
+        onDidCloseTextDocument: () => new DisposableStub(),
         registerFileSystemProvider: () => new DisposableStub(),
         createFileSystemWatcher: () => ({
             onDidCreate: () => new DisposableStub(),
@@ -97,17 +102,18 @@ const vscodeStub = {
         }),
     },
     window: {
-        showErrorMessage: async () => undefined,
-        showWarningMessage: async () => undefined,
-        showInformationMessage: async () => undefined,
-        showSaveDialog: async () => undefined,
-        showTextDocument: async () => undefined,
+        activeTextEditor: undefined as any,
+        showErrorMessage: async (..._args: any[]): Promise<any> => undefined,
+        showWarningMessage: async (..._args: any[]): Promise<any> => undefined,
+        showInformationMessage: async (..._args: any[]): Promise<any> => undefined,
+        showSaveDialog: async (..._args: any[]): Promise<any> => undefined,
+        showTextDocument: async (..._args: any[]): Promise<any> => undefined,
         withProgress: async (_options: unknown, task: () => Promise<unknown>) => task(),
         createStatusBarItem: () => ({show: () => {}, hide: () => {}, dispose: () => {}}),
         createTreeView: () => ({dispose: () => {}}),
     },
     commands: {
-        executeCommand: async () => undefined,
+        executeCommand: async (..._args: any[]): Promise<any> => undefined,
         registerCommand: () => new DisposableStub(),
     },
     languages: {
@@ -168,6 +174,39 @@ function makeUri(
     return uri;
 }
 
+class TestTextDocument {
+    isDirty = false;
+    isClosed = false;
+    version = 1;
+    saveHandler?: () => Promise<boolean>;
+
+    constructor(readonly uri: TestUri, private text: string) {}
+
+    getText(): string {
+        return this.text;
+    }
+
+    setDirtyText(text: string): void {
+        if (this.text !== text) {
+            this.text = text;
+            this.version += 1;
+        }
+        this.isDirty = true;
+    }
+
+    markClean(): void {
+        this.isDirty = false;
+    }
+
+    positionAt(offset: number): number {
+        return offset;
+    }
+
+    save(): Promise<boolean> {
+        return this.saveHandler?.() ?? Promise.resolve(false);
+    }
+}
+
 class MemoryStorage implements ProvenanceStorage {
     readonly records = new Map<string, Uint8Array>();
     beforeDelete?: () => void | Promise<void>;
@@ -207,6 +246,7 @@ type HarnessOptions = {
 type Harness = {
     vfs: any,
     uri: TestUri,
+    document: TestTextDocument,
     doc: import('../core/remoteFileSystemProvider').DocumentEntity,
     identity: DocumentProvenanceIdentity,
     storage: MemoryStorage,
@@ -242,11 +282,13 @@ function makeHarness(options: HarnessOptions = {}): Harness {
     const projectId = options.projectId ?? 'project-1';
     const userId = options.userId ?? 'user-1';
     const docId = options.docId ?? 'doc-1';
-    const protocolVersion = options.protocolVersion ?? 1;
+    const protocolVersion = options.protocolVersion ?? 2;
     const remoteVersion = options.remoteVersion ?? 7;
     let remoteText = options.remoteText ?? 'remote text';
     const uri = makeUri(`/Project/main.tex`, 'overleaf-workshop', 'server',
         `user=${userId}&project=${projectId}`);
+    const document = new TestTextDocument(uri, remoteText);
+    openTextDocuments.push(document);
     const doc: import('../core/remoteFileSystemProvider').DocumentEntity = {
         _id: docId,
         name: 'main.tex',
@@ -261,7 +303,7 @@ function makeHarness(options: HarnessOptions = {}): Harness {
         fileRefs: [],
         folders: [],
     };
-    const project = {rootFolder: [rootFolder]};
+    const project = {_id: projectId, rootFolder: [rootFolder]};
     const submissions: Array<{docId: string, update: any}> = [];
     const vfs = Object.create(remoteModule.VirtualFileSystem.prototype) as any;
     Object.assign(vfs, {
@@ -282,14 +324,26 @@ function makeHarness(options: HarnessOptions = {}): Harness {
         pendingDocumentUpdates: new Map(),
         stagedEditorBases: new Map(),
         activeEditorBases: new Map(),
-        documentIdsByPath: new Map([[uri.path, docId]]),
+        documentIdsByPath: new Map([[uri.toString(), docId]]),
+        editorBufferIds: new WeakMap(),
+        editorBuffers: new Map(),
+        editorSaveIntents: new Map(),
+        unboundEditorSaveIntents: new WeakMap(),
+        editorSaveReceipts: new Map(),
         recoveryNotifications: new Set(),
         provenanceStore: store,
         notify: () => {},
         socket: {
             generation: 1,
+            isConnected: true,
             isUsingAlternativeConnectionScheme: false,
             fatalError: undefined,
+            projectSession: {
+                publicId: 'public-1',
+                permissionsLevel: 'owner',
+                protocolVersion,
+                generation: 1,
+            },
             applyOtUpdate: async (submittedDocId: string, update: any) => {
                 submissions.push({docId: submittedDocId, update});
                 if (options.applyError && !options.applyBeforeError) { throw options.applyError; }
@@ -319,12 +373,20 @@ function makeHarness(options: HarnessOptions = {}): Harness {
         userId,
         projectId,
         docId,
+        canonicalEditorUri: JSON.stringify([
+            'overleaf-workshop',
+            'https://example.test',
+            userId,
+            projectId,
+            docId,
+        ]),
         otType: 'sharejs-text-ot',
         protocolVersion,
     };
     return {
         vfs,
         uri,
+        document,
         doc,
         identity,
         storage,
@@ -336,12 +398,27 @@ function makeHarness(options: HarnessOptions = {}): Harness {
 }
 
 async function write(harness: Harness, text: string): Promise<void> {
-    await harness.vfs.writeFileNow(
-        harness.uri,
-        new TextEncoder().encode(text),
-        false,
-        true,
-    );
+    harness.document.setDirtyText(text);
+    harness.vfs.observeTextDocument(harness.document);
+    harness.vfs.observeWillSaveTextDocument(harness.document);
+    await harness.vfs.writeFileNow(harness.uri, new TextEncoder().encode(text), false, true);
+    harness.document.markClean();
+    harness.vfs.observeTextDocument(harness.document);
+}
+
+async function confirmBase(harness: Harness, text: string): Promise<string> {
+    harness.vfs.stageEditorBase(harness.uri, harness.doc, text);
+    assert.equal(await harness.vfs.confirmEditorBase(harness.document), true);
+    const bufferId = harness.vfs.editorBufferIds.get(harness.document);
+    assert.equal(typeof bufferId, 'string');
+    return bufferId;
+}
+
+function closeHarnessDocument(harness: Harness): void {
+    harness.document.isClosed = true;
+    harness.vfs.forgetTextDocument(harness.document);
+    const index = openTextDocuments.indexOf(harness.document);
+    if (index >= 0) { openTextDocuments.splice(index, 1); }
 }
 
 async function seedColdRecord(
@@ -353,12 +430,57 @@ async function seedColdRecord(
     dirtyText: string,
 ): Promise<string> {
     const store = new DocumentProvenanceStore(storage, {sessionId, now: () => 50});
-    const record = await store.createOrUpdateCurrent({identity, baseVersion, baseText, dirtyText});
+    const record = await store.createOrUpdateCurrent({
+        identity,
+        bufferIncarnationId: `${sessionId}-buffer`,
+        baseVersion,
+        baseText,
+        dirtyText,
+    });
     await store.flush();
     return record.recordName;
 }
 
 describe('remote document exact-base write gate', () => {
+    beforeEach(() => {
+        openTextDocuments.length = 0;
+    });
+
+    it('rejects a mismatched joined project before exposing state or compiling', async () => {
+        const harness = makeHarness();
+        let compileCommands = 0;
+        const originalExecute = vscodeStub.commands.executeCommand;
+        try {
+            vscodeStub.commands.executeCommand = async (command: string) => {
+                if (command === 'overleaf-workshop.compileManager.compile') {
+                    compileCommands += 1;
+                }
+            };
+            harness.vfs.disposed = false;
+            harness.vfs.root = undefined;
+            harness.vfs.joiningProject = undefined;
+            harness.vfs.socket = {
+                fatalError: undefined,
+                needsReinit: false,
+                generation: 1,
+                isConnected: true,
+                waitUntilConnected: async () => 1,
+                joinProject: async () => ({_id: 'wrong-project', rootFolder: []}),
+            };
+
+            await assert.rejects(
+                harness.vfs.connectWithRetry(),
+                (error: unknown) => error instanceof RealtimeFatalError
+                    && error.code === 'project_unavailable',
+            );
+            assert.equal(harness.vfs.root, undefined);
+            assert.equal(harness.vfs.joiningProject, undefined);
+            assert.equal(compileCommands, 0);
+        } finally {
+            vscodeStub.commands.executeCommand = originalExecute;
+        }
+    });
+
     it('rejects a cold stale hot-exit buffer against newer remote text without submitting OT', async () => {
         const harness = makeHarness({remoteText: 'collaborator revision', remoteVersion: 12});
         await seedColdRecord(
@@ -413,13 +535,250 @@ describe('remote document exact-base write gate', () => {
         assert.equal(missingPath.submissions.length, 0);
     });
 
+    it('rejects create:false writes for both missing paths and non-document entities', async () => {
+        const missing = makeHarness();
+        missing.vfs._resolveUri = async () => ({fileType: undefined, fileEntity: undefined});
+        let missingCreateCalls = 0;
+        missing.vfs.createFile = async () => { missingCreateCalls += 1; };
+        await assert.rejects(
+            missing.vfs.writeFileNow(
+                missing.uri,
+                new TextEncoder().encode('must not be created'),
+                false,
+                true,
+            ),
+            /FileNotFound/,
+        );
+        assert.equal(missingCreateCalls, 0);
+        assert.equal(missing.submissions.length, 0);
+
+        const binary = makeHarness();
+        binary.vfs._resolveUri = async () => ({
+            fileType: 'file',
+            fileEntity: {_id: 'binary-1', name: 'image.png', _type: 'file'},
+        });
+        let binaryCreateCalls = 0;
+        binary.vfs.createFile = async () => { binaryCreateCalls += 1; };
+        await assert.rejects(
+            binary.vfs.writeFileNow(
+                binary.uri,
+                new TextEncoder().encode('must not overwrite'),
+                false,
+                true,
+            ),
+            /Only Overleaf text documents/i,
+        );
+        assert.equal(binaryCreateCalls, 0);
+        assert.equal(binary.submissions.length, 0);
+    });
+
+    it('writes recovery-copy bytes from the same editor at dialog completion', async () => {
+        const harness = makeHarness({remoteText: 'authoritative'});
+        harness.vfs.observeTextDocument(harness.document);
+        harness.document.setDirtyText('initial blocked bytes');
+        harness.vfs.observeTextDocument(harness.document);
+        const target = makeUri('/recovery.tex', 'file', '', '');
+        const writes: Array<{target: TestUri, content: Uint8Array}> = [];
+        const originalError = vscodeStub.window.showErrorMessage;
+        const originalSave = vscodeStub.window.showSaveDialog;
+        const originalWrite = vscodeStub.workspace.fs.writeFile;
+        try {
+            vscodeStub.window.showErrorMessage = async () => 'Save Recovery Copy...';
+            vscodeStub.window.showSaveDialog = async () => {
+                harness.document.setDirtyText('latest bytes at dialog completion');
+                return target;
+            };
+            vscodeStub.workspace.fs.writeFile = async (writtenTarget: TestUri, content: Uint8Array) => {
+                writes.push({target: writtenTarget, content: new Uint8Array(content)});
+            };
+            delete harness.vfs.showDocumentRecovery;
+
+            harness.vfs.showDocumentRecovery(
+                harness.uri,
+                new TextEncoder().encode('captured bytes must be ignored'),
+                'test recovery',
+            );
+            for (let attempt = 0; attempt < 10 && writes.length === 0; attempt += 1) {
+                await new Promise<void>(resolve => setImmediate(resolve));
+            }
+
+            assert.equal(writes.length, 1);
+            assert.strictEqual(writes[0].target, target);
+            assert.equal(
+                new TextDecoder().decode(writes[0].content),
+                'latest bytes at dialog completion',
+            );
+            assert.equal(harness.submissions.length, 0);
+            assert.equal(harness.document.isDirty, true);
+        } finally {
+            vscodeStub.window.showErrorMessage = originalError;
+            vscodeStub.window.showSaveDialog = originalSave;
+            vscodeStub.workspace.fs.writeFile = originalWrite;
+        }
+    });
+
+    it('does not let an old recovery prompt write a reopened buffer incarnation', async () => {
+        const harness = makeHarness({remoteText: 'authoritative'});
+        harness.vfs.observeTextDocument(harness.document);
+        harness.document.setDirtyText('old blocked buffer');
+        harness.vfs.observeTextDocument(harness.document);
+        const target = makeUri('/must-not-write.tex', 'file', '', '');
+        let writes = 0;
+        let reopened: TestTextDocument | undefined;
+        const originalError = vscodeStub.window.showErrorMessage;
+        const originalSave = vscodeStub.window.showSaveDialog;
+        const originalWrite = vscodeStub.workspace.fs.writeFile;
+        try {
+            vscodeStub.window.showErrorMessage = async () => 'Save Recovery Copy...';
+            vscodeStub.window.showSaveDialog = async () => {
+                harness.document.isClosed = true;
+                openTextDocuments.splice(0, openTextDocuments.length);
+                reopened = new TestTextDocument(harness.uri, 'new reopened buffer');
+                openTextDocuments.push(reopened);
+                return target;
+            };
+            vscodeStub.workspace.fs.writeFile = async () => { writes += 1; };
+            delete harness.vfs.showDocumentRecovery;
+
+            harness.vfs.showDocumentRecovery(
+                harness.uri,
+                new TextEncoder().encode('old blocked buffer'),
+                'test reopened buffer',
+            );
+            for (let attempt = 0; attempt < 5; attempt += 1) {
+                await new Promise<void>(resolve => setImmediate(resolve));
+            }
+
+            assert.equal(writes, 0);
+            assert.equal(reopened?.getText(), 'new reopened buffer');
+            assert.equal(reopened?.isDirty, false);
+            assert.equal(harness.submissions.length, 0);
+        } finally {
+            vscodeStub.window.showErrorMessage = originalError;
+            vscodeStub.window.showSaveDialog = originalSave;
+            vscodeStub.workspace.fs.writeFile = originalWrite;
+        }
+    });
+
+    it('does not let an old reload prompt revert a reopened buffer incarnation', async () => {
+        const harness = makeHarness({remoteText: 'authoritative'});
+        harness.vfs.observeTextDocument(harness.document);
+        harness.document.setDirtyText('old blocked buffer');
+        harness.vfs.observeTextDocument(harness.document);
+        let reopened: TestTextDocument | undefined;
+        let exactEditorEdits = 0;
+        const originalError = vscodeStub.window.showErrorMessage;
+        const originalWarning = vscodeStub.window.showWarningMessage;
+        const originalShowDocument = vscodeStub.window.showTextDocument;
+        const originalActive = vscodeStub.window.activeTextEditor;
+        try {
+            vscodeStub.window.showErrorMessage = async () => 'Reload Remote';
+            vscodeStub.window.showWarningMessage = async () => 'Reload Remote';
+            vscodeStub.window.showTextDocument = async () => {
+                harness.document.isClosed = true;
+                reopened = new TestTextDocument(harness.uri, 'new reopened buffer');
+                openTextDocuments.splice(0, openTextDocuments.length, reopened);
+                vscodeStub.window.activeTextEditor = {document: reopened};
+                return {
+                    document: reopened,
+                    edit: async () => {
+                        exactEditorEdits += 1;
+                        return true;
+                    },
+                };
+            };
+            delete harness.vfs.showDocumentRecovery;
+
+            harness.vfs.showDocumentRecovery(
+                harness.uri,
+                new TextEncoder().encode('old blocked buffer'),
+                'test reopened reload',
+            );
+            for (let attempt = 0; attempt < 5; attempt += 1) {
+                await new Promise<void>(resolve => setImmediate(resolve));
+            }
+
+            assert.equal(exactEditorEdits, 0);
+            assert.equal(reopened?.getText(), 'new reopened buffer');
+            assert.equal(reopened?.isDirty, false);
+            assert.equal(harness.submissions.length, 0);
+        } finally {
+            vscodeStub.window.showErrorMessage = originalError;
+            vscodeStub.window.showWarningMessage = originalWarning;
+            vscodeStub.window.showTextDocument = originalShowDocument;
+            vscodeStub.window.activeTextEditor = originalActive;
+        }
+    });
+
+    it('reloads only the exact blocked editor even if focus changes', async () => {
+        const harness = makeHarness({remoteText: 'authoritative', remoteVersion: 7});
+        harness.vfs.observeTextDocument(harness.document);
+        harness.document.setDirtyText('blocked local bytes');
+        harness.vfs.observeTextDocument(harness.document);
+        const unrelated = new TestTextDocument(makeUri('/unrelated.tex'), 'unrelated bytes');
+        openTextDocuments.push(unrelated);
+        let exactEditorEdits = 0;
+        let globalReverts = 0;
+        const originalError = vscodeStub.window.showErrorMessage;
+        const originalWarning = vscodeStub.window.showWarningMessage;
+        const originalShowDocument = vscodeStub.window.showTextDocument;
+        const originalActive = vscodeStub.window.activeTextEditor;
+        const originalExecute = vscodeStub.commands.executeCommand;
+        try {
+            vscodeStub.window.showErrorMessage = async () => 'Reload Remote';
+            vscodeStub.window.showWarningMessage = async () => 'Reload Remote';
+            vscodeStub.window.showTextDocument = async (document: TestTextDocument) => ({
+                document,
+                edit: async (callback: (edit: {replace: (_range: unknown, text: string) => void}) => void) => {
+                    let replacement: string | undefined;
+                    callback({replace: (_range, text) => { replacement = text; }});
+                    if (replacement === undefined) { return false; }
+                    exactEditorEdits += 1;
+                    document.setDirtyText(replacement);
+                    return true;
+                },
+            });
+            harness.vfs.openFile = async () => {
+                harness.vfs.stageEditorBase(harness.uri, harness.doc, 'authoritative');
+                vscodeStub.window.activeTextEditor = {document: unrelated};
+                return new TextEncoder().encode('authoritative');
+            };
+            harness.document.saveHandler = async () => {
+                harness.document.markClean();
+                return true;
+            };
+            vscodeStub.commands.executeCommand = async (command: string) => {
+                if (command === 'workbench.action.files.revert') { globalReverts += 1; }
+            };
+            delete harness.vfs.showDocumentRecovery;
+
+            harness.vfs.showDocumentRecovery(
+                harness.uri,
+                new TextEncoder().encode('blocked local bytes'),
+                'test exact-object reload',
+            );
+            for (let attempt = 0; attempt < 10 && exactEditorEdits === 0; attempt += 1) {
+                await new Promise<void>(resolve => setImmediate(resolve));
+            }
+
+            assert.equal(exactEditorEdits, 1);
+            assert.equal(globalReverts, 0);
+            assert.equal(harness.document.getText(), 'authoritative');
+            assert.equal(harness.document.isDirty, false);
+            assert.equal(unrelated.getText(), 'unrelated bytes');
+            assert.equal(unrelated.isDirty, false);
+        } finally {
+            vscodeStub.window.showErrorMessage = originalError;
+            vscodeStub.window.showWarningMessage = originalWarning;
+            vscodeStub.window.showTextDocument = originalShowDocument;
+            vscodeStub.window.activeTextEditor = originalActive;
+            vscodeStub.commands.executeCommand = originalExecute;
+        }
+    });
+
     it('submits exactly one OT update from an exact acknowledged base and reconciles it', async () => {
         const harness = makeHarness({remoteText: 'hello', remoteVersion: 7});
-        harness.vfs.activeEditorBases.set('doc-1', {
-            identity: harness.identity,
-            version: 7,
-            content: 'hello',
-        });
+        await confirmBase(harness, 'hello');
 
         await write(harness, 'hello world');
 
@@ -432,18 +791,23 @@ describe('remote document exact-base write gate', () => {
         assert.deepEqual(await harness.storage.list(), []);
     });
 
-    it('promotes only a clean provider read and persists the later dirty editor text', async () => {
+    it('promotes only an explicitly confirmed clean provider read and persists the later dirty editor text', async () => {
         const harness = makeHarness({remoteText: 'clean base', remoteVersion: 7});
         harness.vfs.stageEditorBase(harness.uri, harness.doc, 'clean base');
-        harness.vfs.observeTextDocument(harness.uri, 'clean base', false);
-        harness.vfs.observeTextDocument(harness.uri, 'dirty edit', true);
+        harness.vfs.observeTextDocument(harness.document);
+        const bufferId = harness.vfs.editorBufferIds.get(harness.document);
+        assert.equal(harness.vfs.activeEditorBases.has(bufferId), false);
+        assert.equal(await harness.vfs.confirmEditorBase(harness.document), true);
+        harness.document.setDirtyText('dirty edit');
+        harness.vfs.observeTextDocument(harness.document);
         await harness.store.flush();
 
-        const active = harness.vfs.activeEditorBases.get('doc-1');
+        const active = harness.vfs.activeEditorBases.get(bufferId);
         assert.equal(active?.version, 7);
         assert.equal(active?.content, 'clean base');
         const persisted = await harness.store.resolveCurrentRecord(active.recordName, {
             identity: harness.identity,
+            bufferIncarnationId: bufferId,
             baseVersion: 7,
             baseText: 'clean base',
             dirtyText: 'dirty edit',
@@ -455,20 +819,16 @@ describe('remote document exact-base write gate', () => {
         assert.equal(harness.getRemoteText(), 'dirty edit');
     });
 
-    it('does not pair an older acknowledged snapshot with a newer realtime version during cleanup', async () => {
+    it('keeps an acknowledged snapshot as ancestry when realtime advances during cleanup', async () => {
         const harness = makeHarness({remoteText: 'hello', remoteVersion: 7});
-        harness.vfs.activeEditorBases.set('doc-1', {
-            identity: harness.identity,
-            version: 7,
-            content: 'hello',
-        });
+        await confirmBase(harness, 'hello');
         harness.storage.beforeDelete = () => {
             harness.setRemoteText('hello world + collaborator');
             harness.doc.version = 9;
             harness.doc.remoteCache = 'hello world + collaborator';
         };
 
-        await assert.rejects(write(harness, 'hello world'), /moved while/i);
+        await write(harness, 'hello world');
 
         assert.equal(harness.submissions.length, 1);
         assert.equal(harness.doc.version, 9);
@@ -476,13 +836,48 @@ describe('remote document exact-base write gate', () => {
         assert.equal(harness.getRemoteText(), 'hello world + collaborator');
     });
 
+    it('keeps the acknowledged base when the same buffer changes during cleanup', async () => {
+        const harness = makeHarness({remoteText: 'hello', remoteVersion: 7});
+        const bufferId = await confirmBase(harness, 'hello');
+        harness.document.setDirtyText('hello world');
+        harness.vfs.observeTextDocument(harness.document);
+        harness.vfs.observeWillSaveTextDocument(harness.document);
+        harness.storage.beforeDelete = () => {
+            harness.document.setDirtyText('hello world + next local edit');
+            harness.vfs.observeTextDocument(harness.document);
+        };
+
+        await harness.vfs.writeFileNow(
+            harness.uri,
+            new TextEncoder().encode('hello world'),
+            false,
+            true,
+        );
+
+        assert.equal(harness.submissions.length, 1);
+        assert.equal(harness.getRemoteText(), 'hello world');
+        assert.equal(harness.document.isDirty, true);
+        assert.equal(harness.document.getText(), 'hello world + next local edit');
+        const active = harness.vfs.activeEditorBases.get(bufferId);
+        assert.equal(active?.version, 8);
+        assert.equal(active?.content, 'hello world');
+
+        harness.vfs.observeTextDocument(harness.document);
+        await harness.store.flush();
+        assert.equal(typeof active?.recordName, 'string');
+        const persisted = await harness.store.resolveCurrentRecord(active.recordName, {
+            identity: harness.identity,
+            bufferIncarnationId: bufferId,
+            baseVersion: 8,
+            baseText: 'hello world',
+            dirtyText: 'hello world + next local edit',
+        });
+        assert.equal(persisted.kind, 'valid');
+    });
+
     it('rechecks remote authority after durable provenance I/O and immediately before submission', async () => {
         const duringPending = makeHarness({remoteText: 'base', remoteVersion: 7});
-        duringPending.vfs.activeEditorBases.set('doc-1', {
-            identity: duringPending.identity,
-            version: 7,
-            content: 'base',
-        });
+        await confirmBase(duringPending, 'base');
         duringPending.storage.afterWrite = (_name, bytes) => {
             const record = JSON.parse(new TextDecoder().decode(bytes)) as {pendingWrite?: unknown};
             if (record.pendingWrite === undefined) { return; }
@@ -495,13 +890,10 @@ describe('remote document exact-base write gate', () => {
         assert.equal(duringPending.submissions.length, 0);
         assert.equal(duringPending.getRemoteText(), 'base + collaborator');
         assert.equal(duringPending.vfs.sourceRevision, 0);
+        closeHarnessDocument(duringPending);
 
         const resolutionRace = makeHarness({remoteText: 'base', remoteVersion: 7});
-        resolutionRace.vfs.activeEditorBases.set('doc-1', {
-            identity: resolutionRace.identity,
-            version: 7,
-            content: 'base',
-        });
+        await confirmBase(resolutionRace, 'base');
         let firstWrite = true;
         resolutionRace.storage.afterWrite = () => {
             if (!firstWrite) { return; }
@@ -520,22 +912,20 @@ describe('remote document exact-base write gate', () => {
         const storage = new MemoryStorage();
         const unknown = new SocketRequestError('timeout', 'unknown acknowledgement', true);
         const first = makeHarness({storage, sessionId: 'submitting-window', applyError: unknown});
-        first.vfs.activeEditorBases.set('doc-1', {
-            identity: first.identity,
-            version: 7,
-            content: 'remote text',
-        });
+        await confirmBase(first, 'remote text');
 
         await assert.rejects(write(first, 'local edit'), error => error === unknown);
         assert.equal(first.submissions.length, 1);
 
         await assert.rejects(write(first, 'local edit'), /save blocked/i);
         assert.equal(first.submissions.length, 1);
+        closeHarnessDocument(first);
 
         const restarted = makeHarness({storage, sessionId: 'restarted-window'});
         await assert.rejects(write(restarted, 'local edit'), /save blocked/i);
         assert.equal(restarted.submissions.length, 0);
         assert.equal(restarted.getRemoteText(), 'remote text');
+        closeHarnessDocument(restarted);
 
         const waiterStorage = new MemoryStorage();
         const waiter = makeHarness({
@@ -543,11 +933,7 @@ describe('remote document exact-base write gate', () => {
             sessionId: 'waiter-disconnected-window',
             versionError: new Error('Document session disconnected'),
         });
-        waiter.vfs.activeEditorBases.set('doc-1', {
-            identity: waiter.identity,
-            version: 7,
-            content: 'remote text',
-        });
+        await confirmBase(waiter, 'remote text');
         await assert.rejects(write(waiter, 'local edit'), (error: unknown) =>
             error instanceof SocketRequestError && error.outcomeUnknown
         );
@@ -560,6 +946,7 @@ describe('remote document exact-base write gate', () => {
         if (retainedAfterPlainWaiterError.kind === 'valid') {
             assert.notEqual(retainedAfterPlainWaiterError.record.pendingWrite, undefined);
         }
+        closeHarnessDocument(waiter);
 
         const appliedStorage = new MemoryStorage();
         const applied = makeHarness({
@@ -568,14 +955,11 @@ describe('remote document exact-base write gate', () => {
             applyError: unknown,
             applyBeforeError: true,
         });
-        applied.vfs.activeEditorBases.set('doc-1', {
-            identity: applied.identity,
-            version: 7,
-            content: 'remote text',
-        });
+        await confirmBase(applied, 'remote text');
         await assert.rejects(write(applied, 'local edit'), error => error === unknown);
         assert.equal(applied.submissions.length, 1);
         assert.equal(applied.getRemoteText(), 'local edit');
+        closeHarnessDocument(applied);
 
         const afterAckLoss = makeHarness({
             storage: appliedStorage,
@@ -594,9 +978,54 @@ describe('remote document exact-base write gate', () => {
         }
     });
 
+    it('restores the original pending intent when a deduplicated retry is known to fail', async () => {
+        const unknown = new SocketRequestError('timeout', 'original outcome unknown', true);
+        const harness = makeHarness({applyError: unknown});
+        const bufferId = await confirmBase(harness, 'remote text');
+        await assert.rejects(write(harness, 'local edit'), error => error === unknown);
+        const originalPending = harness.vfs.pendingDocumentUpdates.get(bufferId);
+        assert.ok(originalPending);
+        const originalRecord = await harness.store.recoverCold(harness.identity, 'local edit');
+        assert.equal(originalRecord.kind, 'valid');
+        assert.ok(originalRecord.kind === 'valid');
+        const originalPayload = originalRecord.record.pendingWrite;
+
+        harness.vfs.publicId = 'public-2';
+        harness.vfs.socket.generation = 2;
+        harness.vfs.socket.projectSession = {
+            publicId: 'public-2',
+            permissionsLevel: 'owner',
+            protocolVersion: 2,
+            generation: 2,
+        };
+        const knownRetryFailure = new SocketRequestError(
+            'server_error',
+            'deduplicated retry rejected',
+            false,
+        );
+        const retryUpdates: any[] = [];
+        harness.vfs.socket.applyOtUpdate = async (_docId: string, update: any) => {
+            retryUpdates.push(update);
+            throw knownRetryFailure;
+        };
+
+        await assert.rejects(write(harness, 'local edit'), error => error === knownRetryFailure);
+
+        assert.equal(retryUpdates.length, 1);
+        assert.deepEqual(retryUpdates[0].dupIfSource, ['public-1']);
+        const restoredPending = harness.vfs.pendingDocumentUpdates.get(bufferId);
+        assert.deepEqual(restoredPending.submittedPublicIds, ['public-1']);
+        assert.deepEqual(restoredPending.update, originalPending.update);
+        const restoredRecord = await harness.store.recoverCold(harness.identity, 'local edit');
+        assert.equal(restoredRecord.kind, 'valid');
+        assert.ok(restoredRecord.kind === 'valid');
+        assert.deepEqual(restoredRecord.record.pendingWrite, originalPayload);
+    });
+
     it('does not authorize with provenance from another server, account, project, document, protocol, or window', async () => {
         const dimensions: Array<keyof DocumentProvenanceIdentity> = [
-            'canonicalServerUrl', 'userId', 'projectId', 'docId', 'protocolVersion',
+            'canonicalServerUrl', 'userId', 'projectId', 'docId', 'canonicalEditorUri',
+            'protocolVersion',
         ];
         for (const dimension of dimensions) {
             const harness = makeHarness({sessionId: `reader-${dimension}`});
@@ -654,17 +1083,14 @@ describe('remote document exact-base write gate', () => {
         assert.equal(otherCold.submissions.length, 0);
 
         const unknownProtocol = makeHarness();
+        await confirmBase(unknownProtocol, 'remote text');
         unknownProtocol.vfs.protocolVersion = undefined;
         await assert.rejects(write(unknownProtocol, 'local edit'));
         assert.equal(unknownProtocol.submissions.length, 0);
 
         const invisible = makeHarness();
+        await confirmBase(invisible, 'remote text');
         invisible.vfs.socket.isUsingAlternativeConnectionScheme = true;
-        invisible.vfs.activeEditorBases.set('doc-1', {
-            identity: invisible.identity,
-            version: 7,
-            content: 'remote text',
-        });
         await assert.rejects(write(invisible, 'local edit'));
         assert.equal(invisible.submissions.length, 0);
     });

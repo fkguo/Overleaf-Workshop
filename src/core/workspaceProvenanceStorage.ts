@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { randomUUID } from 'crypto';
 import { ProvenanceStorage } from './documentProvenance';
 
-const PROVENANCE_FOLDER = 'document-provenance-v1';
+const PROVENANCE_FOLDER = 'document-provenance-v2';
 
 function isFileNotFound(error: unknown): boolean {
     return error instanceof vscode.FileSystemError && error.code === 'FileNotFound';

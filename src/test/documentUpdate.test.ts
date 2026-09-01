@@ -81,16 +81,18 @@ describe('prepareProvenDocumentUpdate', () => {
         }
     });
 
-    it('fails closed for remote version or content movement, including non-overlapping edits', () => {
-        assert.deepEqual(
-            prepareProvenDocumentUpdate(
-                {version: 12, content: 'abc', pendingWrite: false},
-                13,
-                'aRbc',
-                'abcL',
-            ),
-            {status: 'blocked', reason: 'version-mismatch'},
+    it('preserves non-overlapping remote movement and blocks impossible or conflicting movement', () => {
+        const independent = prepareProvenDocumentUpdate(
+            {version: 12, content: 'abc', pendingWrite: false},
+            13,
+            'aRbc',
+            'abcL',
         );
+        assert.equal(independent.status, 'ready');
+        if (independent.status === 'ready') {
+            assert.equal(independent.prepared.mergedContent, 'aRbcL');
+            assert.deepEqual(independent.prepared.operations, [{p: 4, i: 'L', d: undefined}]);
+        }
         assert.deepEqual(
             prepareProvenDocumentUpdate(
                 {version: 12, content: 'abc', pendingWrite: false},
@@ -98,8 +100,124 @@ describe('prepareProvenDocumentUpdate', () => {
                 'aRbc',
                 'abcL',
             ),
-            {status: 'blocked', reason: 'content-mismatch'},
+            {status: 'blocked', reason: 'content-version-mismatch'},
         );
+        assert.deepEqual(
+            prepareProvenDocumentUpdate(
+                {version: 12, content: 'abc', pendingWrite: false},
+                11,
+                'abc',
+                'abcL',
+            ),
+            {status: 'blocked', reason: 'version-regression'},
+        );
+        assert.deepEqual(
+            prepareProvenDocumentUpdate(
+                {version: 12, content: 'same line', pendingWrite: false},
+                13,
+                'remote line',
+                'local line',
+            ),
+            {status: 'blocked', reason: 'merge-conflict'},
+        );
+    });
+
+    it('allows a deletion only when the exact buffer base already contained the deleted text', () => {
+        const base = 'confirmed user text\nshared tail\n';
+        const remote = 'confirmed user text\nshared tail\nremote addition\n';
+        const desired = 'shared tail\n';
+        const result = prepareProvenDocumentUpdate(
+            {version: 20, content: base, pendingWrite: false},
+            21,
+            remote,
+            desired,
+        );
+        assert.equal(result.status, 'ready');
+        if (result.status === 'ready') {
+            assert.equal(result.prepared.mergedContent, 'shared tail\nremote addition\n');
+        }
+
+        const unprovenDeletion = prepareProvenDocumentUpdate(
+            {version: 20, content: 'shared tail\n', pendingWrite: false},
+            21,
+            remote,
+            'shared tail\n',
+        );
+        assert.equal(unprovenDeletion.status, 'noop');
+        if (unprovenDeletion.status === 'noop') {
+            assert.equal(unprovenDeletion.prepared.mergedContent, remote);
+            assert.deepEqual(unprovenDeletion.prepared.operations, []);
+        }
+    });
+
+    it('preserves post-base remote edits across deterministic non-overlap and overlap series', () => {
+        const apply = (text: string, operations: Array<{p: number, i?: string, d?: string}>) => {
+            let result = text;
+            for (const operation of operations) {
+                if (operation.d !== undefined) {
+                    assert.equal(result.slice(operation.p, operation.p + operation.d.length), operation.d);
+                    result = result.slice(0, operation.p) + result.slice(operation.p + operation.d.length);
+                }
+                if (operation.i !== undefined) {
+                    result = result.slice(0, operation.p) + operation.i + result.slice(operation.p);
+                }
+            }
+            return result;
+        };
+        const replace = (text: string, from: string, to: string) => {
+            const position = text.indexOf(from);
+            assert.notEqual(position, -1);
+            return text.slice(0, position) + to + text.slice(position + from.length);
+        };
+        let state = 0x5eed1234;
+        const next = () => {
+            state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+            return state;
+        };
+
+        for (let sample = 0; sample < 128; sample += 1) {
+            const slots = Array.from({length: 9}, (_, index) => `slot-${index}=BASE-${index}`);
+            const base = `${slots.join('\n')}\n`;
+            const remoteIndex = next() % slots.length;
+            let localIndex = next() % slots.length;
+            if (localIndex === remoteIndex) { localIndex = (localIndex + 1) % slots.length; }
+            const remoteToken = `slot-${remoteIndex}=REMOTE-${sample}`;
+            const localToken = `slot-${localIndex}=LOCAL-${sample}`;
+            const remote = replace(base, slots[remoteIndex], remoteToken);
+            const desired = replace(base, slots[localIndex], localToken);
+            const independent = prepareProvenDocumentUpdate(
+                {version: 100 + sample, content: base, pendingWrite: false},
+                101 + sample,
+                remote,
+                desired,
+            );
+            assert.equal(independent.status, 'ready', `non-overlap sample ${sample}`);
+            if (independent.status === 'ready') {
+                assert.match(independent.prepared.mergedContent, new RegExp(`REMOTE-${sample}`));
+                assert.match(independent.prepared.mergedContent, new RegExp(`LOCAL-${sample}`));
+                assert.equal(
+                    apply(remote, independent.prepared.operations),
+                    independent.prepared.mergedContent,
+                    `wire replay sample ${sample}`,
+                );
+            }
+
+            const conflictingDesired = replace(
+                base,
+                slots[remoteIndex],
+                `slot-${remoteIndex}=LOCAL-CONFLICT-${sample}`,
+            );
+            assert.deepEqual(
+                prepareProvenDocumentUpdate(
+                    {version: 100 + sample, content: base, pendingWrite: false},
+                    101 + sample,
+                    remote,
+                    conflictingDesired,
+                ),
+                {status: 'blocked', reason: 'merge-conflict'},
+                `overlap sample ${sample} must emit zero operations`,
+            );
+        }
     });
 
     it('never replays a pending write, but accepts an authoritative exact desired snapshot as a no-op', () => {

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'crypto';
 
-export const DOCUMENT_PROVENANCE_SCHEMA_VERSION = 1 as const;
+export const DOCUMENT_PROVENANCE_SCHEMA_VERSION = 2 as const;
 
 const RECORD_NAMESPACE = 'document-provenance';
 const RECORD_SUFFIX = '.json';
@@ -32,6 +32,7 @@ export interface DocumentProvenanceIdentity {
     userId: string;
     projectId: string;
     docId: string;
+    canonicalEditorUri: string;
     otType: string;
     protocolVersion: number;
 }
@@ -41,6 +42,7 @@ export interface DocumentProvenanceRecord {
     recordName: string;
     identity: DocumentProvenanceIdentity;
     identityHash: string;
+    bufferIncarnationId: string;
     baseVersion: number;
     baseText: string;
     baseHash: string;
@@ -52,6 +54,7 @@ export interface DocumentProvenanceRecord {
 
 export interface DirtyDocumentProvenance {
     identity: DocumentProvenanceIdentity;
+    bufferIncarnationId: string;
     baseVersion: number;
     baseText: string;
     dirtyText: string;
@@ -59,6 +62,7 @@ export interface DirtyDocumentProvenance {
 
 export interface CurrentRecordExpectation {
     identity: DocumentProvenanceIdentity;
+    bufferIncarnationId: string;
     baseVersion?: number;
     baseText?: string;
     dirtyText?: string;
@@ -73,6 +77,7 @@ export type DocumentProvenanceInvalidReason =
     | 'record-name-mismatch'
     | 'identity-mismatch'
     | 'identity-hash-mismatch'
+    | 'buffer-incarnation-mismatch'
     | 'base-hash-mismatch'
     | 'dirty-hash-mismatch'
     | 'base-version-mismatch'
@@ -148,6 +153,7 @@ export function canonicalizeDocumentIdentity(
         userId: requireNonEmptyString(identity.userId, 'userId'),
         projectId: requireNonEmptyString(identity.projectId, 'projectId'),
         docId: requireNonEmptyString(identity.docId, 'docId'),
+        canonicalEditorUri: requireNonEmptyString(identity.canonicalEditorUri, 'canonicalEditorUri'),
         otType: requireNonEmptyString(identity.otType, 'otType'),
         protocolVersion: requireVersion(identity.protocolVersion, 'protocolVersion'),
     };
@@ -160,6 +166,7 @@ function identityTuple(identity: DocumentProvenanceIdentity): readonly (string |
         canonical.userId,
         canonical.projectId,
         canonical.docId,
+        canonical.canonicalEditorUri,
         canonical.otType,
         canonical.protocolVersion,
     ];
@@ -173,8 +180,8 @@ function recordPrefix(identityHash: string): string {
     return `${RECORD_NAMESPACE}.${identityHash}.`;
 }
 
-function recordNameFor(identityHash: string, sessionHash: string): string {
-    return `${recordPrefix(identityHash)}${sessionHash}${RECORD_SUFFIX}`;
+function recordNameFor(identityHash: string, sessionHash: string, bufferHash: string): string {
+    return `${recordPrefix(identityHash)}${sessionHash}.${bufferHash}${RECORD_SUFFIX}`;
 }
 
 function identitiesEqual(
@@ -218,6 +225,7 @@ function readIdentity(value: unknown): DocumentProvenanceIdentity | undefined {
             userId: value.userId as string,
             projectId: value.projectId as string,
             docId: value.docId as string,
+            canonicalEditorUri: value.canonicalEditorUri as string,
             otType: value.otType as string,
             protocolVersion: value.protocolVersion as number,
         });
@@ -266,6 +274,13 @@ function validateRecord(value: unknown, expectedRecordName: string): ParsedRecor
         || !expectedRecordName.endsWith(RECORD_SUFFIX)) {
         return {kind: 'invalid', reason: 'identity-hash-mismatch'};
     }
+    if (typeof value.bufferIncarnationId !== 'string' || value.bufferIncarnationId.length === 0) {
+        return {kind: 'invalid', reason: 'invalid-record'};
+    }
+    const bufferHash = sha256Text(value.bufferIncarnationId);
+    if (!expectedRecordName.endsWith(`.${bufferHash}${RECORD_SUFFIX}`)) {
+        return {kind: 'invalid', reason: 'buffer-incarnation-mismatch'};
+    }
 
     if (!Number.isSafeInteger(value.baseVersion) || (value.baseVersion as number) < 0
         || typeof value.baseText !== 'string'
@@ -291,6 +306,7 @@ function validateRecord(value: unknown, expectedRecordName: string): ParsedRecor
         recordName: expectedRecordName,
         identity,
         identityHash,
+        bufferIncarnationId: value.bufferIncarnationId,
         baseVersion: value.baseVersion as number,
         baseText: value.baseText,
         baseHash: value.baseHash,
@@ -330,8 +346,12 @@ export class DocumentProvenanceStore {
         this.now = options.now ?? Date.now;
     }
 
-    currentRecordName(identity: DocumentProvenanceIdentity): string {
-        return recordNameFor(documentProvenanceIdentityHash(identity), this.sessionHash);
+    currentRecordName(identity: DocumentProvenanceIdentity, bufferIncarnationId: string): string {
+        const bufferHash = sha256Text(requireNonEmptyString(
+            bufferIncarnationId,
+            'bufferIncarnationId',
+        ));
+        return recordNameFor(documentProvenanceIdentityHash(identity), this.sessionHash, bufferHash);
     }
 
     private enqueue<T>(operation: () => Promise<T>): Promise<T> {
@@ -361,7 +381,10 @@ export class DocumentProvenanceStore {
             const reason = parsed.kind === 'invalid' ? parsed.reason : 'missing';
             throw new Error(`Cannot mutate provenance record ${recordName}: ${reason}`);
         }
-        if (this.currentRecordName(parsed.record.identity) !== recordName) {
+        if (this.currentRecordName(
+            parsed.record.identity,
+            parsed.record.bufferIncarnationId,
+        ) !== recordName) {
             throw new Error(`Cannot mutate provenance record ${recordName}: not-current-session`);
         }
         return parsed.record;
@@ -370,17 +393,38 @@ export class DocumentProvenanceStore {
     async createOrUpdateCurrent(input: DirtyDocumentProvenance): Promise<DocumentProvenanceRecord> {
         return this.enqueue(async () => {
             const identity = canonicalizeDocumentIdentity(input.identity);
+            const bufferIncarnationId = requireNonEmptyString(
+                input.bufferIncarnationId,
+                'bufferIncarnationId',
+            );
             const baseVersion = requireVersion(input.baseVersion, 'baseVersion');
             if (typeof input.baseText !== 'string' || typeof input.dirtyText !== 'string') {
                 throw new Error('baseText and dirtyText must be strings');
             }
 
             const identityHash = documentProvenanceIdentityHash(identity);
-            const recordName = recordNameFor(identityHash, this.sessionHash);
+            const recordName = recordNameFor(
+                identityHash,
+                this.sessionHash,
+                sha256Text(bufferIncarnationId),
+            );
             const parsed = await this.readRecord(recordName);
             let previous: DocumentProvenanceRecord | undefined;
             if (parsed.kind !== 'missing') {
                 previous = this.requireValidCurrent(recordName, parsed);
+            }
+            if (previous && hasOwn(previous, 'pendingWrite')) {
+                const exactPendingRecord = identitiesEqual(previous.identity, identity)
+                    && previous.bufferIncarnationId === bufferIncarnationId
+                    && previous.baseVersion === baseVersion
+                    && previous.baseText === input.baseText
+                    && previous.dirtyText === input.dirtyText;
+                if (!exactPendingRecord) {
+                    throw new Error(
+                        `Cannot update provenance record ${recordName}: pending-write is immutable`,
+                    );
+                }
+                return previous;
             }
 
             const record: DocumentProvenanceRecord = {
@@ -388,6 +432,7 @@ export class DocumentProvenanceStore {
                 recordName,
                 identity,
                 identityHash,
+                bufferIncarnationId,
                 baseVersion,
                 baseText: input.baseText,
                 baseHash: sha256Text(input.baseText),
@@ -395,9 +440,6 @@ export class DocumentProvenanceStore {
                 dirtyHash: sha256Text(input.dirtyText),
                 updatedAt: nextTimestamp(this.now, previous?.updatedAt),
             };
-            if (previous && hasOwn(previous, 'pendingWrite')) {
-                record.pendingWrite = previous.pendingWrite;
-            }
             await this.writeRecord(record);
             return record;
         });
@@ -409,7 +451,11 @@ export class DocumentProvenanceStore {
     ): Promise<NamedDocumentProvenanceResolution> {
         await this.flush();
         const identity = canonicalizeDocumentIdentity(expectation.identity);
-        if (recordName !== this.currentRecordName(identity)) {
+        const bufferIncarnationId = requireNonEmptyString(
+            expectation.bufferIncarnationId,
+            'bufferIncarnationId',
+        );
+        if (recordName !== this.currentRecordName(identity, bufferIncarnationId)) {
             return {kind: 'invalid', recordName, reason: 'not-current-session'};
         }
         const parsed = await this.readRecord(recordName);
@@ -421,6 +467,9 @@ export class DocumentProvenanceStore {
         }
         if (!identitiesEqual(parsed.record.identity, identity)) {
             return {kind: 'invalid', recordName, reason: 'identity-mismatch'};
+        }
+        if (parsed.record.bufferIncarnationId !== bufferIncarnationId) {
+            return {kind: 'invalid', recordName, reason: 'buffer-incarnation-mismatch'};
         }
         if (expectation.baseVersion !== undefined
             && parsed.record.baseVersion !== expectation.baseVersion) {

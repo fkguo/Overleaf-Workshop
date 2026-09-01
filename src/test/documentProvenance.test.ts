@@ -72,9 +72,12 @@ const baseIdentity: DocumentProvenanceIdentity = {
     userId: 'verified-user',
     projectId: 'project-a',
     docId: 'main-doc',
+    canonicalEditorUri: 'overleaf-workshop://verified-user/project-a/main-doc',
     otType: 'sharejs-text-ot',
     protocolVersion: 2,
 };
+
+const defaultBufferIncarnationId = 'buffer-a';
 
 function createStore(storage: MemoryStorage, sessionId: string): DocumentProvenanceStore {
     let now = 1_000;
@@ -92,6 +95,7 @@ describe('DocumentProvenanceStore', () => {
         const dirtyText = 'α collaborator\n本地未保存 ✍️';
         const created = await live.createOrUpdateCurrent({
             identity: {...baseIdentity, canonicalServerUrl: 'https://WWW.OVERLEAF.COM/'},
+            bufferIncarnationId: defaultBufferIncarnationId,
             baseVersion: 41,
             baseText,
             dirtyText,
@@ -104,6 +108,7 @@ describe('DocumentProvenanceStore', () => {
 
         const current = await live.resolveCurrentRecord(created.recordName, {
             identity: baseIdentity,
+            bufferIncarnationId: defaultBufferIncarnationId,
             baseVersion: 41,
             baseText,
             dirtyText,
@@ -129,6 +134,7 @@ describe('DocumentProvenanceStore', () => {
 
         await store.createOrUpdateCurrent({
             identity: baseIdentity,
+            bufferIncarnationId: defaultBufferIncarnationId,
             baseVersion: 1,
             baseText: 'base',
             dirtyText: 'dirty',
@@ -148,6 +154,7 @@ describe('DocumentProvenanceStore', () => {
         const store = createStore(storage, 'window-a');
         const schemaRecord = await store.createOrUpdateCurrent({
             identity: baseIdentity,
+            bufferIncarnationId: defaultBufferIncarnationId,
             baseVersion: 1,
             baseText: 'base',
             dirtyText: 'dirty',
@@ -165,6 +172,7 @@ describe('DocumentProvenanceStore', () => {
         const hashStore = createStore(hashStorage, 'window-a');
         const hashRecord = await hashStore.createOrUpdateCurrent({
             identity: baseIdentity,
+            bufferIncarnationId: defaultBufferIncarnationId,
             baseVersion: 1,
             baseText: 'base',
             dirtyText: 'dirty',
@@ -174,6 +182,7 @@ describe('DocumentProvenanceStore', () => {
         hashStorage.writeJson(hashRecord.recordName, tamperedBase);
         const invalidBase = await hashStore.resolveCurrentRecord(hashRecord.recordName, {
             identity: baseIdentity,
+            bufferIncarnationId: defaultBufferIncarnationId,
         });
         assert.deepEqual(invalidBase, {
             kind: 'invalid',
@@ -185,6 +194,7 @@ describe('DocumentProvenanceStore', () => {
         const dirtyStore = createStore(dirtyStorage, 'window-a');
         const dirtyRecord = await dirtyStore.createOrUpdateCurrent({
             identity: baseIdentity,
+            bufferIncarnationId: defaultBufferIncarnationId,
             baseVersion: 1,
             baseText: 'base',
             dirtyText: 'dirty',
@@ -203,6 +213,7 @@ describe('DocumentProvenanceStore', () => {
         const jsonStore = createStore(jsonStorage, 'window-a');
         const jsonRecord = await jsonStore.createOrUpdateCurrent({
             identity: baseIdentity,
+            bufferIncarnationId: defaultBufferIncarnationId,
             baseVersion: 1,
             baseText: 'base',
             dirtyText: 'dirty',
@@ -222,12 +233,14 @@ describe('DocumentProvenanceStore', () => {
         const dirty = 'same restored dirty text';
         const firstRecord = await first.createOrUpdateCurrent({
             identity: baseIdentity,
+            bufferIncarnationId: 'window-a-buffer',
             baseVersion: 7,
             baseText: 'base',
             dirtyText: dirty,
         });
         const secondRecord = await second.createOrUpdateCurrent({
             identity: baseIdentity,
+            bufferIncarnationId: 'window-b-buffer',
             baseVersion: 7,
             baseText: 'base',
             dirtyText: dirty,
@@ -243,18 +256,72 @@ describe('DocumentProvenanceStore', () => {
         }
     });
 
+    it('isolates two buffer incarnations in one session and cold recovery rejects ambiguity', async () => {
+        const storage = new MemoryStorage();
+        const live = createStore(storage, 'shared-window');
+        const dirtyText = 'same text in two aliased buffers';
+        const first = await live.createOrUpdateCurrent({
+            identity: baseIdentity,
+            bufferIncarnationId: 'buffer-one',
+            baseVersion: 4,
+            baseText: 'base',
+            dirtyText,
+        });
+        const second = await live.createOrUpdateCurrent({
+            identity: baseIdentity,
+            bufferIncarnationId: 'buffer-two',
+            baseVersion: 4,
+            baseText: 'base',
+            dirtyText,
+        });
+
+        assert.notEqual(first.recordName, second.recordName);
+        assert.equal(first.identityHash, second.identityHash);
+        assert.equal(storage.records.size, 2);
+        assert.equal((await live.resolveCurrentRecord(first.recordName, {
+            identity: baseIdentity,
+            bufferIncarnationId: 'buffer-one',
+            dirtyText,
+        })).kind, 'valid');
+        assert.deepEqual(await live.resolveCurrentRecord(first.recordName, {
+            identity: baseIdentity,
+            bufferIncarnationId: 'buffer-two',
+            dirtyText,
+        }), {
+            kind: 'invalid',
+            recordName: first.recordName,
+            reason: 'not-current-session',
+        });
+
+        const recovered = await createStore(storage, 'cold-window')
+            .recoverCold(baseIdentity, dirtyText);
+        assert.equal(recovered.kind, 'ambiguous');
+        if (recovered.kind === 'ambiguous') {
+            assert.deepEqual(
+                new Set(recovered.recordNames),
+                new Set([first.recordName, second.recordName]),
+            );
+        }
+    });
+
     it('isolates identical document ids belonging to different projects', async () => {
         const storage = new MemoryStorage();
         const store = createStore(storage, 'window-a');
         const first = await store.createOrUpdateCurrent({
             identity: baseIdentity,
+            bufferIncarnationId: defaultBufferIncarnationId,
             baseVersion: 1,
             baseText: 'project A base',
             dirtyText: 'project A dirty',
         });
-        const secondIdentity = {...baseIdentity, projectId: 'project-b'};
+        const secondIdentity = {
+            ...baseIdentity,
+            projectId: 'project-b',
+            canonicalEditorUri: 'overleaf-workshop://verified-user/project-b/main-doc',
+        };
         const second = await store.createOrUpdateCurrent({
             identity: secondIdentity,
+            bufferIncarnationId: 'buffer-project-b',
             baseVersion: 9,
             baseText: 'project B base',
             dirtyText: 'project B dirty',
@@ -282,6 +349,7 @@ describe('DocumentProvenanceStore', () => {
         const store = createStore(storage, 'window-a');
         const created = await store.createOrUpdateCurrent({
             identity: baseIdentity,
+            bufferIncarnationId: defaultBufferIncarnationId,
             baseVersion: 12,
             baseText: 'abc',
             dirtyText: 'abXc',
@@ -298,8 +366,29 @@ describe('DocumentProvenanceStore', () => {
         await store.markPendingWrite(created.recordName, pending);
         assert.equal(storage.writeCount, writesBeforeMark + 1);
 
+        const exactRetry = await store.createOrUpdateCurrent({
+            identity: baseIdentity,
+            bufferIncarnationId: defaultBufferIncarnationId,
+            baseVersion: 12,
+            baseText: 'abc',
+            dirtyText: 'abXc',
+        });
+        assert.deepEqual(exactRetry.pendingWrite, pending);
+        assert.equal(storage.writeCount, writesBeforeMark + 1);
+        await assert.rejects(
+            () => store.createOrUpdateCurrent({
+                identity: baseIdentity,
+                bufferIncarnationId: defaultBufferIncarnationId,
+                baseVersion: 12,
+                baseText: 'abc',
+                dirtyText: 'abXYc',
+            }),
+            /pending-write is immutable/,
+        );
+
         const resolved = await store.resolveCurrentRecord(created.recordName, {
             identity: baseIdentity,
+            bufferIncarnationId: defaultBufferIncarnationId,
             baseVersion: 12,
             baseText: 'abc',
             dirtyText: 'abXc',
@@ -322,12 +411,18 @@ describe('DocumentProvenanceStore', () => {
         const secondStore = createStore(storage, 'window-b');
         const first = await firstStore.createOrUpdateCurrent({
             identity: baseIdentity,
+            bufferIncarnationId: defaultBufferIncarnationId,
             baseVersion: 1,
             baseText: 'base one',
             dirtyText: 'dirty one',
         });
         const second = await secondStore.createOrUpdateCurrent({
-            identity: {...baseIdentity, projectId: 'project-b'},
+            identity: {
+                ...baseIdentity,
+                projectId: 'project-b',
+                canonicalEditorUri: 'overleaf-workshop://verified-user/project-b/main-doc',
+            },
+            bufferIncarnationId: 'buffer-project-b',
             baseVersion: 2,
             baseText: 'base two',
             dirtyText: 'dirty two',
@@ -335,6 +430,7 @@ describe('DocumentProvenanceStore', () => {
 
         const updated = await firstStore.createOrUpdateCurrent({
             identity: baseIdentity,
+            bufferIncarnationId: defaultBufferIncarnationId,
             baseVersion: 1,
             baseText: 'base one',
             dirtyText: 'dirty one updated',
@@ -359,6 +455,7 @@ describe('DocumentProvenanceStore', () => {
         const block = storage.blockNextWrite();
         const update = store.createOrUpdateCurrent({
             identity: baseIdentity,
+            bufferIncarnationId: defaultBufferIncarnationId,
             baseVersion: 1,
             baseText: 'base',
             dirtyText: 'dirty',

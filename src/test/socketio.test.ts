@@ -120,6 +120,52 @@ describe('SocketIOAPI project protocol', () => {
         assert.equal(socket.needsReinit, false);
     });
 
+    it('terminates a session whose joined project identity differs from the request', async () => {
+        const {base, socket} = createAPI();
+        const transport = base.sockets[0];
+        const joinedSessions: unknown[] = [];
+        const fatalErrors: RealtimeFatalError[] = [];
+        socket.updateEventHandlers({
+            onProjectJoined: session => joinedSessions.push(session),
+            onFatalError: error => fatalErrors.push(error),
+        });
+        transport.serverEmit('connect');
+
+        const joined = socket.joinProject('project-id');
+        transport.serverEmit('joinProjectResponse', {
+            publicId: 'P.wrong-project',
+            project: {_id: 'different-project-id', rootFolder: []},
+            permissionsLevel: 'owner',
+            protocolVersion: 2,
+        });
+
+        await assert.rejects(
+            joined,
+            (error: unknown) => error instanceof RealtimeFatalError
+                && error.code === 'project_unavailable'
+                && error.details !== null
+                && typeof error.details === 'object'
+                && (error.details as {expectedProjectId?: string}).expectedProjectId === 'project-id'
+                && (error.details as {receivedProjectId?: string}).receivedProjectId === 'different-project-id',
+        );
+        assert.equal(joinedSessions.length, 0, 'a mismatched tree must never become a project session');
+        assert.equal(fatalErrors.length, 1);
+        assert.strictEqual(socket.fatalError, fatalErrors[0]);
+        assert.equal(socket.projectSession, undefined);
+        assert.equal(socket.isConnected, false);
+        assert.equal(socket.needsReinit, false, 'an identity mismatch is terminal, not retryable');
+
+        await assert.rejects(
+            socket.joinDoc('doc-id'),
+            (error: unknown) => error === fatalErrors[0],
+        );
+        assert.equal(
+            transport.emitted.filter(item => item.event === 'joinDoc').length,
+            0,
+            'no document join may follow a mismatched project response',
+        );
+    });
+
     it('retires and replaces a transport after a transient disconnect', async () => {
         const {base, socket} = createAPI();
         const transport = base.sockets[0];
@@ -512,7 +558,11 @@ describe('SocketIOAPI project protocol', () => {
             assert.equal(socket.projectSession?.permissionsLevel, permissionsLevel);
             const sentBeforeWrite = transport.emitted.length;
             await assert.rejects(
-                socket.applyOtUpdate('doc-id', {doc: 'doc-id', v: 1, op: [{p: 0, i: 'x'}]}),
+                socket.applyOtUpdate(
+                    'doc-id',
+                    {doc: 'doc-id', v: 1, op: [{p: 0, i: 'x'}]},
+                    socket.projectSession!,
+                ),
                 (error: unknown) => error instanceof SocketRequestError && error.code === 'server_error',
             );
             assert.equal(transport.emitted.length, sentBeforeWrite);
@@ -701,7 +751,11 @@ describe('SocketIOAPI project protocol', () => {
             await joined;
 
             await assert.rejects(
-                socket.applyOtUpdate('doc-id', {doc: 'doc-id', v: 1, op: [{p: 0, i: 'x'}]}),
+                socket.applyOtUpdate(
+                    'doc-id',
+                    {doc: 'doc-id', v: 1, op: [{p: 0, i: 'x'}]},
+                    socket.projectSession!,
+                ),
                 (error: unknown) => error instanceof SocketRequestError && error.code === 'server_error',
             );
             assert.equal(transport.emitted.some(item => item.event === 'applyOtUpdate'), false);
@@ -726,7 +780,11 @@ describe('SocketIOAPI project protocol', () => {
             protocolVersion: 2,
         });
         await joined;
-        const saving = socket.applyOtUpdate('doc-id', {doc: 'doc-id', v: 4, op: [{p: 0, i: 'x'}]});
+        const saving = socket.applyOtUpdate(
+            'doc-id',
+            {doc: 'doc-id', v: 4, op: [{p: 0, i: 'x'}]},
+            socket.projectSession!,
+        );
         await waitForEmission(transport, 'applyOtUpdate');
 
         transport.serverEmit('otUpdateError', 'update is too large', {
@@ -752,6 +810,40 @@ describe('SocketIOAPI project protocol', () => {
         });
         assert.equal(disconnects, 1);
         assert.equal(socket.needsReinit, true);
+    });
+
+    it('emits no OT when the accepted sender changes during request preparation', async () => {
+        const {base, socket} = createAPI();
+        const transport = base.sockets[0];
+        transport.serverEmit('connect');
+        const joined = socket.joinProject('project-id');
+        transport.serverEmit('joinProjectResponse', {
+            publicId: 'P.original',
+            project,
+            permissionsLevel: 'owner',
+            protocolVersion: 2,
+        });
+        await joined;
+        const witness = socket.projectSession!;
+
+        const saving = socket.applyOtUpdate(
+            'doc-id',
+            {doc: 'doc-id', v: 4, op: [{p: 0, i: 'x'}]},
+            witness,
+        );
+        transport.serverEmit('connectionAccepted', undefined, 'P.rotated');
+
+        await assert.rejects(
+            saving,
+            (error: unknown) => error instanceof SocketRequestError
+                && error.code === 'stale_connection'
+                && error.outcomeUnknown === false,
+        );
+        assert.equal(
+            transport.emitted.some(item => item.event === 'applyOtUpdate'),
+            false,
+            'sender rotation before emit must produce zero wire operations',
+        );
     });
 
     it('stops reconnecting when the protocol changes across project joins', async () => {
@@ -784,6 +876,43 @@ describe('SocketIOAPI project protocol', () => {
         assert.equal(fatalErrors[0]?.code, 'protocol_changed');
         assert.equal(disconnects, 1);
         assert.equal(socket.needsReinit, false);
+    });
+
+    it('does not inherit a prior protocol witness when the new join omits it', async () => {
+        const {base, socket} = createAPI();
+        const first = base.sockets[0];
+        first.serverEmit('connect');
+        const firstJoin = socket.joinProject('project-id');
+        first.serverEmit('joinProjectResponse', {
+            publicId: 'P.explicit-v2', project, permissionsLevel: 'owner', protocolVersion: 2,
+        });
+        await firstJoin;
+        assert.equal(socket.projectSession?.protocolVersion, 2);
+        first.serverEmit('disconnect');
+
+        socket.init();
+        const second = base.sockets[1];
+        second.serverEmit('connect');
+        const secondJoin = socket.joinProject('project-id');
+        second.serverEmit('joinProjectResponse', {
+            publicId: 'P.missing-protocol', project, permissionsLevel: 'owner',
+        });
+        await secondJoin;
+
+        const witness = socket.projectSession!;
+        assert.equal(witness.protocolVersion, undefined);
+        const emittedBeforeWrite = second.emitted.length;
+        await assert.rejects(
+            socket.applyOtUpdate(
+                'doc-id',
+                {doc: 'doc-id', v: 1, op: [{p: 0, i: 'unsafe'}]},
+                witness,
+            ),
+            (error: unknown) => error instanceof SocketRequestError
+                && error.code === 'server_error'
+                && error.outcomeUnknown === false,
+        );
+        assert.equal(second.emitted.length, emittedBeforeWrite, 'missing protocol must emit zero OT');
     });
 
     it('rejects History OT documents without advertising unsupported capability', async () => {

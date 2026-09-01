@@ -29,19 +29,42 @@ export type ProvenDocumentUpdate =
     | {status: 'ready', prepared: PreparedDocumentUpdate}
     | {
         status: 'blocked',
-        reason: 'missing-base' | 'pending-write' | 'version-mismatch' | 'content-mismatch',
+        reason:
+            | 'missing-base'
+            | 'pending-write'
+            | 'version-regression'
+            | 'content-version-mismatch'
+            | 'merge-conflict',
     };
 
 export function isSenderConfirmation(update: {op?: unknown[]}): boolean {
     return update.op === undefined;
 }
 
+export function buildRecoveryUpdate<T extends object>(
+    update: T,
+    submittedPublicIds: string[],
+): T & {dupIfSource: string[]} {
+    return {
+        ...update,
+        dupIfSource: [...new Set(submittedPublicIds.filter(Boolean))],
+    };
+}
+
+export function desiredChangesArePresent(
+    localBase: string,
+    remoteContent: string,
+    desiredContent: string,
+): boolean {
+    const prepared = prepareDocumentUpdate(localBase, remoteContent, desiredContent);
+    return prepared.mergeApplied && prepared.operations.length === 0;
+}
+
 /**
- * Authorize a document write only from the exact remote state which the editor
- * previously acknowledged. A current remote snapshot is not a substitute for a
- * missing editor base: that would turn an old hot-exit buffer into a valid bulk
- * edit. Any remote version/content movement therefore fails closed. The caller
- * may later add a separately proven merge path without weakening this gate.
+ * Authorize a document write only from an exact editor base. A current remote
+ * snapshot is never substituted for missing ancestry. If the remote revision
+ * moved forward, merge only independent edits derived from that same proven
+ * base; impossible version/content pairs and overlapping edits fail closed.
  */
 export function prepareProvenDocumentUpdate(
     base: ExactDocumentBase | undefined,
@@ -61,16 +84,19 @@ export function prepareProvenDocumentUpdate(
     if (base.pendingWrite) {
         return {status: 'blocked', reason: 'pending-write'};
     }
-    if (base.version !== remoteVersion) {
-        return {status: 'blocked', reason: 'version-mismatch'};
+    if (remoteVersion < base.version) {
+        return {status: 'blocked', reason: 'version-regression'};
     }
-    if (base.content !== remoteContent) {
-        return {status: 'blocked', reason: 'content-mismatch'};
+    if (remoteVersion === base.version && base.content !== remoteContent) {
+        return {status: 'blocked', reason: 'content-version-mismatch'};
     }
-    return {
-        status: 'ready',
-        prepared: prepareDocumentUpdate(base.content, remoteContent, desiredContent),
-    };
+    const prepared = prepareDocumentUpdate(base.content, remoteContent, desiredContent);
+    if (!prepared.mergeApplied) {
+        return {status: 'blocked', reason: 'merge-conflict'};
+    }
+    return prepared.operations.length === 0 ?
+        {status: 'noop', prepared} :
+        {status: 'ready', prepared};
 }
 
 function editsFromBase(base: string, target: string): TextEdit[] {

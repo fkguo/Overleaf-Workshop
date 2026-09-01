@@ -67,6 +67,8 @@ export interface ProjectSessionSchema {
     generation: number,
 }
 
+export type ProjectSenderWitness = Pick<ProjectSessionSchema, 'publicId' | 'generation'>;
+
 export interface OtUpdateErrorSchema {
     message: string,
     projectId?: string,
@@ -99,7 +101,7 @@ export interface EventsHandler {
     onFileRenamed?: (entityId:string, newName:string) => void,
     onFileRemoved?: (entityId:string) => void,
     onFileMoved?: (entityId:string, newParentFolderId:string) => void,
-    onFileChanged?: (update:UpdateSchema) => void,
+    onFileChanged?: (update:UpdateSchema, sender?: ProjectSenderWitness) => void,
     //
     onDisconnected?: () => void,
     onConnectionAccepted?: (publicId:string) => void,
@@ -146,6 +148,7 @@ function deferred<T>(): Deferred<T> {
 
 const CONNECT_TIMEOUT_MS = 15000;
 const ACK_TIMEOUT_MS = 15000;
+const SUPPORTED_PLAIN_OT_PROTOCOL_VERSION = 2;
 
 export class SocketIOAPI {
     // Current Overleaf real-time servers require projectId on the socket
@@ -177,7 +180,8 @@ export class SocketIOAPI {
     private currentPublicId?: string;
     private currentPermissionsLevel?: PermissionsLevel;
     private lastKnownPermissionsLevel?: PermissionsLevel;
-    private protocolVersion?: number;
+    private currentProtocolVersion?: number;
+    private lastKnownProtocolVersion?: number;
     private joinedGeneration?: number;
     private terminalFailure?: RealtimeFatalError;
     private readonly disconnectedNotifications = new WeakSet<object>();
@@ -314,7 +318,7 @@ export class SocketIOAPI {
         return {
             publicId: this.currentPublicId,
             permissionsLevel: this.currentPermissionsLevel,
-            protocolVersion: this.protocolVersion,
+            protocolVersion: this.currentProtocolVersion,
             generation: this.joinedGeneration,
         };
     }
@@ -377,6 +381,7 @@ export class SocketIOAPI {
         this._socketInitScheme = undefined;
         this.connectionAcceptedGeneration = undefined;
         this.joinedGeneration = undefined;
+        this.currentProtocolVersion = undefined;
         this.currentPermissionsLevel = this.scheme === 'Alt' ? this.lastKnownPermissionsLevel : undefined;
 
         const socket = this.socket;
@@ -427,6 +432,7 @@ export class SocketIOAPI {
         this.connectionAcceptedSignal = deferred<{generation: number, publicId: string}>();
         this.connectionAcceptedGeneration = undefined;
         this.currentPublicId = undefined;
+        this.currentProtocolVersion = undefined;
         this.currentPermissionsLevel = this.scheme === 'Alt' ? this.lastKnownPermissionsLevel : undefined;
         this.joinedGeneration = undefined;
         this.rejectV2ProjectResponse(new SocketRequestError(
@@ -466,6 +472,7 @@ export class SocketIOAPI {
         this.connectionAcceptedSignal = deferred<{generation: number, publicId: string}>();
         this.connectionAcceptedGeneration = undefined;
         this.currentPublicId = undefined;
+        this.currentProtocolVersion = undefined;
         this.currentPermissionsLevel = undefined;
         this.joinedGeneration = undefined;
         this.rejectV2ProjectResponse(new SocketRequestError(
@@ -532,16 +539,48 @@ export class SocketIOAPI {
         return accepted.publicId;
     }
 
-    private async request<T extends any[]>(event: string, args: any[], timeoutMs: number = ACK_TIMEOUT_MS): Promise<T> {
+    private senderWitnessMatches(expected: ProjectSenderWitness): boolean {
+        const session = this.projectSession;
+        return Boolean(
+            session
+            && session.publicId === expected.publicId
+            && session.generation === expected.generation
+            && this.socketGeneration === expected.generation
+            && this.transportConnected
+        );
+    }
+
+    private async request<T extends any[]>(
+        event: string,
+        args: any[],
+        timeoutMs: number = ACK_TIMEOUT_MS,
+        expectedSender?: ProjectSenderWitness,
+    ): Promise<T> {
+        if (expectedSender && !this.senderWitnessMatches(expectedSender)) {
+            throw new SocketRequestError(
+                'stale_connection',
+                'Realtime sender identity changed before the request could be sent',
+                false,
+            );
+        }
         const generation = await this.waitUntilConnected();
         const socketAtEmit = this.socket;
+        if (expectedSender && !this.senderWitnessMatches(expectedSender)) {
+            throw new SocketRequestError(
+                'stale_connection',
+                'Realtime sender identity changed while preparing the request',
+                false,
+            );
+        }
         return requestWithAck<T>(
             socketAtEmit,
             event,
             args,
             timeoutMs,
             generation,
-            (candidate) => candidate === this.socketGeneration && socketAtEmit === this.socket,
+            (candidate) => candidate === this.socketGeneration
+                && socketAtEmit === this.socket
+                && (!expectedSender || this.senderWitnessMatches(expectedSender)),
         );
     }
 
@@ -579,8 +618,17 @@ export class SocketIOAPI {
     private finalizeProjectJoin(
         response: ProjectJoinResponse,
         generation: number,
+        expectedProjectId: string,
         fallbackPublicId?: string,
     ): ProjectEntity {
+        const receivedProjectId = response.project?._id;
+        if (receivedProjectId !== expectedProjectId) {
+            throw this.terminateRealtime(
+                'project_unavailable',
+                `Project join returned ${String(receivedProjectId)} instead of ${expectedProjectId}`,
+                {expectedProjectId, receivedProjectId},
+            );
+        }
         const publicId = response.publicId ?? fallbackPublicId ?? this.currentPublicId;
         const activeScheme = this._socketInitScheme ?? this.scheme;
         if (
@@ -596,18 +644,19 @@ export class SocketIOAPI {
             );
         }
         if (
-            this.protocolVersion !== undefined &&
+            this.lastKnownProtocolVersion !== undefined &&
             response.protocolVersion !== undefined &&
-            this.protocolVersion !== response.protocolVersion
+            this.lastKnownProtocolVersion !== response.protocolVersion
         ) {
             throw this.terminateRealtime(
                 'protocol_changed',
-                `Realtime protocol changed from ${this.protocolVersion} to ${response.protocolVersion}`,
+                `Realtime protocol changed from ${this.lastKnownProtocolVersion} to ${response.protocolVersion}`,
                 response,
             );
         }
+        this.currentProtocolVersion = response.protocolVersion;
         if (response.protocolVersion !== undefined) {
-            this.protocolVersion = response.protocolVersion;
+            this.lastKnownProtocolVersion = response.protocolVersion;
         }
         const permissionsLevel = response.permissionsLevel ??
             (activeScheme === 'Alt' ? this.currentPermissionsLevel ?? this.lastKnownPermissionsLevel : undefined);
@@ -620,7 +669,7 @@ export class SocketIOAPI {
         const session: ProjectSessionSchema = {
             publicId,
             permissionsLevel,
-            protocolVersion: response.protocolVersion ?? this.protocolVersion,
+            protocolVersion: this.currentProtocolVersion,
             generation,
         };
         this._handlers.forEach(handler => handler.onProjectJoined?.(session));
@@ -905,11 +954,20 @@ export class SocketIOAPI {
                         handler(entityId, folderId);
                     });
                     break;
-                case handlers.onFileChanged:
-                    this.socket.on('otUpdateApplied', (update: UpdateSchema) => {
-                        handler(update);
+                case handlers.onFileChanged: {
+                    const socketAtRegistration = this.socket;
+                    socketAtRegistration.on('otUpdateApplied', (update: UpdateSchema) => {
+                        const session = this.projectSession;
+                        const sender = socketAtRegistration === this.socket
+                            && socketAtRegistration !== this.retiredSocket
+                            && session?.generation === this.socketGeneration ? {
+                                publicId: session.publicId,
+                                generation: session.generation,
+                            } : undefined;
+                        handler(update, sender);
                     });
                     break;
+                }
                 case handlers.onDisconnected:
                 case handlers.onConnectionAccepted:
                 case handlers.onProjectJoined:
@@ -1006,7 +1064,7 @@ export class SocketIOAPI {
                         publicId,
                         permissionsLevel: response[1] as PermissionsLevel | undefined,
                         protocolVersion: response[2],
-                    }, generation, publicId);
+                    }, generation, project_id, publicId);
                     this.record = Promise.resolve(project);
                     return project;
                 } catch (error) {
@@ -1044,7 +1102,7 @@ export class SocketIOAPI {
                     // legacy server: doing so would replace a valid project-query
                     // socket with a v1 socket that omits projectId.
                     const joinResponse = await withTimeout(response.promise, 'project handshake', timeoutMs);
-                    const project = this.finalizeProjectJoin(joinResponse, generation);
+                    const project = this.finalizeProjectJoin(joinResponse, generation, project_id);
                     this.record = Promise.resolve(project);
                     return project;
                 } catch (error) {
@@ -1142,8 +1200,19 @@ export class SocketIOAPI {
      * @param {any} update - The changes.
      * @returns {Promise}
      */
-    async applyOtUpdate(docId:string, update:UpdateSchema) {
+    async applyOtUpdate(
+        docId:string,
+        update:UpdateSchema,
+        expectedSender: ProjectSenderWitness,
+    ) {
         const activeScheme = this._socketInitScheme ?? this.scheme;
+        if (this.projectSession?.protocolVersion !== SUPPORTED_PLAIN_OT_PROTOCOL_VERSION) {
+            throw new SocketRequestError(
+                'server_error',
+                'Plain OT writes require an explicit current-generation protocol version',
+                false,
+            );
+        }
         if (this.currentPermissionsLevel === 'readOnly' || this.currentPermissionsLevel === 'review') {
             throw new SocketRequestError(
                 'server_error',
@@ -1166,7 +1235,7 @@ export class SocketIOAPI {
                 {permissionsLevel: this.currentPermissionsLevel, docId},
             );
         }
-        return this.request<any[]>('applyOtUpdate', [docId, update])
+        return this.request<any[]>('applyOtUpdate', [docId, update], ACK_TIMEOUT_MS, expectedSender)
             .then(() => {
                 return;
             });

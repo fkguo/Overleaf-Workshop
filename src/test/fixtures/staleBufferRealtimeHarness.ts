@@ -1,6 +1,10 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import {strict as assert} from 'assert';
 import {SocketRequestError} from '../../api/socketRequest';
+import {
+    DocumentProvenanceStore,
+    ProvenanceStorage,
+} from '../../core/documentProvenance';
 
 export type TextOperation = {
     p: number,
@@ -34,7 +38,7 @@ type EventHandlers = {
         doc: string,
         v: number,
         op?: TextOperation[],
-    }) => void,
+    }, sender?: {publicId: string, generation: number}) => void,
 };
 
 type StoredDocument = {
@@ -190,6 +194,8 @@ class FileSystemErrorStub extends Error {
 const workspaceDocuments: Array<{
     uri: UriStub,
     readonly isDirty: boolean,
+    readonly isClosed: boolean,
+    readonly version: number,
     getText(): string,
 }> = [];
 
@@ -262,9 +268,55 @@ class MemoryMemento {
     setKeysForSync(_keys: readonly string[]): void {}
 }
 
+class MemoryProvenanceStorage implements ProvenanceStorage {
+    constructor(private readonly values: Map<string, Uint8Array>) {}
+
+    async list(): Promise<string[]> {
+        return [...this.values.keys()];
+    }
+
+    async read(recordName: string): Promise<Uint8Array | undefined> {
+        const value = this.values.get(recordName);
+        return value && new Uint8Array(value);
+    }
+
+    async write(recordName: string, content: Uint8Array): Promise<void> {
+        this.values.set(recordName, new Uint8Array(content));
+    }
+
+    async delete(recordName: string): Promise<void> {
+        this.values.delete(recordName);
+    }
+}
+
 export class HarnessStorage {
     readonly globalState = new MemoryMemento();
     private readonly workspaceStates = new Map<string, MemoryMemento>();
+    private readonly provenanceBytes = new Map<string, Map<string, Uint8Array>>();
+    private readonly provenanceStores = new Map<string, DocumentProvenanceStore>();
+    private sessionSequence = 0;
+
+    provenanceStore(windowId: string): DocumentProvenanceStore {
+        let store = this.provenanceStores.get(windowId);
+        if (!store) {
+            let bytes = this.provenanceBytes.get(windowId);
+            if (!bytes) {
+                bytes = new Map<string, Uint8Array>();
+                this.provenanceBytes.set(windowId, bytes);
+            }
+            this.sessionSequence += 1;
+            store = new DocumentProvenanceStore(
+                new MemoryProvenanceStorage(bytes),
+                {sessionId: `${windowId}-session-${this.sessionSequence}`},
+            );
+            this.provenanceStores.set(windowId, store);
+        }
+        return store;
+    }
+
+    restartWindow(windowId: string): void {
+        this.provenanceStores.delete(windowId);
+    }
 
     context(server: DeterministicRealtimeServer, windowId: string) {
         let workspaceState = this.workspaceStates.get(windowId);
@@ -314,6 +366,7 @@ interface ModuleLoader {
 }
 
 let VirtualFileSystemConstructor: any;
+let RemoteFileSystemProviderConstructor: any;
 let loadedRemotePath: string | undefined;
 let loadedStatePath: string | undefined;
 let previousRemoteModule: NodeModule | undefined;
@@ -359,13 +412,18 @@ function loadVirtualFileSystem(): any {
             __realtimeServer: DeterministicRealtimeServer,
             __windowId: string,
         }, _name: string, projectId: string) => {
-            return context.__realtimeServer.createClient(projectId, context.__windowId);
+            return {
+                ...context.__realtimeServer.createClient(projectId, context.__windowId),
+                serverUrl: 'https://www.overleaf.com/',
+                userId: 'test-user',
+            };
         }) as unknown as typeof GlobalStateManager.initSocketIOAPI;
         GlobalStateManager.authenticate = (async () => ({
             csrfToken: 'csrf',
             cookies: 'session=test',
         })) as typeof GlobalStateManager.authenticate;
         VirtualFileSystemConstructor = remoteModule.VirtualFileSystem;
+        RemoteFileSystemProviderConstructor = remoteModule.RemoteFileSystemProvider;
     } finally {
         moduleLoader._load = originalLoad;
     }
@@ -409,6 +467,15 @@ class DeterministicSocket {
 
     get needsReinit(): boolean {
         return !this.connected;
+    }
+
+    get projectSession() {
+        return this.connected ? {
+            publicId: this.publicId,
+            permissionsLevel: 'owner' as const,
+            protocolVersion: 2,
+            generation: this.generation,
+        } : undefined;
     }
 
     updateEventHandlers(handlers: EventHandlers): void {
@@ -462,6 +529,10 @@ class DeterministicSocket {
         return this.server.receiveUpdate(this, docId, update);
     }
 
+    emitAnonymousSenderConfirmation(docId: string, version: number): void {
+        this.handlers.onFileChanged?.({doc: docId, v: version});
+    }
+
     disconnect(): void {
         if (!this.connected) { return; }
         this.connected = false;
@@ -496,6 +567,7 @@ export class DeterministicRealtimeServer {
     logicalApplyCount = 0;
     senderConfirmationCount = 0;
     collaboratorBroadcastCount = 0;
+    clientCreationCount = 0;
     private readonly projects = new Map<string, StoredProject>();
     private readonly sockets = new Set<DeterministicSocket>();
     private publicIdSequence = 0;
@@ -527,6 +599,7 @@ export class DeterministicRealtimeServer {
 
     createClient(projectId: string, windowId: string) {
         assert.ok(this.projects.has(projectId), `Unknown deterministic project ${projectId}`);
+        this.clientCreationCount += 1;
         const socket = new DeterministicSocket(this, projectId, windowId);
         this.sockets.add(socket);
         return {api: new FakeProjectAPI(), socket};
@@ -619,7 +692,7 @@ export class DeterministicRealtimeServer {
                     doc: document.id,
                     v: version,
                     op: clone(operations),
-                });
+                }, {publicId: socket.publicId, generation: socket.generation});
             }
         }
     }
@@ -694,7 +767,10 @@ export class DeterministicRealtimeServer {
             }
             if (!omitSenderConfirmation) {
                 this.senderConfirmationCount += 1;
-                sender.handlers.onFileChanged?.({doc: docId, v: update.v});
+                sender.handlers.onFileChanged?.(
+                    {doc: docId, v: update.v},
+                    {publicId: sender.publicId, generation: sender.generation},
+                );
             }
             return;
         }
@@ -723,6 +799,7 @@ export class DeterministicRealtimeServer {
                 socket === sender ?
                     {doc: docId, v: version} :
                     {doc: docId, v: version, op: clone(update.op ?? [])},
+                {publicId: socket.publicId, generation: socket.generation},
             );
         }
     }
@@ -755,40 +832,171 @@ export function createVirtualProject(options: {
         context,
         uri,
         (events: unknown[]) => notifications.push(events),
+        options.storage.provenanceStore(options.windowId),
     );
     const socket = (vfs as {socket: DeterministicSocket}).socket;
     return {vfs, uri, socket, notifications};
 }
 
+export type AliasProviderHarness = {
+    provider: any,
+    vfs: any,
+    decodedUri: UriStub,
+    encodedUri: UriStub,
+    reorderedUri: UriStub,
+};
+
+export async function createAliasProviderProject(options: {
+    server: DeterministicRealtimeServer,
+    storage: HarnessStorage,
+    windowId: string,
+    projectId: string,
+}): Promise<AliasProviderHarness> {
+    loadVirtualFileSystem();
+    const project = options.server.projectSnapshot(options.projectId);
+    const context = options.storage.context(options.server, options.windowId);
+    const decodedQuery = `user=test-user&project=${options.projectId}`;
+    const decodedUri = new UriStub(
+        'overleaf-workshop',
+        'www.overleaf.com',
+        `/${project.name}/${project.rootFolder[0].docs[0].name}`,
+        decodedQuery,
+    );
+    const encodedUri = decodedUri.with({query: encodeURIComponent(decodedQuery)});
+    const reorderedUri = decodedUri.with({query: `project=${options.projectId}&user=test-user`});
+    const provider = new RemoteFileSystemProviderConstructor(context);
+    const [decodedVfs, encodedVfs, reorderedVfs] = await Promise.all([
+        provider.prefetch(decodedUri),
+        provider.prefetch(encodedUri),
+        provider.prefetch(reorderedUri),
+    ]);
+    assert.strictEqual(encodedVfs, decodedVfs, 'encoded query must reuse the decoded VFS');
+    assert.strictEqual(reorderedVfs, decodedVfs, 'reordered query must reuse the decoded VFS');
+    return {provider, vfs: decodedVfs, decodedUri, encodedUri, reorderedUri};
+}
+
 export class SimulatedDirtyEditor {
     dirty = true;
+    closed = false;
+    version = 1;
+    private currentText: string;
     readonly document: {
         uri: UriStub,
         readonly isDirty: boolean,
+        readonly isClosed: boolean,
+        readonly version: number,
         getText(): string,
     };
 
-    constructor(readonly uri: UriStub, readonly text: string) {
+    constructor(readonly uri: UriStub, text: string) {
         const editor = this;
+        this.currentText = text;
         this.document = {
             uri,
             get isDirty() { return editor.dirty; },
-            getText: () => editor.text,
+            get isClosed() { return editor.closed; },
+            get version() { return editor.version; },
+            getText: () => editor.currentText,
         };
     }
 
+    get text(): string {
+        return this.currentText;
+    }
+
     attach(): void {
-        workspaceDocuments.push(this.document);
+        if (!workspaceDocuments.includes(this.document)) {
+            workspaceDocuments.push(this.document);
+        }
+    }
+
+    /** Keep the buffer alive while modelling another VS Code window's process. */
+    hideFromCurrentWindow(): void {
+        const index = workspaceDocuments.indexOf(this.document);
+        if (index >= 0) { workspaceDocuments.splice(index, 1); }
+    }
+
+    detach(vfs?: any): void {
+        const index = workspaceDocuments.indexOf(this.document);
+        if (index >= 0) { workspaceDocuments.splice(index, 1); }
+        this.closed = true;
+        vfs?.forgetTextDocument(this.document);
+    }
+
+    /**
+     * Model an explicit Reload Remote confirmation on this exact buffer
+     * incarnation, followed by the user's dirty edit from that base.
+     */
+    async confirmStagedBase(vfs: any, baseText: string): Promise<void> {
+        const desiredText = this.currentText;
+        this.currentText = baseText;
+        this.dirty = false;
+        this.version += 1;
+        vfs.observeTextDocument(this.document);
+        assert.equal(
+            await vfs.confirmEditorBase(this.document),
+            true,
+            'the deterministic exact remote reload must establish this buffer base',
+        );
+        this.currentText = desiredText;
+        this.dirty = desiredText !== baseText;
+        this.version += 1;
+        vfs.observeTextDocument(this.document);
+    }
+
+    /** Model a clean startup open followed by hot-exit overlay on the same object. */
+    observeCleanThenOverlay(vfs: any, cleanText: string, restoredText: string): void {
+        this.currentText = cleanText;
+        this.dirty = false;
+        this.version += 1;
+        vfs.observeTextDocument(this.document);
+        this.currentText = restoredText;
+        this.dirty = true;
+        this.version += 1;
+        vfs.observeTextDocument(this.document);
+    }
+
+    edit(text: string): void {
+        this.currentText = text;
+        this.dirty = true;
+        this.version += 1;
     }
 
     async save(vfs: any): Promise<{saved: boolean, error?: unknown}> {
         try {
-            await vfs.writeFile(this.uri, new TextEncoder().encode(this.text), false, true);
+            vfs.observeTextDocument(this.document);
+            vfs.observeWillSaveTextDocument(this.document);
+            await vfs.writeFile(this.uri, new TextEncoder().encode(this.currentText), false, true);
             this.dirty = false;
+            vfs.observeTextDocument(this.document);
             return {saved: true};
         } catch (error) {
             return {saved: false, error};
         }
+    }
+}
+
+export class SimulatedEditorHost {
+    manualSaveCalls = 0;
+    autoSaveCalls = 0;
+    saveAllCalls = 0;
+
+    manualSave(editor: SimulatedDirtyEditor, vfs: any) {
+        this.manualSaveCalls += 1;
+        return editor.save(vfs);
+    }
+
+    autoSave(editor: SimulatedDirtyEditor, vfs: any) {
+        this.autoSaveCalls += 1;
+        return editor.save(vfs);
+    }
+
+    async saveAll(
+        editors: Array<{editor: SimulatedDirtyEditor, vfs: any}>,
+    ): Promise<boolean> {
+        this.saveAllCalls += 1;
+        const results = await Promise.all(editors.map(({editor, vfs}) => editor.save(vfs)));
+        return results.every(result => result.saved);
     }
 }
 
@@ -824,6 +1032,7 @@ export function resetHarnessRuntime(): void {
         }
     }
     VirtualFileSystemConstructor = undefined;
+    RemoteFileSystemProviderConstructor = undefined;
     loadedRemotePath = undefined;
     loadedStatePath = undefined;
     previousRemoteModule = undefined;
@@ -834,7 +1043,10 @@ export function resetHarnessRuntime(): void {
     originalCacheKeys = undefined;
 }
 
-export async function openAuthoritativeText(harness: VirtualProjectHarness): Promise<string> {
+export async function openAuthoritativeText(
+    harness: VirtualProjectHarness,
+    _acceptAsEditorBase = true,
+): Promise<string> {
     const bytes = await harness.vfs.openFile(harness.uri);
     return new TextDecoder().decode(bytes);
 }
