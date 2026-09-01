@@ -63,6 +63,8 @@ function replaceAt(content: string, from: string, to: string): TextOperation[] {
 async function assertJoinCatchUpFailsClosed(
     label: string,
     response: LooseJoinDocResponse,
+    liveUpdates: unknown[] = [],
+    expectedReadError?: RegExp,
 ): Promise<void> {
     const authoritative = 'aXbc';
     const local = 'LOCAL';
@@ -75,23 +77,25 @@ async function assertJoinCatchUpFailsClosed(
         projectId: PROJECT_A,
     });
     server.injectNextJoinDocResponse(PROJECT_A, 'same-doc-id', response);
-    server.injectNextJoinDocResponse(PROJECT_A, 'same-doc-id', response);
+    server.injectNextJoinLiveUpdates(PROJECT_A, 'same-doc-id', liveUpdates);
 
     try {
         let staleRead: string | undefined;
+        let readError: unknown;
         try {
             staleRead = new TextDecoder().decode(await harness.provider.readFile(harness.uri));
-        } catch {
+        } catch (error) {
             staleRead = undefined;
+            readError = error;
         }
         const editor = new SimulatedDirtyEditor(harness.uri, staleRead ?? local);
         if (staleRead === undefined) {
             editor.attach();
         } else {
-            // On the vulnerable implementation the malformed catch-up is
-            // silently dropped on both joins, binding abc@9 before this edit.
-            // Continue through the public lifecycle so the regression observes
-            // the resulting stale wire attempt before asserting failure.
+            // On a vulnerable implementation the contradictory join can bind
+            // abc@9 before this edit. Continue through the public lifecycle so
+            // the regression observes any stale wire attempt before asserting
+            // that the initial read must have been rejected.
             harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
             editor.openClean(harness.events);
             await settleAsyncWork();
@@ -101,6 +105,9 @@ async function assertJoinCatchUpFailsClosed(
         const result = await editor.saveThroughProvider(harness.provider, harness.events);
 
         assert.equal(staleRead, undefined);
+        if (expectedReadError) {
+            assert.match(String(readError), expectedReadError);
+        }
         assert.equal(result.saved, false);
         assert.equal(editor.dirty, true);
         assert.equal(editor.document.getText(), local);
@@ -117,88 +124,119 @@ describe('stale-buffer rollback safety', () => {
     beforeEach(() => resetHarnessDocuments());
     after(() => resetHarnessRuntime());
 
-    it('rejects a string-version join catch-up before a dirty public save can emit OT', async () => {
+    it('rejects a string-version join-time live update before a dirty public save can emit OT', async () => {
         await assertJoinCatchUpFailsClosed('malformed-join-version', {
             docLines: ['abc'],
             version: 9,
-            updates: [{v: '9', op: [{p: 1, i: 'X'}]}],
+            updates: [],
             ranges: {},
-        });
+        }, [{doc: 'same-doc-id', v: '9', op: [{p: 1, i: 'X'}]}]);
     });
 
-    it('rejects a malformed outer join catch-up before a dirty public save can emit OT', async () => {
+    it('rejects a malformed outer join-time live update before a dirty public save can emit OT', async () => {
         await assertJoinCatchUpFailsClosed('malformed-join-outer', {
             docLines: ['abc'],
             version: 9,
-            updates: [null],
+            updates: [],
             ranges: {},
-        });
+        }, [null]);
     });
 
-    it('rejects a revision gap in join catch-up before a dirty public save can emit OT', async () => {
+    it('rejects a revision gap in join-time live catch-up before a dirty public save can emit OT', async () => {
         await assertJoinCatchUpFailsClosed('gapped-join-catch-up', {
             docLines: ['abc'],
             version: 9,
-            updates: [{doc: 'same-doc-id', v: 10, op: [{p: 1, i: 'X'}]}],
+            updates: [],
             ranges: {},
-        });
+        }, [{doc: 'same-doc-id', v: 10, op: [{p: 1, i: 'X'}]}]);
     });
 
-    it('rejects conflicting duplicate join revisions before a dirty public save can emit OT', async () => {
+    it('rejects conflicting duplicate join-time live revisions before a dirty public save can emit OT', async () => {
         await assertJoinCatchUpFailsClosed('duplicate-join-catch-up', {
             docLines: ['abc'],
             version: 9,
-            updates: [
-                {doc: 'same-doc-id', v: 9, op: [{p: 1, i: 'X'}]},
-                {doc: 'same-doc-id', v: 9, op: [{p: 1, i: 'Y'}]},
-            ],
+            updates: [],
             ranges: {},
-        });
+        }, [
+            {doc: 'same-doc-id', v: 9, op: [{p: 1, i: 'X'}]},
+            {doc: 'same-doc-id', v: 9, op: [{p: 1, i: 'Y'}]},
+        ]);
     });
 
-    it('rejects malformed join operation components before a dirty public save can emit OT', async () => {
+    it('rejects malformed join-time live operation components before a dirty public save can emit OT', async () => {
         await assertJoinCatchUpFailsClosed('malformed-join-component', {
             docLines: ['abc'],
             version: 9,
-            updates: [{doc: 'same-doc-id', v: 9, op: [{p: '1', i: 'X'}]}],
+            updates: [],
             ranges: {},
-        });
+        }, [{doc: 'same-doc-id', v: 9, op: [{p: '1', i: 'X'}]}]);
     });
 
-    it('rejects join catch-up that cannot replay against its snapshot', async () => {
+    it('rejects join-time live catch-up that cannot replay against its snapshot', async () => {
         await assertJoinCatchUpFailsClosed('unreplayable-join-catch-up', {
             docLines: ['abc'],
             version: 9,
-            updates: [{doc: 'same-doc-id', v: 9, op: [{p: 0, d: 'zzz'}]}],
+            updates: [],
             ranges: {},
-        });
+        }, [{doc: 'same-doc-id', v: 9, op: [{p: 0, d: 'zzz'}]}]);
     });
 
-    it('rejects an operation revision that predates the join snapshot', async () => {
+    it('rejects a join-time live operation revision that predates the join snapshot', async () => {
         await assertJoinCatchUpFailsClosed('pre-anchor-join-operation', {
             docLines: ['abc'],
             version: 9,
-            updates: [{v: 8, op: [{p: 0, d: 'zzz'}]}],
+            updates: [],
             ranges: {},
-        });
+        }, [{doc: 'same-doc-id', v: 8, op: [{p: 0, d: 'zzz'}]}]);
     });
 
-    it('rejects an op-less revision that predates the join snapshot', async () => {
+    it('rejects a join-time op-less revision that predates the join snapshot', async () => {
         await assertJoinCatchUpFailsClosed('pre-anchor-join-confirmation', {
             docLines: ['abc'],
             version: 9,
-            updates: [{v: 8}],
+            updates: [],
             ranges: {},
-        });
+        }, [{doc: 'same-doc-id', v: 8}]);
     });
 
-    it('replays a response/live duplicate once as the public editor authority', async () => {
+    it('rejects nonempty response updates as a join protocol contradiction', async () => {
+        await assertJoinCatchUpFailsClosed('nonempty-response-updates', {
+            docLines: ['abc'],
+            version: 9,
+            updates: [{v: 9, op: [{p: 1, i: 'X'}]}],
+            ranges: {},
+        }, [], /unexpected catch-up operations/);
+    });
+
+    it('rejects a snapshot revision above Number.MAX_SAFE_INTEGER', async () => {
+        await assertJoinCatchUpFailsClosed('unsafe-snapshot-version', {
+            docLines: ['abc'],
+            version: Number.MAX_SAFE_INTEGER + 1,
+            updates: [],
+            ranges: {},
+        }, [], /invalid snapshot/);
+    });
+
+    it('rejects a join-time live revision above Number.MAX_SAFE_INTEGER', async () => {
+        await assertJoinCatchUpFailsClosed('unsafe-live-version', {
+            docLines: ['abc'],
+            version: 9,
+            updates: [],
+            ranges: {},
+        }, [{
+            doc: 'same-doc-id',
+            v: Number.MAX_SAFE_INTEGER + 1,
+            op: [{p: 1, i: 'X'}],
+        }], /invalid revision/);
+    });
+
+    it('replays exact duplicate join-time live updates once as the public editor authority', async () => {
         const authoritative = 'aXbc';
         const desired = 'aXbc!';
         const response: LooseJoinDocResponse = {
             docLines: ['abc'],
             version: 9,
-            updates: [{v: 9, op: [{p: 1, i: 'X'}]}],
+            updates: [],
             ranges: {},
         };
         const server = new DeterministicRealtimeServer();
@@ -210,17 +248,18 @@ describe('stale-buffer rollback safety', () => {
             projectId: PROJECT_A,
         });
         server.injectNextJoinDocResponse(PROJECT_A, 'same-doc-id', response);
-        server.injectNextJoinDocResponse(PROJECT_A, 'same-doc-id', response);
-        server.injectNextJoinLiveUpdate(PROJECT_A, 'same-doc-id', {
-            doc: 'same-doc-id',
-            v: 9,
-            op: [{p: 1, i: 'X'}],
-        });
-        server.injectNextJoinLiveUpdate(PROJECT_A, 'same-doc-id', {
-            doc: 'same-doc-id',
-            v: 9,
-            op: [{p: 1, i: 'X'}],
-        });
+        server.injectNextJoinLiveUpdates(PROJECT_A, 'same-doc-id', [
+            {
+                doc: 'same-doc-id',
+                v: 9,
+                op: [{p: 1, i: 'X'}],
+            },
+            {
+                doc: 'same-doc-id',
+                v: 9,
+                op: [{p: 1, i: 'X'}],
+            },
+        ]);
 
         try {
             assert.equal(
@@ -1390,8 +1429,8 @@ describe('stale-buffer rollback safety', () => {
         assert.equal(server.text(PROJECT_A), 'Yab');
     });
 
-    it('invalidates a causal epoch for missing or non-numeric remote revisions', async () => {
-        for (const malformedVersion of [undefined, '10']) {
+    it('invalidates a causal epoch for missing, non-numeric, or unsafe remote revisions', async () => {
+        for (const malformedVersion of [undefined, '10', Number.MAX_SAFE_INTEGER + 1]) {
             const server = new DeterministicRealtimeServer();
             addProject(server, 'ab', PROJECT_A, `Malformed Revision ${String(malformedVersion)}`, 10);
             const harness = createHarness(server);
@@ -1494,6 +1533,79 @@ describe('stale-buffer rollback safety', () => {
         assert.equal(server.senderConfirmationCount, 1);
         assert.equal(server.collaboratorBroadcastCount, 1);
         assert.equal(server.text(PROJECT_A), desired);
+    });
+
+    it('emits zero retry OT when the fresh authoritative revision cannot advance safely', async () => {
+        const base = 'abc';
+        const desired = 'abXc';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Unsafe Retry Revision', 9);
+        const harness = createHarness(server, new HarnessStorage(), 'writer');
+        assert.equal(await openAuthoritativeText(harness), base);
+        const editor = new SimulatedDirtyEditor(harness.uri, desired);
+        editor.attach();
+        await editor.confirmStagedBase(harness.vfs, base);
+        server.loseNextAckBeforeCommit();
+
+        const interrupted = await editor.save(harness.vfs);
+        assert.equal(interrupted.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(server.capturedUpdates.length, 1);
+        assert.equal(server.logicalApplyCount, 0);
+
+        server.document(PROJECT_A).version = Number.MAX_SAFE_INTEGER;
+        await harness.vfs.init();
+        await settleAsyncWork();
+        const recovered = await editor.save(harness.vfs);
+
+        assert.equal(recovered.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), desired);
+        assert.equal(server.capturedUpdates.length, 1);
+        assert.equal(server.logicalApplyCount, 0);
+        assert.equal(server.text(PROJECT_A), base);
+        assert.equal(server.version(PROJECT_A), Number.MAX_SAFE_INTEGER);
+    });
+
+    it('rechecks the authoritative revision after persisting a retry intent', async () => {
+        const base = 'abc';
+        const desired = 'abXc';
+        const storage = new HarnessStorage();
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Retry Authority Race', 9);
+        const harness = createHarness(server, storage, 'writer');
+        assert.equal(await openAuthoritativeText(harness), base);
+        const editor = new SimulatedDirtyEditor(harness.uri, desired);
+        editor.attach();
+        await editor.confirmStagedBase(harness.vfs, base);
+        server.loseNextAckBeforeCommit();
+
+        const interrupted = await editor.save(harness.vfs);
+        assert.equal(interrupted.saved, false);
+        assert.equal(server.capturedUpdates.length, 1);
+        assert.equal(server.logicalApplyCount, 0);
+
+        server.document(PROJECT_A).version = Number.MAX_SAFE_INTEGER - 1;
+        await harness.vfs.init();
+        await settleAsyncWork();
+        const provenanceStore = storage.provenanceStore('writer');
+        const markPendingWrite = provenanceStore.markPendingWrite.bind(provenanceStore);
+        provenanceStore.markPendingWrite = async (recordName, pendingWrite) => {
+            const record = await markPendingWrite(recordName, pendingWrite);
+            provenanceStore.markPendingWrite = markPendingWrite;
+            server.collaboratorUpdate(PROJECT_A, [{p: 0, i: 'Y'}]);
+            return record;
+        };
+
+        const recovered = await editor.save(harness.vfs);
+
+        assert.equal(recovered.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), desired);
+        assert.equal(server.capturedUpdates.length, 1);
+        assert.equal(server.logicalApplyCount, 0);
+        assert.equal(server.text(PROJECT_A), `Y${base}`);
+        assert.equal(server.version(PROJECT_A), Number.MAX_SAFE_INTEGER);
     });
 
     it('retains durable dedupe evidence when payload enqueue succeeds but notification enqueue disconnects', async () => {

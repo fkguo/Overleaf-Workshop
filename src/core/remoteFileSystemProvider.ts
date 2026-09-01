@@ -252,6 +252,10 @@ function isPlainObject(value: unknown): value is {[key: string]: unknown} {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function isNonnegativeSafeInteger(value: unknown): value is number {
+    return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
 export function parseUri(uri: vscode.Uri) {
     return parseProjectUri(uri.authority, uri.path, uri.query);
 }
@@ -612,6 +616,9 @@ export class VirtualFileSystem extends vscode.Disposable {
         content: string,
         socketGeneration: number,
     ): RemoteDocumentCausality {
+        if (!isNonnegativeSafeInteger(version)) {
+            throw new Error('Document causal ledger has an invalid anchor revision');
+        }
         const ledger: RemoteDocumentCausality = {
             socketGeneration,
             epoch: randomUUID(),
@@ -630,6 +637,10 @@ export class VirtualFileSystem extends vscode.Disposable {
         prepared: PreparedDocumentJoin,
         socketGeneration: number,
     ): RemoteDocumentCausality {
+        if (!isNonnegativeSafeInteger(prepared.headVersion)
+            || [...prepared.updates.keys()].some(version => !isNonnegativeSafeInteger(version))) {
+            throw new Error('Document causal ledger contains an invalid revision');
+        }
         const ledger = this.startRemoteCausality(
             docId,
             prepared.anchorVersion,
@@ -660,8 +671,11 @@ export class VirtualFileSystem extends vscode.Disposable {
         const remote = this.remoteDocumentCausality.get(docId);
         const valid = Boolean(
             sender
+            && isNonnegativeSafeInteger(version)
             && remote
             && remote.valid
+            && isNonnegativeSafeInteger(remote.anchorVersion)
+            && isNonnegativeSafeInteger(remote.headVersion)
             && remote.socketGeneration === sender.generation
             && remote.headVersion === version
             && remote.headContent === content
@@ -689,6 +703,8 @@ export class VirtualFileSystem extends vscode.Disposable {
         const local = active?.causality;
         const remote = this.remoteDocumentCausality.get(docId);
         if (!sender
+            || !isNonnegativeSafeInteger(base.version)
+            || !isNonnegativeSafeInteger(remoteVersion)
             || !active
             || active.identity.docId !== docId
             || active.version !== base.version
@@ -700,6 +716,8 @@ export class VirtualFileSystem extends vscode.Disposable {
             || local.content !== desiredContent
             || !remote
             || !remote.valid
+            || !isNonnegativeSafeInteger(remote.anchorVersion)
+            || !isNonnegativeSafeInteger(remote.headVersion)
             || remote.socketGeneration !== sender.generation
             || remote.epoch !== local.remoteEpoch
             || remote.anchorVersion > base.version
@@ -754,7 +772,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     private stageEditorBase(uri: vscode.Uri, doc: DocumentEntity, content: string) {
         const resourceKey = this.resourceKey(uri);
         this.documentIdsByPath.set(resourceKey, doc._id);
-        if (doc.version === undefined) {
+        if (!isNonnegativeSafeInteger(doc.version)) {
             this.stagedEditorBases.delete(resourceKey);
             return;
         }
@@ -770,7 +788,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         this.stageEditorBase(uri, doc, content);
         const resourceKey = this.resourceKey(uri);
         const sender = this.currentSenderWitness();
-        if (doc.version === undefined || !sender) {
+        if (!isNonnegativeSafeInteger(doc.version) || !sender) {
             this.pendingReadTickets.delete(resourceKey);
             return;
         }
@@ -1338,7 +1356,8 @@ export class VirtualFileSystem extends vscode.Disposable {
         expectedContent: string,
     ): boolean {
         try {
-            return this.currentDocument(doc._id) === doc
+            return isNonnegativeSafeInteger(expectedVersion)
+                && this.currentDocument(doc._id) === doc
                 && doc.version === expectedVersion
                 && doc.remoteCache === expectedContent;
         } catch {
@@ -1506,7 +1525,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                     || bufferAfterJoin?.docId !== buffer.docId
                     || document.version !== blockedVersion
                     || document.getText() !== blockedText
-                    || authoritativeVersion === undefined
+                    || !isNonnegativeSafeInteger(authoritativeVersion)
                     || senderAfterJoin?.publicId !== sender.publicId
                     || senderAfterJoin.generation !== sender.generation
                     || !this.documentMatchesAuthority(
@@ -1704,6 +1723,9 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     private waitForDocumentVersion(docId: string, expectedVersion: number, timeoutMs = 15000) {
+        if (!isNonnegativeSafeInteger(expectedVersion)) {
+            throw new Error('Cannot wait for an invalid document revision');
+        }
         let waiter!: DocumentVersionWaiter;
         const promise = new Promise<number>((resolve, reject) => {
             waiter = {
@@ -2114,27 +2136,23 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (!isPlainObject(response)
             || !Array.isArray(response.docLines)
             || !response.docLines.every(line => typeof line === 'string')
-            || typeof response.version !== 'number'
-            || !Number.isInteger(response.version)
-            || response.version < 0
+            || !isNonnegativeSafeInteger(response.version)
             || !Array.isArray(response.updates)) {
             throw new Error('Document join response has an invalid snapshot');
+        }
+        if (response.updates.length !== 0) {
+            throw new Error('Document join response contains unexpected catch-up operations');
         }
 
         const anchorVersion = response.version;
         const anchorContent = response.docLines.join('\n');
-        const responseUpdates = response.updates.map(update => ({update}));
-        const normalized = [...responseUpdates, ...receivedUpdates].map((received, index) => {
+        const normalized = receivedUpdates.map((received, index) => {
             const update = received.update;
             if (!isPlainObject(update)
-                || typeof update.v !== 'number'
-                || !Number.isInteger(update.v)
-                || update.v < 0) {
+                || !isNonnegativeSafeInteger(update.v)) {
                 throw new Error(`Document join update ${index} has an invalid revision`);
             }
-            const fromJoinResponse = index < responseUpdates.length;
-            if ((fromJoinResponse && update.doc !== undefined && update.doc !== docId)
-                || (!fromJoinResponse && update.doc !== docId)) {
+            if (update.doc !== docId) {
                 throw new Error(`Document join update ${index} has an invalid document identity`);
             }
             if (update.v < anchorVersion) {
@@ -2183,6 +2201,9 @@ export class VirtualFileSystem extends vscode.Disposable {
             if (revision !== headVersion) {
                 throw new Error('Document join catch-up revisions are not contiguous');
             }
+            if (!isNonnegativeSafeInteger(headVersion + 1)) {
+                throw new Error('Document join catch-up exceeds the safe revision range');
+            }
             const operations = uniqueUpdates.get(revision)!;
             headContent = applyTextOperations(headContent, operations);
             causalUpdates.set(
@@ -2206,10 +2227,17 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (res===undefined) { return; }
 
         const doc = res.fileEntity as DocumentEntity;
-        if (!Number.isInteger(update.v) || update.v < 0) {
+        if (!isNonnegativeSafeInteger(update.v)) {
             this.invalidateDocumentSession(
                 doc._id,
                 new Error('Document update has an invalid revision'),
+            );
+            return;
+        }
+        if (doc.version !== undefined && !isNonnegativeSafeInteger(doc.version)) {
+            this.invalidateDocumentSession(
+                doc._id,
+                new Error('Document session has an invalid revision'),
             );
             return;
         }
@@ -2288,6 +2316,13 @@ export class VirtualFileSystem extends vscode.Disposable {
             return;
         }
 
+        if (!isNonnegativeSafeInteger(doc.version + 1)) {
+            this.invalidateDocumentSession(
+                doc._id,
+                new Error('Document update exceeds the safe revision range'),
+            );
+            return;
+        }
         const beforeVersion = doc.version;
         const beforeContent = doc.remoteCache;
         doc.version += 1;
@@ -2837,8 +2872,14 @@ export class VirtualFileSystem extends vscode.Disposable {
     private async ensureDocumentSession(docId: string): Promise<{doc: DocumentEntity, content: string}> {
         await this.init();
         const doc = this.currentDocument(docId);
-        if (doc.version !== undefined && doc.remoteCache !== undefined) {
+        if (isNonnegativeSafeInteger(doc.version) && doc.remoteCache !== undefined) {
             return {doc, content: doc.remoteCache};
+        }
+        if (doc.version !== undefined || doc.remoteCache !== undefined) {
+            this.invalidateDocumentSession(
+                docId,
+                new Error('Cached document session has an invalid revision or snapshot'),
+            );
         }
         return this.joinFreshDocumentSession(docId);
     }
@@ -2897,6 +2938,16 @@ export class VirtualFileSystem extends vscode.Disposable {
         }).catch(() => {});
     }
 
+    private pendingDocumentUpdateHasSafeRevisions(pending: PendingDocumentUpdate): boolean {
+        return isNonnegativeSafeInteger(pending.baseVersion)
+            && isNonnegativeSafeInteger(pending.update.v)
+            && isNonnegativeSafeInteger(pending.update.v + 1)
+            && (pending.update.lastV === undefined
+                || isNonnegativeSafeInteger(pending.update.lastV))
+            && (pending.confirmationVersion === undefined
+                || isNonnegativeSafeInteger(pending.confirmationVersion));
+    }
+
     private pendingWritePayload(
         pending: PendingDocumentUpdate,
         state = 'submitted',
@@ -2934,8 +2985,11 @@ export class VirtualFileSystem extends vscode.Disposable {
         currentMatchesAuthoritative: boolean,
     }> {
         const authoritativeVersion = authoritative.doc.version;
-        if (authoritativeVersion === undefined) {
+        if (!isNonnegativeSafeInteger(authoritativeVersion)) {
             throw new Error('The confirmed write has no authoritative revision');
+        }
+        if (!this.pendingDocumentUpdateHasSafeRevisions(pending)) {
+            throw new Error('The confirmed write contains an invalid document revision');
         }
         if (pending.confirmationVersion === undefined) {
             throw new Error('The confirmed write has no observed sender-confirmation revision');
@@ -3093,6 +3147,13 @@ export class VirtualFileSystem extends vscode.Disposable {
                 'an outcome-unknown write belongs to a different remote document',
             );
         }
+        if (!this.pendingDocumentUpdateHasSafeRevisions(pending)) {
+            this.blockDocumentWrite(
+                uri,
+                content,
+                'the pending write contains an invalid document revision',
+            );
+        }
         if (pending.confirmationVersion === undefined
             && pending.desiredContent !== desiredContent) {
             this.blockDocumentWrite(
@@ -3154,7 +3215,16 @@ export class VirtualFileSystem extends vscode.Disposable {
             }
         }
 
-        await this.ensureDocumentSession(docId);
+        const retrySession = await this.ensureDocumentSession(docId);
+        const retrySessionVersion = retrySession.doc.version;
+        if (!isNonnegativeSafeInteger(retrySessionVersion)
+            || !isNonnegativeSafeInteger(retrySessionVersion + 1)) {
+            this.blockDocumentWrite(
+                uri,
+                content,
+                'the current document revision cannot accept a safe deduplicated retry',
+            );
+        }
         const sender = this.currentSenderWitness();
         const retryPublicId = sender?.publicId;
         const retryGeneration = sender?.generation;
@@ -3181,9 +3251,16 @@ export class VirtualFileSystem extends vscode.Disposable {
             retryPending.provenanceRecordName,
             this.pendingWritePayload(retryPending),
         );
-        if (this.publicId !== retryPublicId
-            || this.socket.generation !== retryGeneration
-            || !this.socket.isConnected
+        const senderBeforeRetry = this.currentSenderWitness();
+        const retryAuthorityStillCurrent = this.documentMatchesAuthority(
+            retrySession.doc,
+            retrySessionVersion,
+            retrySession.content,
+        ) && isNonnegativeSafeInteger(retrySession.doc.version)
+            && isNonnegativeSafeInteger(retrySession.doc.version + 1);
+        if (senderBeforeRetry?.publicId !== retryPublicId
+            || senderBeforeRetry.generation !== retryGeneration
+            || !retryAuthorityStillCurrent
             || this.pendingDocumentUpdates.get(witness.bufferId) !== pending
             || !this.bufferMatchesWitness(witness)) {
             await this.provenanceStore.markPendingWrite(
@@ -3193,7 +3270,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             this.blockDocumentWrite(
                 uri,
                 content,
-                'the realtime identity changed before the pending operation could be retried',
+                'the document authority or realtime identity changed before the pending operation could be retried',
             );
         }
         this.pendingDocumentUpdates.set(witness.bufferId, retryPending);
@@ -3256,7 +3333,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             throw error;
         }
         const authoritativeVersion = authoritative.doc.version;
-        if (authoritativeVersion === undefined) {
+        if (!isNonnegativeSafeInteger(authoritativeVersion)) {
             this.blockDocumentWrite(
                 uri,
                 content,
@@ -3341,8 +3418,15 @@ export class VirtualFileSystem extends vscode.Disposable {
             const doc = session.doc;
             const remoteContent = session.content;
             const sessionVersion = doc.version;
-            if (sessionVersion === undefined) {
-                this.blockDocumentWrite(uri, content, 'the joined document revision is unknown');
+            if (!isNonnegativeSafeInteger(sessionVersion)) {
+                this.blockDocumentWrite(uri, content, 'the joined document revision is invalid');
+            }
+            if (!isNonnegativeSafeInteger(sessionVersion + 1)) {
+                this.blockDocumentWrite(
+                    uri,
+                    content,
+                    'the next document revision cannot be represented safely',
+                );
             }
 
             const provenance = await this.resolveEditorProvenance(docId, _content, witness);
@@ -3549,7 +3633,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 throw error;
             }
             const authoritativeVersion = authoritative.doc.version;
-            if (authoritativeVersion === undefined) {
+            if (!isNonnegativeSafeInteger(authoritativeVersion)) {
                 this.blockDocumentWrite(
                     uri,
                     content,

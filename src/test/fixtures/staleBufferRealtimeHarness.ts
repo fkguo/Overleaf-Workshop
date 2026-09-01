@@ -33,12 +33,6 @@ export type LooseJoinDocResponse = {
     [key: string]: unknown,
 };
 
-type InjectedJoinLiveUpdate = {
-    doc: string,
-    v: number,
-    op?: TextOperation[],
-};
-
 type EventHandlers = {
     onConnectionAccepted?: (publicId: string) => void,
     onProjectJoined?: (session: {
@@ -889,10 +883,10 @@ class DeterministicSocket {
         this.joinedDocuments.add(docId);
         this.server.joinDocCallCount += 1;
         const injected = this.server.consumeNextJoinDocResponse(this.projectId, docId);
-        const liveUpdate = this.server.consumeNextJoinLiveUpdate(this.projectId, docId);
-        if (liveUpdate) {
+        const liveUpdates = this.server.consumeNextJoinLiveUpdates(this.projectId, docId);
+        for (const liveUpdate of liveUpdates) {
             this.handlers.onFileChanged?.(
-                liveUpdate,
+                liveUpdate as Parameters<NonNullable<EventHandlers['onFileChanged']>>[0],
                 {publicId: this.publicId, generation: this.generation},
             );
         }
@@ -968,10 +962,10 @@ export class DeterministicRealtimeServer {
         docId: string,
         response: LooseJoinDocResponse,
     }> = [];
-    private readonly nextJoinLiveUpdates: Array<{
+    private readonly nextJoinLiveUpdateBatches: Array<{
         projectId: string,
         docId: string,
-        update: InjectedJoinLiveUpdate,
+        updates: unknown[],
     }> = [];
 
     addProject(spec: {
@@ -1032,21 +1026,21 @@ export class DeterministicRealtimeServer {
         return clone(injected.response);
     }
 
-    injectNextJoinLiveUpdate(
+    injectNextJoinLiveUpdates(
         projectId: string,
         docId: string,
-        update: InjectedJoinLiveUpdate,
+        updates: unknown[],
     ): void {
-        this.nextJoinLiveUpdates.push({projectId, docId, update: clone(update)});
+        this.nextJoinLiveUpdateBatches.push({projectId, docId, updates: clone(updates)});
     }
 
-    consumeNextJoinLiveUpdate(projectId: string, docId: string): InjectedJoinLiveUpdate | undefined {
-        const injected = this.nextJoinLiveUpdates[0];
+    consumeNextJoinLiveUpdates(projectId: string, docId: string): unknown[] {
+        const injected = this.nextJoinLiveUpdateBatches[0];
         if (!injected || injected.projectId !== projectId || injected.docId !== docId) {
-            return undefined;
+            return [];
         }
-        this.nextJoinLiveUpdates.shift();
-        return clone(injected.update);
+        this.nextJoinLiveUpdateBatches.shift();
+        return clone(injected.updates);
     }
 
     projectSnapshot(projectId: string) {
