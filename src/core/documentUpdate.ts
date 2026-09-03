@@ -317,6 +317,45 @@ function transformOperationPair(
     return [left, transformedRight];
 }
 
+export type ConcurrentTextOperationTransform = {
+    remoteContent: string,
+    localContent: string,
+    mergedContent: string,
+    remoteAfterLocal: TextOperation[],
+    localAfterRemote: TextOperation[],
+};
+
+/**
+ * Transform one exact server operation and one exact local operation from the
+ * same base. The server/left operation wins same-position insertion ties, as
+ * required by Overleaf's pinned ShareJS text type. Both application orders are
+ * replayed before any transformed operation is returned.
+ */
+export function transformConcurrentTextOperations(
+    baseContent: string,
+    remoteOperations: TextOperation[],
+    localOperations: TextOperation[],
+): ConcurrentTextOperationTransform {
+    const remoteContent = applyTextOperations(baseContent, remoteOperations);
+    const localContent = applyTextOperations(baseContent, localOperations);
+    const [remoteAfterLocal, localAfterRemote] = transformOperationPair(
+        remoteOperations,
+        localOperations,
+    );
+    const remoteFirst = applyTextOperations(remoteContent, localAfterRemote);
+    const localFirst = applyTextOperations(localContent, remoteAfterLocal);
+    if (remoteFirst !== localFirst) {
+        throw new Error('Concurrent text operation transform does not converge');
+    }
+    return {
+        remoteContent,
+        localContent,
+        mergedContent: remoteFirst,
+        remoteAfterLocal,
+        localAfterRemote,
+    };
+}
+
 function markerBoundary(markers: PositionMarker[], position: number, originalLength: number): number {
     for (let index = position; index < markers.length; index += 1) {
         const marker = markers[index];
