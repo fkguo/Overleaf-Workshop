@@ -768,6 +768,64 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
         assert.equal(viewer.doc.generation, 1);
     });
 
+    it('does not let a later failed or no-op compile verify an earlier unresolved build', async () => {
+        for (const laterOutcome of [failedOutcome(), undefined]) {
+            const fixture = projectFixture();
+            const actions: string[] = [];
+            let compileCount = 0;
+            const vfs = createVfs(successfulOutcome(), actions);
+            (vfs as any).compile = async () => {
+                compileCount += 1;
+                return compileCount === 1 ? successfulOutcome() : laterOutcome;
+            };
+            const manager = createManager(vfs);
+
+            // PDF A began opening without a record. Build B commits, then C
+            // fails or does nothing before A finishes registering.
+            await manager.compile(true, 'command', fixture.compileUri);
+            await manager.compile(true, 'command', fixture.compileUri);
+            const viewer = registerPdfViewer(fixture, actions, {initialGeneration: 1});
+            setActiveEditor(fixture.sourceUri);
+            await manager.syncCode();
+
+            assert.deepEqual(actions, []);
+            assert.deepEqual(viewer.messages, []);
+        }
+    });
+
+    it('keeps the old PDF blocked when it registers before the later compile fails', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        let finishLaterCompile!: (outcome: CompileOutcome) => void;
+        const laterCompile = new Promise<CompileOutcome>(resolve => {
+            finishLaterCompile = resolve;
+        });
+        let compileCount = 0;
+        const vfs = createVfs(successfulOutcome(), actions);
+        vfs.compile = async () => {
+            compileCount += 1;
+            return compileCount === 1 ? successfulOutcome() : laterCompile;
+        };
+        const manager = createManager(vfs);
+
+        // PDF A has no record when build B commits. It finishes registering
+        // while compile C is active, before C reports failure.
+        await manager.compile(true, 'command', fixture.compileUri);
+        const compiling = manager.compile(true, 'command', fixture.compileUri);
+        await flushAsync();
+        const viewer = registerPdfViewer(fixture, actions, {initialGeneration: 1});
+        setActiveEditor(fixture.sourceUri);
+        await manager.syncCode();
+        assert.deepEqual(actions, []);
+
+        finishLaterCompile(failedOutcome());
+        await compiling;
+        await manager.syncCode();
+
+        assert.deepEqual(actions, []);
+        assert.deepEqual(viewer.messages, []);
+    });
+
     it('keeps a successful compile successful when SyncTeX is unavailable', async () => {
         const fixture = projectFixture();
         const actions: string[] = [];

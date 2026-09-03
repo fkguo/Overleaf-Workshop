@@ -93,6 +93,7 @@ type CapturedCompileSourceSync = PendingSourceSync & {
 type PdfCompileTransition = {
     buildGeneration: number,
     autoSourceGeneration: number,
+    priorBuildUnverified: boolean,
     previousRecord?: PdfViewRecord,
     previousSyncableGeneration?: number,
     buildMayHaveChanged: boolean,
@@ -662,6 +663,7 @@ export class CompileManager {
         const transition: PdfCompileTransition = {
             buildGeneration: compiledPdfBuildRequests.begin(identifier),
             autoSourceGeneration: sourceSyncRequests.begin(recordKey),
+            priorBuildUnverified: unsyncablePdfProjects.has(identifier),
             previousRecord: record,
             previousSyncableGeneration: record && isPdfGenerationSyncable(record, generation) ?
                 generation : undefined,
@@ -681,6 +683,7 @@ export class CompileManager {
 
     private restorePdfSyncability(identifier: string, transition: PdfCompileTransition) {
         if (
+            transition.priorBuildUnverified ||
             transition.buildMayHaveChanged ||
             !compiledPdfBuildRequests.isCurrent(identifier, transition.buildGeneration)
         ) { return; }
