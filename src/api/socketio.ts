@@ -7,6 +7,18 @@ import {
     SocketRequestError,
     withTimeout,
 } from './socketRequest';
+import {
+    JsonValue,
+    parseHistoryOtSnapshot,
+    serializeHistoryOtSnapshot,
+} from '../core/historyOt';
+import {deepCloneJson, isJsonObject} from '../core/historyOt/protocol';
+import type {
+    HistoryOtSession,
+    HistoryOtThreadEventName,
+    HistoryOtWriteIntent,
+} from '../core/historyOtSession';
+import {parseHistoryOtRealtimeEnvelope} from '../core/historyOtSession';
 
 function decodePackedUtf8(text: string): string {
     return Buffer.from(text, 'latin1').toString('utf-8');
@@ -58,6 +70,24 @@ export interface UpdateSchema {
     }
 }
 
+export interface ShareJsDocumentJoin {
+    readonly otType: 'sharejs-text-ot',
+    readonly docLines: string[],
+    readonly version: number,
+    readonly updates: unknown[],
+    readonly ranges: unknown,
+}
+
+export interface HistoryOtDocumentJoin {
+    readonly otType: 'history-ot',
+    readonly snapshot: JsonValue,
+    readonly version: number,
+    readonly updates: JsonValue[],
+    readonly ranges: JsonValue,
+}
+
+export type DocumentJoin = ShareJsDocumentJoin | HistoryOtDocumentJoin;
+
 export type PermissionsLevel = 'owner' | 'readAndWrite' | 'review' | 'readOnly';
 
 export interface ProjectSessionSchema {
@@ -102,13 +132,18 @@ export interface EventsHandler {
     onFileRenamed?: (entityId:string, newName:string) => void,
     onFileRemoved?: (entityId:string) => void,
     onFileMoved?: (entityId:string, newParentFolderId:string) => void,
-    onFileChanged?: (update:UpdateSchema, sender?: ProjectSenderWitness) => void,
+    // Kept intentionally untyped at this transport boundary: ShareJS and
+    // History OT have distinct wire shapes and consumers must select/parser-gate
+    // the active document kind before interpreting the raw payload.
+    onFileChanged?: (update:unknown, sender?: ProjectSenderWitness) => void,
     //
     onDisconnected?: () => void,
     onConnectionAccepted?: (publicId:string) => void,
     onProjectJoined?: (session:ProjectSessionSchema) => void,
     onOtUpdateError?: (error:OtUpdateErrorSchema) => void,
     onFatalError?: (error:RealtimeFatalError) => void,
+    onPermissionsInvalidated?: () => void,
+    onHistoryOtThreadEvent?: (event:HistoryOtThreadEventName, args:unknown[]) => void,
     onClientUpdated?: (user:UpdateUserSchema) => void,
     onClientDisconnected?: (id:string) => void,
     //
@@ -565,6 +600,7 @@ export class SocketIOAPI {
         args: any[],
         timeoutMs: number = ACK_TIMEOUT_MS,
         expectedSender?: ProjectSenderWitness,
+        authorizeImmediatelyBeforeEmit?: () => void,
     ): Promise<T> {
         if (expectedSender && !this.senderWitnessMatches(expectedSender)) {
             throw new SocketRequestError(
@@ -582,6 +618,10 @@ export class SocketIOAPI {
                 false,
             );
         }
+        // No await may occur between this authorization hook and
+        // requestWithAck's synchronous emit. History OT uses it to close the
+        // permission/session invalidation window opened by waitUntilConnected.
+        authorizeImmediatelyBeforeEmit?.();
         return requestWithAck<T>(
             socketAtEmit,
             event,
@@ -817,6 +857,15 @@ export class SocketIOAPI {
                 'Access to this Overleaf project was revoked',
             );
         });
+        const invalidatePermissions = () => {
+            if (socketAtInit !== this.socket || socketAtInit === this.retiredSocket) { return; }
+            this.currentPermissionsLevel = undefined;
+            this.lastKnownPermissionsLevel = undefined;
+            this._handlers.forEach(handler => handler.onPermissionsInvalidated?.());
+        };
+        socketAtInit.on('project:membership:changed', invalidatePermissions);
+        socketAtInit.on('project:collaboratorAccessLevel:changed', invalidatePermissions);
+        socketAtInit.on('project:publicAccessLevel:changed', invalidatePermissions);
         socketAtInit.on('otUpdateError', (error:any, details:any) => {
             if (socketAtInit !== this.socket || socketAtInit === this.retiredSocket) { return; }
             const updateError = this.normalizeOtUpdateError(error, details);
@@ -1025,48 +1074,56 @@ export class SocketIOAPI {
     updateEventHandlers(handlers: EventsHandler) {
         if (this.disposed) { return; }
         this._handlers.push(handlers);
+        const socketAtRegistration = this.socket;
+        const generationAtRegistration = this.socketGeneration;
+        if (!socketAtRegistration) { return; }
+        const active = <Args extends unknown[]>(callback: (...args: Args) => void) =>
+            (...args: Args) => {
+                if (
+                    this.disposed ||
+                    socketAtRegistration !== this.socket ||
+                    socketAtRegistration === this.retiredSocket ||
+                    generationAtRegistration !== this.socketGeneration
+                ) { return; }
+                callback(...args);
+            };
         Object.values(handlers).forEach((handler) => {
             switch (handler) {
                 case handlers.onFileCreated:
-                    this.socket.on('reciveNewDoc', (parentFolderId:string, doc:DocumentEntity) => {
+                    socketAtRegistration.on('reciveNewDoc', active((parentFolderId:string, doc:DocumentEntity) => {
                         handler(parentFolderId, 'doc', doc);
-                    });
-                    this.socket.on('reciveNewFile', (parentFolderId:string, file:FileRefEntity) => {
+                    }));
+                    socketAtRegistration.on('reciveNewFile', active((parentFolderId:string, file:FileRefEntity) => {
                         handler(parentFolderId, 'file', file);
-                    });
-                    this.socket.on('reciveNewFolder', (parentFolderId:string, folder:FolderEntity) => {
+                    }));
+                    socketAtRegistration.on('reciveNewFolder', active((parentFolderId:string, folder:FolderEntity) => {
                         handler(parentFolderId, 'folder', folder);
-                    });
+                    }));
                     break;
                 case handlers.onFileRenamed:
-                    this.socket.on('reciveEntityRename', (entityId:string, newName:string) => {
+                    socketAtRegistration.on('reciveEntityRename', active((entityId:string, newName:string) => {
                         handler(entityId, newName);
-                    });
+                    }));
                     break;
                 case handlers.onFileRemoved:
-                    this.socket.on('removeEntity', (entityId:string) => {
+                    socketAtRegistration.on('removeEntity', active((entityId:string) => {
                         handler(entityId);
-                    });
+                    }));
                     break;
                 case handlers.onFileMoved:
-                    this.socket.on('reciveEntityMove', (entityId:string, folderId:string) => {
+                    socketAtRegistration.on('reciveEntityMove', active((entityId:string, folderId:string) => {
                         handler(entityId, folderId);
-                    });
+                    }));
                     break;
                 case handlers.onFileChanged: {
-                    const socketAtRegistration = this.socket;
-                    socketAtRegistration.on('otUpdateApplied', (update: UpdateSchema) => {
-                        if (socketAtRegistration !== this.socket
-                            || socketAtRegistration === this.retiredSocket) {
-                            return;
-                        }
+                    socketAtRegistration.on('otUpdateApplied', active((update: unknown) => {
                         const session = this.projectSession;
                         const sender = session?.generation === this.socketGeneration ? {
                                 publicId: session.publicId,
                                 generation: session.generation,
                             } : undefined;
                         handler(update, sender);
-                    });
+                    }));
                     break;
                 }
                 case handlers.onDisconnected:
@@ -1074,38 +1131,52 @@ export class SocketIOAPI {
                 case handlers.onProjectJoined:
                 case handlers.onOtUpdateError:
                 case handlers.onFatalError:
+                case handlers.onPermissionsInvalidated:
                     // Internal handlers dispatch these lifecycle events after
                     // validating the active socket generation.
                     break;
+                case handlers.onHistoryOtThreadEvent:
+                    for (const event of [
+                        'new-comment',
+                        'edit-message',
+                        'delete-message',
+                        'resolve-thread',
+                        'reopen-thread',
+                        'delete-thread',
+                        'new-comment-threads',
+                    ] as const) {
+                        socketAtRegistration.on(event, active((...args: unknown[]) => handler(event, args)));
+                    }
+                    break;
                 case handlers.onClientUpdated:
-                    this.socket.on('clientTracking.clientUpdated', (user:UpdateUserSchema) => {
+                    socketAtRegistration.on('clientTracking.clientUpdated', active((user:UpdateUserSchema) => {
                         handler(user);
-                    });
+                    }));
                     break;
                 case handlers.onClientDisconnected:
-                    this.socket.on('clientTracking.clientDisconnected', (id:string) => {
+                    socketAtRegistration.on('clientTracking.clientDisconnected', active((id:string) => {
                         handler(id);
-                    });
+                    }));
                     break;
                 case handlers.onReceivedMessage:
-                    this.socket.on('new-chat-message', (message:ProjectMessageResponseSchema) => {
+                    socketAtRegistration.on('new-chat-message', active((message:ProjectMessageResponseSchema) => {
                         handler(message);
-                    });
+                    }));
                     break;
                 case handlers.onSpellCheckLanguageUpdated:
-                    this.socket.on('spellCheckLanguageUpdated', (language:string) => {
+                    socketAtRegistration.on('spellCheckLanguageUpdated', active((language:string) => {
                         handler(language);
-                    });
+                    }));
                     break;
                 case handlers.onCompilerUpdated:
-                    this.socket.on('compilerUpdated', (compiler:string) => {
+                    socketAtRegistration.on('compilerUpdated', active((compiler:string) => {
                         handler(compiler);
-                    });
+                    }));
                     break;
                 case handlers.onRootDocUpdated:
-                    this.socket.on('rootDocUpdated', (rootDocId:string) => {
+                    socketAtRegistration.on('rootDocUpdated', active((rootDocId:string) => {
                         handler(rootDocId);
-                    });
+                    }));
                     break;
                 default:
                     break;
@@ -1249,27 +1320,72 @@ export class SocketIOAPI {
      * @param {string} docId - The document id.
      * @returns {Promise}
      */
-    async joinDoc(docId:string) {
+    async joinDoc(docId:string): Promise<DocumentJoin> {
         try {
+            const activeScheme = this._socketInitScheme ?? this.scheme;
+            const supportsHistoryOt = activeScheme !== 'Alt';
             return await this.queueDocumentMembership(() =>
-                this.request<[Array<string>, number, Array<any>, any, string?]>(
+                this.request<[unknown, number, unknown[], unknown, string?]>(
                     'joinDoc',
-                    // Deliberately do not claim supportsHistoryOT. This client cannot
-                    // safely interpret tracked-change operations yet.
-                    [docId, { encodeRanges: true }],
+                    [docId, {
+                        encodeRanges: true,
+                        ...(supportsHistoryOt ? {supportsHistoryOT: true} : {}),
+                    }],
                 )
             )
-            .then((returns: [Array<string>, number, Array<any>, any, string?]) => {
-                const [docLinesAscii, version, updates, ranges, type = 'sharejs-text-ot'] = returns;
-                if (type !== 'sharejs-text-ot') {
+            .then((returns): DocumentJoin => {
+                const [rawDocument, version, rawUpdates, ranges, type = 'sharejs-text-ot'] = returns;
+                if (!Number.isSafeInteger(version) || version < 0 || !Array.isArray(rawUpdates)) {
                     throw this.terminateRealtime(
                         'unsupported_history_ot',
-                        `Document ${docId} uses unsupported OT type ${type}`,
+                        `Document ${docId} returned an unsafe join response`,
+                        {docId, version, type},
+                    );
+                }
+                if (type === 'history-ot') {
+                    if (!supportsHistoryOt) {
+                        throw this.terminateRealtime(
+                            'unsupported_history_ot',
+                            `Document ${docId} requires History OT on an unsupported connection mode`,
+                            {docId, type, activeScheme},
+                        );
+                    }
+                    try {
+                        const snapshot = parseHistoryOtSnapshot(rawDocument);
+                        const preservedRanges = deepCloneJson(ranges);
+                        const updates = rawUpdates.map(update => deepCloneJson(update));
+                        if (!snapshot.safe || !isJsonObject(preservedRanges)) {
+                            throw new Error([
+                                ...snapshot.unsafeReasons,
+                                ...(!isJsonObject(preservedRanges) ? ['ranges must be a JSON object'] : []),
+                            ].join('; '));
+                        }
+                        return {
+                            otType: 'history-ot',
+                            snapshot: serializeHistoryOtSnapshot(snapshot),
+                            version,
+                            updates,
+                            ranges: preservedRanges,
+                        };
+                    } catch (error) {
+                        throw this.terminateRealtime(
+                            'unsupported_history_ot',
+                            `Document ${docId} returned an unsafe History OT join response`,
+                            {docId, reason: error instanceof Error ? error.message : String(error)},
+                        );
+                    }
+                }
+                if (type !== 'sharejs-text-ot'
+                    || !Array.isArray(rawDocument)
+                    || !rawDocument.every(line => typeof line === 'string')) {
+                    throw this.terminateRealtime(
+                        'unsupported_history_ot',
+                        `Document ${docId} uses unsupported or malformed OT type ${type}`,
                         {docId, type},
                     );
                 }
-                const docLines = docLinesAscii.map((line) => decodePackedUtf8(line));
-                return {docLines, version, updates, ranges};
+                const docLines = rawDocument.map((line) => decodePackedUtf8(line));
+                return {otType: 'sharejs-text-ot', docLines, version, updates: rawUpdates, ranges};
             });
         } catch (error) {
             if (
@@ -1343,6 +1459,118 @@ export class SocketIOAPI {
             .then(() => {
                 return;
             });
+    }
+
+    async applyHistoryOtUpdate(
+        docId: string,
+        update: JsonValue,
+        intent: HistoryOtWriteIntent,
+        session: HistoryOtSession,
+        expectedSender: ProjectSenderWitness,
+    ): Promise<void> {
+        const activeScheme = this._socketInitScheme ?? this.scheme;
+        if (activeScheme === 'Alt') {
+            throw new SocketRequestError(
+                'server_error',
+                'History OT is unavailable in the alternative connection mode',
+                false,
+                {docId, activeScheme},
+            );
+        }
+        if (this.projectSession?.protocolVersion !== SUPPORTED_PLAIN_OT_PROTOCOL_VERSION) {
+            throw new SocketRequestError(
+                'server_error',
+                'History OT writes require an explicit current-generation protocol version',
+                false,
+                {docId},
+            );
+        }
+        if (!this.senderWitnessMatches(expectedSender)) {
+            throw new SocketRequestError(
+                'stale_connection',
+                'Realtime sender identity changed before the History OT request could be authorized',
+                false,
+                {docId},
+            );
+        }
+        const permissionAllowsIntent = () => intent.kind !== 'comment-write' && (
+            this.currentPermissionsLevel === 'owner'
+            || this.currentPermissionsLevel === 'readAndWrite'
+            || (this.currentPermissionsLevel === 'review'
+                && (intent.kind === 'tracked-write'
+                    || (intent.kind === 'tracked-decision' && intent.decision === 'reject')))
+        );
+        const permissionError = () => new SocketRequestError(
+            'server_error',
+            'This realtime project session does not permit the History OT write intent',
+            false,
+            {permissionsLevel: this.currentPermissionsLevel, docId, intent: intent.kind},
+        );
+        if (!permissionAllowsIntent()) {
+            throw permissionError();
+        }
+        if (session.docId !== docId) {
+            throw new SocketRequestError(
+                'server_error',
+                'History OT session does not match the submitted document',
+                false,
+                {docId, sessionDocId: session.docId},
+            );
+        }
+        let authorizedUpdate: JsonValue;
+        try {
+            authorizedUpdate = session.assertPendingSubmission(
+                expectedSender.generation,
+                update,
+                intent,
+            );
+        } catch (error) {
+            throw new SocketRequestError(
+                'server_error',
+                error instanceof Error ? error.message : 'History OT submission was not authorized',
+                false,
+                {docId},
+            );
+        }
+        const parsed = parseHistoryOtRealtimeEnvelope(authorizedUpdate);
+        if (!parsed.safe
+            || parsed.classification !== 'collaborator-update'
+            || parsed.doc !== docId
+            || parsed.source !== expectedSender.publicId) {
+            throw new SocketRequestError(
+                'server_error',
+                'Unsafe History OT update envelope',
+                false,
+                {docId, reasons: parsed.unsafeReasons},
+            );
+        }
+        await this.request<any[]>(
+            'applyOtUpdate',
+            [docId, authorizedUpdate],
+            ACK_TIMEOUT_MS,
+            expectedSender,
+            () => {
+                if (!permissionAllowsIntent()) {
+                    throw permissionError();
+                }
+                try {
+                    session.assertPendingSubmission(
+                        expectedSender.generation,
+                        authorizedUpdate,
+                        intent,
+                    );
+                } catch (error) {
+                    throw new SocketRequestError(
+                        'server_error',
+                        error instanceof Error
+                            ? error.message
+                            : 'History OT submission authorization changed before emit',
+                        false,
+                        {docId},
+                    );
+                }
+            },
+        );
     }
 
     /**

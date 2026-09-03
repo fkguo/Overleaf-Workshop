@@ -2,6 +2,7 @@
 import { strict as assert } from 'assert';
 import { RealtimeFatalError, SocketIOAPI } from '../api/socketio';
 import { SocketRequestError } from '../api/socketRequest';
+import {HistoryOtSession} from '../core/historyOtSession';
 
 type Listener = (...args: any[]) => void;
 
@@ -565,12 +566,14 @@ describe('SocketIOAPI project protocol', () => {
         assert.strictEqual(await joined, project);
     });
 
-    it('drops full OT operations emitted by a retired socket generation', async () => {
+    it('drops full OT operations and thread events emitted by a retired socket generation', async () => {
         const {base, socket} = createAPI();
         const retired = base.sockets[0];
         const updates: unknown[] = [];
+        const threadEvents: unknown[] = [];
         socket.updateEventHandlers({
             onFileChanged: (update, sender) => updates.push({update, sender}),
+            onHistoryOtThreadEvent: (event, args) => threadEvents.push({event, args}),
         });
         retired.serverEmit('connect');
         const firstJoin = socket.joinProject('project-id');
@@ -583,6 +586,7 @@ describe('SocketIOAPI project protocol', () => {
             v: 4,
             op: [{p: 0, i: 'stale-before-replacement'}],
         });
+        retired.serverEmit('delete-thread', 'thread-stale-before-replacement');
         assert.deepEqual(
             updates,
             [],
@@ -601,16 +605,28 @@ describe('SocketIOAPI project protocol', () => {
             v: 4,
             op: [{p: 0, i: 'stale'}],
         });
+        retired.serverEmit('delete-thread', 'thread-stale');
         assert.deepEqual(updates, [], 'a retired transport must have no observable OT effect');
 
         current.serverEmit('otUpdateApplied', {
             doc: 'doc-id',
             v: 4,
-            op: [{p: 0, i: 'current'}],
+            op: [{textOperation: [1, 'current']}],
+            meta: {origin: {kind: 'remote', opaque: true}},
         });
+        current.serverEmit('new-comment', 'thread-current', {opaque: {preserved: true}});
         assert.deepEqual(updates, [{
-            update: {doc: 'doc-id', v: 4, op: [{p: 0, i: 'current'}]},
+            update: {
+                doc: 'doc-id',
+                v: 4,
+                op: [{textOperation: [1, 'current']}],
+                meta: {origin: {kind: 'remote', opaque: true}},
+            },
             sender: {publicId: 'P.current', generation: socket.generation},
+        }]);
+        assert.deepEqual(threadEvents, [{
+            event: 'new-comment',
+            args: ['thread-current', {opaque: {preserved: true}}],
         }]);
     });
 
@@ -1109,7 +1125,7 @@ describe('SocketIOAPI project protocol', () => {
         assert.equal(second.emitted.length, emittedBeforeWrite, 'missing protocol must emit zero OT');
     });
 
-    it('rejects History OT documents without advertising unsupported capability', async () => {
+    it('advertises History OT on realtime joins and preserves its JSON payload losslessly', async () => {
         const {base, socket} = createAPI();
         const transport = base.sockets[0];
         transport.serverEmit('connect');
@@ -1122,22 +1138,252 @@ describe('SocketIOAPI project protocol', () => {
         const joiningDoc = socket.joinDoc('history-doc');
         await waitForEmission(transport, 'joinDoc');
         const joinEmission = transport.emitted.find(item => item.event === 'joinDoc');
-        assert.deepEqual(joinEmission?.args[1], {encodeRanges: true});
+        assert.deepEqual(joinEmission?.args[1], {
+            encodeRanges: true,
+            supportsHistoryOT: true,
+        });
+        const snapshot = {
+            content: 'tracked',
+            trackedChanges: [{
+                range: {pos: 0, length: 7},
+                tracking: {
+                    type: 'insert',
+                    userId: 'user-a',
+                    ts: '2026-08-31T00:00:00.000Z',
+                },
+            }],
+        };
+        const updates = [{
+            doc: 'history-doc',
+            v: 1,
+            op: [{textOperation: [7, 'x']}],
+            opaque: {mustSurvive: [true, null, 3]},
+        }];
+        const ranges = {thread: {nested: ['raw', {value: 4}]}};
         transport.acknowledge(
             'joinDoc',
             undefined,
-            ['tracked'],
+            snapshot,
             1,
-            [],
-            {},
+            updates,
+            ranges,
             'history-ot',
         );
 
+        const joinedDoc = await joiningDoc;
+        assert.deepEqual(joinedDoc, {
+            otType: 'history-ot',
+            snapshot,
+            version: 1,
+            updates,
+            ranges,
+        });
+        updates[0].opaque.mustSurvive[0] = false;
+        ranges.thread.nested[0] = 'mutated';
+        assert.deepEqual(joinedDoc.updates[0], {
+            doc: 'history-doc',
+            v: 1,
+            op: [{textOperation: [7, 'x']}],
+            opaque: {mustSurvive: [true, null, 3]},
+        });
+        assert.deepEqual(joinedDoc.ranges, {thread: {nested: ['raw', {value: 4}]}});
+    });
+
+    it('never advertises or accepts History OT on the HTTP-backed alternative transport', async () => {
+        const {base, socket} = createAPI();
+        const transport = base.sockets[0];
+        (socket as any).scheme = 'Alt';
+        (socket as any)._socketInitScheme = 'Alt';
+        transport.serverEmit('connect');
+        transport.serverEmit('connectionAccepted', undefined, '');
+        const joined = socket.joinProject('project-id');
+        await waitForEmission(transport, 'joinProject');
+        transport.acknowledge('joinProject', undefined, project, undefined, undefined);
+        await joined;
+
+        const joiningDoc = socket.joinDoc('history-doc');
+        await waitForEmission(transport, 'joinDoc');
+        const joinEmission = transport.emitted.find(item => item.event === 'joinDoc');
+        assert.deepEqual(joinEmission?.args[1], {encodeRanges: true});
+        transport.acknowledge('joinDoc', undefined, {content: 'tracked'}, 1, [], {}, 'history-ot');
         await assert.rejects(
             joiningDoc,
-            (error: unknown) => error instanceof RealtimeFatalError && error.code === 'unsupported_history_ot',
+            (error: unknown) => error instanceof RealtimeFatalError
+                && error.code === 'unsupported_history_ot',
         );
-        assert.equal(socket.needsReinit, false);
+    });
+
+    it('binds History OT writes to exact intent, sender, generation, session, and queue-only ACK', async () => {
+        const {base, socket} = createAPI();
+        const transport = base.sockets[0];
+        transport.serverEmit('connect');
+        const joined = socket.joinProject('project-id');
+        transport.serverEmit('joinProjectResponse', {
+            publicId: 'P.review', project, permissionsLevel: 'review', protocolVersion: 2,
+        });
+        await joined;
+        const witness = socket.projectSession!;
+        const intent = {kind: 'tracked-write'} as const;
+        const session = new HistoryOtSession('doc-id', witness.generation, {
+            level: 'review',
+            userId: 'user-a',
+        });
+        session.acceptJoin(witness.generation, {
+            snapshot: {content: 'a'},
+            version: 4,
+            operations: [],
+            ranges: {},
+            otType: 'history-ot',
+        });
+        const staged = session.stage(witness.generation, {
+            operation: [{textOperation: [1, {
+                i: 'x',
+                tracking: {
+                    type: 'insert',
+                    userId: 'user-a',
+                    ts: '2026-08-31T00:00:00.000Z',
+                },
+            }]}],
+            meta: {tc: 'opaque-seed'},
+            intent,
+            publicId: witness.publicId,
+        });
+        const envelope = staged.envelope;
+        assert.ok(envelope);
+
+        const expectedEnvelope = JSON.parse(JSON.stringify(envelope));
+        const saving = socket.applyHistoryOtUpdate('doc-id', envelope, intent, session, witness);
+        (envelope as any).v = 99;
+        (envelope as any).meta.source = 'P.mutated-after-authorization';
+        await waitForEmission(transport, 'applyOtUpdate');
+        const writes = () => transport.emitted.filter(item => item.event === 'applyOtUpdate');
+        assert.deepEqual(
+            writes()[0].args[1],
+            expectedEnvelope,
+            'the exact authorized snapshot must reach the wire despite caller mutation',
+        );
+        assert.notStrictEqual(writes()[0].args[1], envelope);
+        assert.equal(session.getState().pendingQueued, false);
+        transport.acknowledge('applyOtUpdate', undefined);
+        await saving;
+        assert.equal(
+            session.getState().pendingQueued,
+            false,
+            'socket ACK only witnesses queue acceptance; the coordinator owns session mutation',
+        );
+
+        const acceptedWriteCount = writes().length;
+        const rejected: Array<Promise<void>> = [
+            socket.applyHistoryOtUpdate(
+                'doc-id', expectedEnvelope,
+                {kind: 'tracked-decision', decision: 'accept', selectedRanges: []},
+                session, witness,
+            ),
+            socket.applyHistoryOtUpdate(
+                'doc-id', expectedEnvelope, {kind: 'comment-write'}, session, witness,
+            ),
+            socket.applyHistoryOtUpdate(
+                'doc-id',
+                {...expectedEnvelope as object, meta: {source: 'P.other', tc: 'opaque-seed'}},
+                intent,
+                session,
+                witness,
+            ),
+            socket.applyHistoryOtUpdate(
+                'doc-id', expectedEnvelope, intent, session,
+                {...witness, generation: witness.generation + 1},
+            ),
+            socket.applyHistoryOtUpdate(
+                'doc-id', expectedEnvelope, intent,
+                new HistoryOtSession('doc-id', witness.generation, {
+                    level: 'review', userId: 'user-a',
+                }),
+                witness,
+            ),
+        ];
+        for (const rejection of rejected) {
+            await assert.rejects(rejection, (error: unknown) => error instanceof SocketRequestError);
+        }
+        assert.equal(writes().length, acceptedWriteCount, 'every rejected History write must emit zero wire calls');
+
+        const raceSession = new HistoryOtSession('doc-id', witness.generation, {
+            level: 'review',
+            userId: 'user-a',
+        });
+        raceSession.acceptJoin(witness.generation, {
+            snapshot: {content: 'a'},
+            version: 4,
+            operations: [],
+            ranges: {},
+            otType: 'history-ot',
+        });
+        const raceStaged = raceSession.stage(witness.generation, {
+            operation: [{textOperation: [1, {
+                i: 'z',
+                tracking: {
+                    type: 'insert',
+                    userId: 'user-a',
+                    ts: '2026-08-31T00:00:00.000Z',
+                },
+            }]}],
+            meta: {tc: 'race-seed'},
+            intent,
+            publicId: witness.publicId,
+        });
+        const emittedBeforeInvalidation = writes().length;
+        const racingWrite = socket.applyHistoryOtUpdate(
+            'doc-id',
+            raceStaged.envelope!,
+            intent,
+            raceSession,
+            witness,
+        );
+        transport.serverEmit('project:membership:changed', {members: true});
+        await assert.rejects(
+            racingWrite,
+            (error: unknown) => error instanceof SocketRequestError,
+        );
+        assert.equal(
+            writes().length,
+            emittedBeforeInvalidation,
+            'permission invalidation before emit must produce zero wire calls',
+        );
+    });
+
+    it('forwards raw thread events and clears current and remembered authority on invalidation', async () => {
+        const {base, socket} = createAPI();
+        const transport = base.sockets[0];
+        const events: unknown[] = [];
+        let invalidations = 0;
+        socket.updateEventHandlers({
+            onHistoryOtThreadEvent: (event, args) => events.push({event, args}),
+            onPermissionsInvalidated: () => { invalidations += 1; },
+        });
+        transport.serverEmit('connect');
+        const joined = socket.joinProject('project-id');
+        transport.serverEmit('joinProjectResponse', {
+            publicId: 'P.owner', project, permissionsLevel: 'owner', protocolVersion: 2,
+        });
+        await joined;
+
+        const rawThread = {id: 'comment-a', opaque: {preserved: [1, true, null]}};
+        transport.serverEmit('new-comment', 'thread-a', rawThread);
+        assert.deepEqual(events, [{event: 'new-comment', args: ['thread-a', rawThread]}]);
+
+        transport.serverEmit('project:membership:changed', {members: true});
+        assert.equal(invalidations, 1);
+        assert.equal(socket.projectSession?.permissionsLevel, undefined);
+        assert.equal((socket as any).lastKnownPermissionsLevel, undefined);
+        const emittedBeforeWrite = transport.emitted.length;
+        await assert.rejects(
+            socket.applyOtUpdate(
+                'doc-id',
+                {doc: 'doc-id', v: 1, op: [{p: 0, i: 'x'}]},
+                socket.projectSession!,
+            ),
+            (error: unknown) => error instanceof SocketRequestError && error.code === 'server_error',
+        );
+        assert.equal(transport.emitted.length, emittedBeforeWrite);
     });
 
     it('removes physical handlers when the socket session is disposed', () => {

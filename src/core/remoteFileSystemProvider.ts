@@ -287,6 +287,14 @@ function isNonnegativeSafeInteger(value: unknown): value is number {
     return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
+function isRealtimeUpdateSchema(value: unknown): value is UpdateSchema {
+    return isPlainObject(value)
+        && typeof value.doc === 'string'
+        && value.doc.length > 0
+        && isNonnegativeSafeInteger(value.v)
+        && (value.op === undefined || Array.isArray(value.op));
+}
+
 export function parseUri(uri: vscode.Uri) {
     return parseProjectUri(uri.authority, uri.path, uri.query);
 }
@@ -3184,8 +3192,8 @@ export class VirtualFileSystem extends vscode.Disposable {
                     ]);
                 }
             },
-            onFileChanged: (update:UpdateSchema, sender?: ProjectSenderWitness) => {
-                if (!isPlainObject(update) || typeof update.doc !== 'string') {
+            onFileChanged: (update:unknown, sender?: ProjectSenderWitness) => {
+                if (!isRealtimeUpdateSchema(update)) {
                     const error = new Error('Realtime document update has no valid document identity');
                     this.joiningDocuments.forEach(joining => {
                         joining.invalid = error;
