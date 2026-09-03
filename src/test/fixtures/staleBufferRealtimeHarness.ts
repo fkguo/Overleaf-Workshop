@@ -26,6 +26,7 @@ export type CapturedUpdate = {
 };
 
 export type LooseJoinDocResponse = {
+    otType?: unknown,
     docLines?: unknown,
     version?: unknown,
     updates?: unknown,
@@ -649,7 +650,19 @@ class MemoryProvenanceStorage implements ProvenanceStorage {
 }
 
 export class HarnessStorage {
-    readonly globalState = new MemoryMemento();
+    readonly globalState = new MemoryMemento(new Map<string, unknown>([
+        ['overleaf-servers', {
+            'www.overleaf.com': {
+                name: 'www.overleaf.com',
+                url: 'https://www.overleaf.com/',
+                login: {
+                    userId: 'test-user',
+                    username: 'test@example.com',
+                    identity: {},
+                },
+            },
+        }],
+    ]));
     private readonly workspaceStates = new Map<string, MemoryMemento>();
     private readonly provenanceBytes = new Map<string, Map<string, Uint8Array>>();
     private readonly provenanceStores = new Map<string, DocumentProvenanceStore>();
@@ -928,9 +941,12 @@ class DeterministicSocket {
             );
         }
         if (injected !== undefined) {
-            return injected;
+            return injected.otType === undefined
+                ? {...injected, otType: 'sharejs-text-ot' as const}
+                : injected;
         }
         return {
+            otType: 'sharejs-text-ot' as const,
             docLines: document.content.split('\n'),
             version: document.version,
             updates: [],

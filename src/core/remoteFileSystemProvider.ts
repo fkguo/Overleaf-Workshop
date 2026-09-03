@@ -1,7 +1,15 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import * as vscode from 'vscode';
-import { BaseAPI, CompileOutputFileSchema, Identity, MemberEntity, ProjectSettingsSchema } from '../api/base';
 import {
+    BaseAPI,
+    ChangesUserSchema,
+    CompileOutputFileSchema,
+    Identity,
+    MemberEntity,
+    ProjectSettingsSchema,
+} from '../api/base';
+import {
+    DocumentJoin,
     OtUpdateErrorSchema,
     PermissionsLevel,
     ProjectSessionSchema,
@@ -27,12 +35,24 @@ import {
 } from './documentUpdate';
 import {
     applyUtf16TextOperations,
+    acknowledgeHistorySubmission,
+    beginHistorySubmission,
     beginLocalEditorSubmission,
+    commitHistoryRemoteEditorTransaction,
     commitRemoteEditorTransaction,
     confirmLocalEditorSubmission,
+    createHistoryRealtimeEditorBridgeState,
     createRealtimeEditorBridgeState,
+    HistoryEditorWriteDescriptor,
+    HistoryRealtimeEditorBridgeState,
+    HistoryRemoteEditorTransaction,
+    prepareHistoryRemoteEditorTransaction,
     prepareRemoteEditorTransaction,
+    rebindHistorySubmissionForRecovery,
+    reconcileHistoryEditorAfterJoin,
+    recordHistoryLocalEditorChange,
     recordLocalEditorChange,
+    rejectHistorySubmission,
     rejectLocalEditorSubmission,
     RealtimeEditorBridgeState,
     RemoteEditorTransaction,
@@ -54,9 +74,44 @@ import {
     DocumentProvenanceIdentity,
     DocumentProvenanceRecord,
     DocumentProvenanceStore,
-    JsonValue,
+    JsonValue as ProvenanceJsonValue,
 } from './documentProvenance';
 import { WorkspaceProvenanceStorage } from './workspaceProvenanceStorage';
+import {
+    getVisibleHistoryOtText,
+    historyOtJsonEqual,
+    JsonValue as HistoryJsonValue,
+    parseHistoryOtOperations,
+    parseHistoryOtSnapshot,
+    serializeHistoryOtOperations,
+    serializeHistoryOtSnapshot,
+    serializeHistoryOtWireOperation,
+} from './historyOt';
+import {
+    appendHistoryOtThreadEvent,
+    awaitHistoryOtSubmissionCommit,
+    HistoryOtRawThreadEventLog,
+    HistoryOtSession,
+    HistoryOtSessionResult,
+    HistoryOtThreadEventName,
+    HistoryOtWriteIntent,
+    parseHistoryOtRealtimeEnvelope,
+} from './historyOtSession';
+import {
+    buildRealtimeHistoryOtPresentation,
+    HistoryOtMemberDirectory,
+    RealtimeHistoryOtPresentationModel,
+} from '../scm/trackChangesPresentation';
+import { deepCloneJson } from './historyOt/protocol';
+import {
+    reduceHistoryOtThreadEvent,
+    reduceHistoryOtThreadEvents,
+} from './historyOtThreads';
+import {
+    HistoryOtCommitDuringJoinError,
+    runHistoryOtJoinWithCommitRefresh,
+} from './historyOtJoin';
+import {mergeHistoryOtMemberDirectory} from './historyOtAuthors';
 
 const __OUTPUTS_ID = `${ROOT_NAME}-outputs`;
 const SUPPORTED_WRITE_PROTOCOL_VERSION = 2;
@@ -85,6 +140,11 @@ export interface DocumentEntity extends FileEntity {
     lastVersion?: number,
     localCache?: string,
     remoteCache?: string,
+    otType?: 'sharejs-text-ot' | 'history-ot',
+    historyOtSnapshot?: HistoryJsonValue,
+    historyOtSession?: HistoryOtSession,
+    historyOtPresentation?: RealtimeHistoryOtPresentationModel,
+    historyOtEpoch?: string,
 }
 
 export interface FileRefEntity extends FileEntity {
@@ -136,7 +196,7 @@ type ReceivedDocumentUpdate = {
     sender?: ProjectSenderWitness,
 };
 
-type PreparedDocumentJoin = {
+type PreparedShareJsDocumentJoin = {
     anchorVersion: number,
     anchorContent: string,
     headVersion: number,
@@ -145,6 +205,7 @@ type PreparedDocumentJoin = {
 };
 
 type PendingDocumentUpdate = {
+    otType?: 'sharejs-text-ot' | 'history-ot',
     docId: string,
     bufferId: string,
     provenanceRecordName: string,
@@ -157,6 +218,9 @@ type PendingDocumentUpdate = {
     socketGeneration: number,
     submissionToken: string,
     confirmationVersion?: number,
+    historyIntent?: import('./historyOtSession').HistoryOtWriteIntent,
+    /** Same-host recovery authority only; never serialized to provenance. */
+    historySession?: HistoryOtSession,
 };
 
 type StagedEditorBase = {
@@ -189,6 +253,7 @@ type EditorDocumentBase = {
     recordName?: string,
     persistence?: Promise<DocumentProvenanceRecord>,
     causality: RealtimeEditorBridgeState,
+    historyCausality?: HistoryRealtimeEditorBridgeState,
 };
 
 type PendingRemoteEditorTransaction = {
@@ -214,6 +279,32 @@ type PendingCleanEditorRefresh = {
     nextRemoteVersion: number,
     nextRemoteContent: string,
     candidateContents: Set<string>,
+};
+
+type PendingHistoryRemoteEditorTransaction = {
+    document: vscode.TextDocument,
+    active: EditorDocumentBase,
+    transaction: HistoryRemoteEditorTransaction,
+    consumed: boolean,
+};
+
+type PendingHistoryCleanEditorRefresh = {
+    document: vscode.TextDocument,
+    active: EditorDocumentBase,
+    transaction: HistoryRemoteEditorTransaction,
+    nextRemoteVersion: number,
+    nextRemoteSnapshot: HistoryJsonValue,
+    nextRemoteContent: string,
+    candidateContents: Set<string>,
+};
+
+type PreparedHistoryRemoteEditorUpdate = {
+    bufferId: string,
+    document: vscode.TextDocument,
+    active: EditorDocumentBase,
+    transaction: HistoryRemoteEditorTransaction,
+    delivery: 'workspace-edit' | 'provider-refresh',
+    cleanRefresh?: PendingHistoryCleanEditorRefresh,
 };
 
 type RemoteDocumentCausality = {
@@ -295,6 +386,12 @@ function isRealtimeUpdateSchema(value: unknown): value is UpdateSchema {
         && (value.op === undefined || Array.isArray(value.op));
 }
 
+function realtimeUpdateDocId(value: unknown): string | undefined {
+    return isPlainObject(value) && typeof value.doc === 'string' && value.doc.length > 0
+        ? value.doc
+        : undefined;
+}
+
 export function parseUri(uri: vscode.Uri) {
     return parseProjectUri(uri.authority, uri.path, uri.query);
 }
@@ -338,6 +435,21 @@ export class VirtualFileSystem extends vscode.Disposable {
     private editorSaveReceipts = new Map<string, EditorSaveReceipt>();
     private pendingRemoteEditorTransactions?: Map<string, PendingRemoteEditorTransaction>;
     private pendingCleanEditorRefreshes?: Map<string, PendingCleanEditorRefresh>;
+    private pendingHistoryRemoteEditorTransactions?: Map<string, PendingHistoryRemoteEditorTransaction>;
+    private pendingHistoryCleanEditorRefreshes?: Map<string, PendingHistoryCleanEditorRefresh>;
+    private commentThreads?: HistoryJsonValue;
+    private commentThreadsLoading?: Promise<HistoryJsonValue | undefined>;
+    private commentThreadsEpoch = 0;
+    private appliedHistoryOtThreadEventCount = 0;
+    private changesUsers?: ChangesUserSchema[];
+    private changesUsersLoading?: Promise<ChangesUserSchema[] | undefined>;
+    private changesUsersEpoch = 0;
+    private historyOtThreadEvents: HistoryOtRawThreadEventLog = {events: []};
+    private rejectedHistoryOtThreadEvents: Array<{
+        event: HistoryOtThreadEventName,
+        args: HistoryJsonValue,
+        reason: string,
+    }> = [];
     private recoveryNotifications = new Set<string>();
     private freshConnectionRequested = false;
     private sourceRevision = 0;
@@ -428,12 +540,27 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (this.disposed) {
             throw vscode.FileSystemError.Unavailable('The Overleaf project is closed');
         }
+        this.assertAuthenticatedAccount();
         this.connectionRequested = true;
         if (this.root) {
             return Promise.resolve(this.root);
         }
+        const root = await this.startInitialization(false);
+        this.assertAuthenticatedAccount();
+        return root;
+    }
 
-        return this.startInitialization(false);
+    private assertAuthenticatedAccount(uri?: vscode.Uri): void {
+        const currentUserId = GlobalStateManager.getAuthenticatedUserId(
+            this.context,
+            this.serverName,
+        );
+        const uriUserId = uri === undefined ? this.userId : parseUri(uri).userId;
+        if (uriUserId !== this.userId || currentUserId !== this.userId) {
+            throw vscode.FileSystemError.NoPermissions(
+                'The authenticated Overleaf account changed; reopen the project before editing',
+            );
+        }
     }
 
     private startInitialization(showProgress: boolean): Promise<ProjectEntity> {
@@ -641,6 +768,14 @@ export class VirtualFileSystem extends vscode.Disposable {
         return this.pendingCleanEditorRefreshes ??= new Map();
     }
 
+    private historyRemoteEditorTransactionMap(): Map<string, PendingHistoryRemoteEditorTransaction> {
+        return this.pendingHistoryRemoteEditorTransactions ??= new Map();
+    }
+
+    private historyCleanEditorRefreshMap(): Map<string, PendingHistoryCleanEditorRefresh> {
+        return this.pendingHistoryCleanEditorRefreshes ??= new Map();
+    }
+
     private canonicalEditorUri(docId: string): string {
         return JSON.stringify([
             ROOT_NAME,
@@ -689,7 +824,7 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     private startPreparedRemoteCausality(
         docId: string,
-        prepared: PreparedDocumentJoin,
+        prepared: PreparedShareJsDocumentJoin,
         socketGeneration: number,
     ): RemoteDocumentCausality {
         if (!isNonnegativeSafeInteger(prepared.headVersion)
@@ -750,6 +885,40 @@ export class VirtualFileSystem extends vscode.Disposable {
         return {...input, pendingOperations: [], localOperations: [], valid: false};
     }
 
+    private createHistoryEditorCausality(
+        document: vscode.TextDocument,
+        doc: DocumentEntity,
+    ): HistoryRealtimeEditorBridgeState | undefined {
+        const sender = this.currentSenderWitness();
+        if (doc.otType !== 'history-ot'
+            || !sender
+            || !isNonnegativeSafeInteger(doc.version)
+            || doc.historyOtSnapshot === undefined
+            || !doc.historyOtEpoch
+            || document.getText() !== doc.remoteCache) {
+            return undefined;
+        }
+        try {
+            return createHistoryRealtimeEditorBridgeState({
+                socketGeneration: sender.generation,
+                remoteEpoch: doc.historyOtEpoch,
+                remoteVersion: doc.version,
+                remoteSnapshot: doc.historyOtSnapshot,
+                documentVersion: document.version,
+                editorContent: document.getText(),
+            });
+        } catch {
+            return undefined;
+        }
+    }
+
+    private invalidateEditorBase(active: EditorDocumentBase): void {
+        active.causality = {...active.causality, valid: false};
+        if (active.historyCausality) {
+            active.historyCausality = {...active.historyCausality, valid: false};
+        }
+    }
+
     private causalEvidenceForWrite(
         docId: string,
         base: {version: number, content: string},
@@ -805,14 +974,22 @@ export class VirtualFileSystem extends vscode.Disposable {
         docId: string,
         buffer: Pick<EditorBufferState, 'bufferId' | 'canonicalEditorUri'>,
     ): DocumentProvenanceIdentity | undefined {
-        if (!this.currentSenderWitness()) { return undefined; }
+        const resolved = this._resolveById(docId);
+        const otType = resolved?.fileType === 'doc'
+            ? (resolved.fileEntity as DocumentEntity).otType
+            : undefined;
+        if (GlobalStateManager.getAuthenticatedUserId(this.context, this.serverName) !== this.userId
+            || !this.currentSenderWitness()
+            || (otType !== 'sharejs-text-ot' && otType !== 'history-ot')) {
+            return undefined;
+        }
         return {
             canonicalServerUrl: this.serverUrl,
             userId: this.userId,
             projectId: this.projectId,
             docId,
             canonicalEditorUri: buffer.canonicalEditorUri,
-            otType: 'sharejs-text-ot',
+            otType,
             protocolVersion: SUPPORTED_WRITE_PROTOCOL_VERSION,
         };
     }
@@ -1192,6 +1369,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 ticket.version,
                 ticket.content,
             ),
+            historyCausality: this.createHistoryEditorCausality(document, authoritative.doc),
         });
         this.cleanEditorRefreshMap().delete(bufferId);
         authoritative.doc.localCache = ticket.content;
@@ -1222,6 +1400,106 @@ export class VirtualFileSystem extends vscode.Disposable {
                 rangeLength: change.rangeLength,
                 text: change.text,
             }));
+            const history = active.historyCausality;
+            const pendingHistoryRemote = buffer
+                ? this.historyRemoteEditorTransactionMap().get(buffer.bufferId) : undefined;
+            const pendingHistoryClean = buffer
+                ? this.historyCleanEditorRefreshMap().get(buffer.bufferId) : undefined;
+            if (history) {
+                if (pendingHistoryRemote) {
+                    let next = commitHistoryRemoteEditorTransaction(
+                        history,
+                        pendingHistoryRemote.transaction,
+                        document.version,
+                        changes,
+                        document.getText(),
+                    );
+                    if (pendingHistoryRemote.document !== document
+                        || pendingHistoryRemote.active !== active
+                        || sender?.generation !== next.socketGeneration) {
+                        next = {...next, valid: false};
+                    }
+                    active.historyCausality = next;
+                    pendingHistoryRemote.consumed = next.valid;
+                    this.historyRemoteEditorTransactionMap().delete(buffer!.bufferId);
+                    if (next.valid && next.inflightWire === undefined) {
+                        active.version = next.remoteVersion;
+                        active.content = getVisibleHistoryOtText(next.remoteSnapshot);
+                        active.recordName = undefined;
+                        active.persistence = undefined;
+                    }
+                } else if (pendingHistoryClean) {
+                    const transaction = pendingHistoryClean.transaction;
+                    let next = commitHistoryRemoteEditorTransaction(
+                        history,
+                        transaction,
+                        document.version,
+                        changes,
+                        document.getText(),
+                    );
+                    let current: DocumentEntity | undefined;
+                    try {
+                        current = this.currentDocument(active.identity.docId);
+                    } catch {
+                        current = undefined;
+                    }
+                    if (pendingHistoryClean.document !== document
+                        || pendingHistoryClean.active !== active
+                        || document.isDirty
+                        || sender?.generation !== next.socketGeneration
+                        || !current
+                        || current.version !== pendingHistoryClean.nextRemoteVersion
+                        || current.remoteCache !== pendingHistoryClean.nextRemoteContent
+                        || current.historyOtSnapshot === undefined
+                        || !historyOtJsonEqual(
+                            current.historyOtSnapshot,
+                            pendingHistoryClean.nextRemoteSnapshot,
+                        )) {
+                        next = {...next, valid: false};
+                    }
+                    active.historyCausality = next;
+                    this.historyCleanEditorRefreshMap().delete(buffer!.bufferId);
+                    this.pendingReadTickets.delete(buffer!.resourceKey);
+                    this.boundReadCandidates.delete(buffer!.bufferId);
+                    if (next.valid && current) {
+                        active.version = next.remoteVersion;
+                        active.content = getVisibleHistoryOtText(next.remoteSnapshot);
+                        active.recordName = undefined;
+                        active.persistence = undefined;
+                        this.stageEditorBase(document.uri, current, document.getText());
+                    }
+                } else if (changes.length === 0) {
+                    active.historyCausality = {
+                        ...history,
+                        valid: history.valid
+                            && sender?.generation === history.socketGeneration
+                            && document.version >= history.documentVersion
+                            && document.getText() === history.editorContent,
+                        documentVersion: document.version,
+                    };
+                } else {
+                    const tracked = this.permissionsLevel === 'review'
+                        || vscode.workspace.getConfiguration(ROOT_NAME, document.uri)
+                            .get<boolean>('trackChanges.enabled', false);
+                    const currentDescriptor = history.pendingWriteDescriptor
+                        ?? history.inflightWriteDescriptor;
+                    const descriptor: HistoryEditorWriteDescriptor = currentDescriptor?.kind
+                        === (tracked ? 'tracked-write' : 'plain-write')
+                        ? currentDescriptor
+                        : tracked ? {
+                            kind: 'tracked-write',
+                            tracking: {userId: this.userId, ts: new Date().toISOString()},
+                        } : {kind: 'plain-write'};
+                    active.historyCausality = sender?.generation === history.socketGeneration
+                        ? recordHistoryLocalEditorChange(
+                            history,
+                            document.version,
+                            changes,
+                            document.getText(),
+                            descriptor,
+                        ) : {...history, valid: false};
+                }
+            } else {
             const pendingRemote = buffer ?
                 this.remoteEditorTransactionMap().get(buffer.bufferId) : undefined;
             const pendingCleanRefresh = buffer ?
@@ -1332,6 +1610,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                     active.causality.valid = false;
                 }
             }
+            }
         }
         this.observeTextDocument(document);
     }
@@ -1359,6 +1638,10 @@ export class VirtualFileSystem extends vscode.Disposable {
                         receipt.identity.docId,
                         receipt.version,
                         receipt.content,
+                    ),
+                    historyCausality: this.createHistoryEditorCausality(
+                        document,
+                        this.currentDocument(receipt.identity.docId),
                     ),
                 });
                 this.cleanEditorRefreshMap().delete(buffer.bufferId);
@@ -1454,6 +1737,8 @@ export class VirtualFileSystem extends vscode.Disposable {
         this.boundReadCandidates.delete(bufferId);
         this.remoteEditorTransactionMap().delete(bufferId);
         this.cleanEditorRefreshMap().delete(bufferId);
+        this.historyRemoteEditorTransactionMap().delete(bufferId);
+        this.historyCleanEditorRefreshMap().delete(bufferId);
         this.pendingReadTickets.delete(this.resourceKey(document.uri));
         this.editorBufferIds.delete(document);
     }
@@ -1494,6 +1779,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 staged.version,
                 staged.content,
             ),
+            historyCausality: this.createHistoryEditorCausality(document, current),
         });
         this.pendingReadTickets.delete(buffer.resourceKey);
         this.boundReadCandidates.delete(buffer.bufferId);
@@ -1747,6 +2033,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 expectedVersion,
                 authoritativeContent,
             ),
+            historyCausality: this.createHistoryEditorCausality(witness.document, doc),
         });
         this.cleanEditorRefreshMap().delete(witness.bufferId);
         this.editorSaveReceipts.set(witness.bufferId, {
@@ -1933,15 +2220,36 @@ export class VirtualFileSystem extends vscode.Disposable {
         );
     }
 
+    private historyPendingForDocument(docId: string): PendingDocumentUpdate | undefined {
+        const matches = [...this.pendingDocumentUpdates.values()].filter(pending =>
+            pending.otType === 'history-ot'
+            && pending.docId === docId
+            && pending.historySession?.getState().hasPendingOperation === true
+        );
+        return matches.length === 1 ? matches[0] : undefined;
+    }
+
     private invalidateDocumentSessions(project?: ProjectEntity) {
         this.pendingReadTickets.clear();
         this.boundReadCandidates.clear();
         this.remoteEditorTransactionMap().clear();
         this.cleanEditorRefreshMap().clear();
+        this.historyRemoteEditorTransactionMap().clear();
+        this.historyCleanEditorRefreshMap().clear();
         const documentIds = new Set(this.documentMap(project).keys());
         this.activeEditorBases.forEach(active => {
             if (documentIds.has(active.identity.docId)) {
-                active.causality.valid = false;
+                active.causality = {...active.causality, valid: false};
+                const pending = this.historyPendingForDocument(active.identity.docId);
+                const preserveHistoryRecovery = pending?.bufferId === active.bufferId
+                    && pending.historySession
+                        === this.documentMap(project).get(active.identity.docId)?.historyOtSession
+                    && active.historyCausality?.inflightWire !== undefined
+                    && (active.historyCausality.inflightToken === pending.submissionToken
+                        || pending.historySession?.getState().phase === 'recovery-ready');
+                if (active.historyCausality && !preserveHistoryRecovery) {
+                    active.historyCausality = {...active.historyCausality, valid: false};
+                }
             }
         });
         this.documentMap(project).forEach((doc) => {
@@ -1949,6 +2257,9 @@ export class VirtualFileSystem extends vscode.Disposable {
             doc.version = undefined;
             doc.remoteCache = undefined;
             doc.lastVersion = undefined;
+            doc.historyOtSnapshot = undefined;
+            doc.historyOtPresentation = undefined;
+            doc.historyOtEpoch = undefined;
             this.rejectDocumentVersionWaiters(doc._id, new Error('Document session disconnected'));
         });
     }
@@ -1957,9 +2268,11 @@ export class VirtualFileSystem extends vscode.Disposable {
         this.invalidateRemoteCausality(docId);
         this.activeEditorBases.forEach((active, bufferId) => {
             if (active.identity.docId === docId) {
-                active.causality.valid = false;
+                this.invalidateEditorBase(active);
                 this.remoteEditorTransactionMap().delete(bufferId);
                 this.cleanEditorRefreshMap().delete(bufferId);
+                this.historyRemoteEditorTransactionMap().delete(bufferId);
+                this.historyCleanEditorRefreshMap().delete(bufferId);
             }
         });
         for (const [resourceKey, ticket] of this.pendingReadTickets) {
@@ -1977,6 +2290,9 @@ export class VirtualFileSystem extends vscode.Disposable {
             doc.version = undefined;
             doc.remoteCache = undefined;
             doc.lastVersion = undefined;
+            doc.historyOtSnapshot = undefined;
+            doc.historyOtPresentation = undefined;
+            doc.historyOtEpoch = undefined;
         });
         this.rejectDocumentVersionWaiters(docId, error);
     }
@@ -2000,7 +2316,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         return (this.terminalRealtimeError ?? this.socket.fatalError)?.message;
     }
 
-    private async assertProjectWritable(action: string) {
+    private async assertProjectWritable(action: string, allowReviewDocumentMutation = false) {
         const unavailableBeforeJoin = this.realtimeUnavailableMessage();
         if (unavailableBeforeJoin) {
             throw vscode.FileSystemError.Unavailable(unavailableBeforeJoin);
@@ -2012,7 +2328,8 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (unavailableAfterJoin) {
             throw vscode.FileSystemError.Unavailable(unavailableAfterJoin);
         }
-        if (this.isProjectReadOnly()) {
+        if (this.permissionsLevel === 'readOnly'
+            || (this.permissionsLevel === 'review' && !allowReviewDocumentMutation)) {
             throw vscode.FileSystemError.NoPermissions(
                 this.permissionsLevel === 'review' ?
                     `${action}: Track Changes sessions are read-only because this client does not support History OT` :
@@ -2063,6 +2380,35 @@ export class VirtualFileSystem extends vscode.Disposable {
         );
     }
 
+    private handlePermissionsInvalidated() {
+        if (this.disposed || this.terminalRealtimeError) { return; }
+        const rejection = new SocketRequestError(
+            'stale_connection',
+            'Overleaf project permissions changed; a fresh project join is required',
+            true,
+        );
+        this.permissionsLevel = undefined;
+        this.resetCommentThreadProjection();
+        this.resetChangesUsers();
+        for (const project of [this.root, this.joiningProject, this.previousRoot]) {
+            this.documentMap(project).forEach(doc => {
+                try {
+                    doc.historyOtSession?.updatePermission(this.socket.generation, {
+                        level: undefined,
+                        userId: undefined,
+                    });
+                } catch {
+                    // The session is invalidated below even if its generation is stale.
+                }
+            });
+        }
+        if (this.root) { this.previousRoot = this.root; }
+        this.invalidateDocumentSessions(this.previousRoot);
+        this.root = undefined;
+        this.joiningProject = undefined;
+        this.forceFreshConnection();
+    }
+
     private restoreDocumentRuntime(previous: ProjectEntity | undefined, current: ProjectEntity) {
         const previousDocs = this.documentMap(previous);
         this.documentMap(current).forEach((doc, id) => {
@@ -2078,6 +2424,14 @@ export class VirtualFileSystem extends vscode.Disposable {
             doc.mtime = oldDoc.mtime;
             doc.providerMtime = oldDoc.providerMtime;
             doc.providerSize = oldDoc.providerSize;
+            // Preserve only the last proven protocol discriminant so durable
+            // pending provenance can be located before the next document join.
+            // The fresh join must prove the same protocol again before emit.
+            doc.otType = oldDoc.otType;
+            const pendingHistory = this.historyPendingForDocument(id);
+            if (pendingHistory?.historySession === oldDoc.historyOtSession) {
+                doc.historyOtSession = oldDoc.historyOtSession;
+            }
         });
     }
 
@@ -2432,6 +2786,132 @@ export class VirtualFileSystem extends vscode.Disposable {
         ];
     }
 
+    private historyOtMembers(): HistoryOtMemberDirectory {
+        const project = this.root ?? this.joiningProject;
+        return mergeHistoryOtMemberDirectory(
+            this.changesUsers,
+            [project?.owner, ...(project?.members ?? [])],
+        );
+    }
+
+    private historyOtCommentThreads() {
+        return isPlainObject(this.commentThreads)
+            ? this.commentThreads as Record<string, HistoryJsonValue | undefined>
+            : undefined;
+    }
+
+    private resetCommentThreadProjection() {
+        this.commentThreadsEpoch += 1;
+        this.commentThreads = undefined;
+        this.commentThreadsLoading = undefined;
+        // A later REST snapshot includes all events observed before this reset.
+        // Only newer events may be replayed onto that authoritative base.
+        this.appliedHistoryOtThreadEventCount = this.historyOtThreadEvents.events.length;
+    }
+
+    private resetChangesUsers() {
+        this.changesUsersEpoch += 1;
+        this.changesUsers = undefined;
+        this.changesUsersLoading = undefined;
+    }
+
+    private refreshHistoryOtPresentationsForThreadEvent() {
+        const changes: vscode.FileChangeEvent[] = [];
+        for (const {entity, path} of this.walk(item => item._type === 'doc')) {
+            const doc = entity as DocumentEntity;
+            if (doc.otType !== 'history-ot' || !doc.historyOtSession?.getState().snapshot) {
+                continue;
+            }
+            try {
+                this.refreshHistoryOtRuntime(doc);
+                changes.push({type: vscode.FileChangeType.Changed, uri: this.pathToUri(path)});
+            } catch (error) {
+                console.warn('Unable to refresh History OT comment presentation', error);
+            }
+        }
+        if (changes.length > 0) { this.notify(changes); }
+    }
+
+    private refreshHistoryOtRuntime(doc: DocumentEntity): string {
+        const state = doc.historyOtSession?.getState();
+        if (!state?.snapshot || state.version === undefined) {
+            throw new Error('History OT session has no authoritative snapshot');
+        }
+        const snapshot = parseHistoryOtSnapshot(state.snapshot);
+        if (!snapshot.safe) {
+            throw new Error(`Unsafe History OT session snapshot: ${snapshot.unsafeReasons.join('; ')}`);
+        }
+        const raw = serializeHistoryOtSnapshot(snapshot);
+        const presentation = buildRealtimeHistoryOtPresentation(raw, {
+            members: this.historyOtMembers(),
+            commentThreads: this.historyOtCommentThreads(),
+            compatibilityRanges: state.ranges,
+        });
+        const content = getVisibleHistoryOtText(snapshot);
+        if (presentation.visibleText !== content) {
+            throw new Error('History OT presentation does not match the authoritative visible snapshot');
+        }
+        doc.otType = 'history-ot';
+        doc.version = state.version;
+        doc.historyOtSnapshot = raw;
+        doc.historyOtPresentation = presentation;
+        doc.remoteCache = content;
+        this.touchDocumentProviderStat(doc, content);
+        return content;
+    }
+
+    private async ensureChangesUsers(): Promise<ChangesUserSchema[] | undefined> {
+        if (this.changesUsers !== undefined) { return this.changesUsers; }
+        if (this.changesUsersLoading) { return this.changesUsersLoading; }
+        const epoch = this.changesUsersEpoch;
+        let loading!: Promise<ChangesUserSchema[] | undefined>;
+        loading = (async () => {
+            const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+            const response = await this.api.getChangesUsers(identity, this.projectId);
+            if (epoch !== this.changesUsersEpoch) { return undefined; }
+            if (response.type !== 'success' || response.changesUsers === undefined) {
+                return undefined;
+            }
+            this.changesUsers = response.changesUsers;
+            return this.changesUsers;
+        })().finally(() => {
+            if (this.changesUsersLoading === loading) {
+                this.changesUsersLoading = undefined;
+            }
+        });
+        this.changesUsersLoading = loading;
+        return loading;
+    }
+
+    private async ensureCommentThreads(): Promise<HistoryJsonValue | undefined> {
+        if (this.commentThreads !== undefined) { return this.commentThreads; }
+        if (this.commentThreadsLoading) { return this.commentThreadsLoading; }
+        const epoch = this.commentThreadsEpoch;
+        let loading!: Promise<HistoryJsonValue | undefined>;
+        loading = (async () => {
+            const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+            const response = await this.api.getCommentThreads(identity, this.projectId);
+            if (response.type !== 'success' || response.commentThreads === undefined) {
+                return undefined;
+            }
+            const raw = deepCloneJson(response.commentThreads);
+            if (epoch !== this.commentThreadsEpoch) { return undefined; }
+            const pendingEvents = this.historyOtThreadEvents.events.slice(
+                this.appliedHistoryOtThreadEventCount,
+            );
+            const projected = reduceHistoryOtThreadEvents(raw, pendingEvents);
+            this.commentThreads = projected;
+            this.appliedHistoryOtThreadEventCount = this.historyOtThreadEvents.events.length;
+            return projected;
+        })().finally(() => {
+            if (this.commentThreadsLoading === loading) {
+                this.commentThreadsLoading = undefined;
+            }
+        });
+        this.commentThreadsLoading = loading;
+        return loading;
+    }
+
     private normalizeRealtimeTextOperations(update: UpdateSchema): TextOperation[] {
         if (!Array.isArray(update.op)) {
             throw new Error('Realtime update has no text operation');
@@ -2463,19 +2943,26 @@ export class VirtualFileSystem extends vscode.Disposable {
         update: unknown,
         sender?: ProjectSenderWitness,
     ): ReceivedDocumentUpdate {
-        if (!isPlainObject(update)) {
-            return {update, sender: sender ? {...sender} : undefined};
-        }
-        const snapshot: {[key: string]: unknown} = {...update};
-        if (Array.isArray(update.op)) {
-            snapshot.op = update.op.map(operation =>
-                isPlainObject(operation) ? {...operation} : operation
-            );
-        }
         return {
-            update: snapshot,
+            update: deepCloneJson(update),
             sender: sender ? {...sender} : undefined,
         };
+    }
+
+    private assertReceivedDocumentUpdateAuthority(
+        docId: string,
+        updates: readonly ReceivedDocumentUpdate[],
+        expected: ProjectSenderWitness,
+    ): void {
+        updates.forEach((received, index) => {
+            if (received.sender?.publicId !== expected.publicId
+                || received.sender.generation !== expected.generation) {
+                throw new Error(`Document join update ${index} belongs to an unproven realtime generation`);
+            }
+            if (!isPlainObject(received.update) || received.update.doc !== docId) {
+                throw new Error(`Document join update ${index} has an invalid document identity`);
+            }
+        });
     }
 
     private sameTextOperations(left: TextOperation[], right: TextOperation[]): boolean {
@@ -2491,7 +2978,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         docId: string,
         response: unknown,
         receivedUpdates: readonly ReceivedDocumentUpdate[],
-    ): PreparedDocumentJoin {
+    ): PreparedShareJsDocumentJoin {
         if (!isPlainObject(response)
             || !Array.isArray(response.docLines)
             || !response.docLines.every(line => typeof line === 'string')
@@ -3067,6 +3554,356 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
+    private prepareHistoryLiveRemoteEditorUpdate(
+        doc: DocumentEntity,
+        remoteVersion: number,
+        remoteOperations: HistoryJsonValue,
+    ): PreparedHistoryRemoteEditorUpdate | undefined {
+        const candidates = [...this.activeEditorBases.entries()].filter(([bufferId, active]) => {
+            const buffer = this.editorBuffers.get(bufferId);
+            return active.identity.docId === doc._id
+                && active.historyCausality !== undefined
+                && buffer !== undefined
+                && this.bufferMatchesIncarnation(buffer);
+        });
+        if (candidates.length === 0) { return undefined; }
+        if (candidates.length !== 1) {
+            candidates.forEach(([, active]) => this.invalidateEditorBase(active));
+            return undefined;
+        }
+        const [bufferId, active] = candidates[0];
+        const buffer = this.editorBuffers.get(bufferId)!;
+        const history = active.historyCausality!;
+        const sender = this.currentSenderWitness();
+        if (!sender
+            || !doc.historyOtEpoch
+            || doc.historyOtSnapshot === undefined
+            || this.historyRemoteEditorTransactionMap().has(bufferId)
+            || this.historyCleanEditorRefreshMap().has(bufferId)
+            || !history.valid
+            || history.authority !== 'ready'
+            || history.socketGeneration !== sender.generation
+            || history.remoteEpoch !== doc.historyOtEpoch
+            || history.remoteVersion !== remoteVersion
+            || !historyOtJsonEqual(history.remoteSnapshot.raw, doc.historyOtSnapshot)
+            || history.documentVersion !== buffer.document.version
+            || history.editorContent !== buffer.document.getText()) {
+            this.invalidateEditorBase(active);
+            return undefined;
+        }
+        try {
+            const transaction = prepareHistoryRemoteEditorTransaction(
+                history,
+                randomUUID(),
+                remoteVersion,
+                remoteOperations,
+            );
+            const clean = !buffer.document.isDirty
+                && history.inflightWire === undefined
+                && history.inflightView === undefined
+                && history.pending === undefined;
+            const delivery: PreparedHistoryRemoteEditorUpdate['delivery'] = clean
+                ? 'provider-refresh' : 'workspace-edit';
+            const nextRemoteSnapshot = serializeHistoryOtSnapshot(
+                transaction.transformed.serverSnapshot,
+            );
+            const cleanRefresh = clean ? {
+                document: buffer.document,
+                active,
+                transaction,
+                nextRemoteVersion: remoteVersion + 1,
+                nextRemoteSnapshot,
+                nextRemoteContent: getVisibleHistoryOtText(transaction.transformed.serverSnapshot),
+                candidateContents: new Set([transaction.beforeEditorContent]),
+            } : undefined;
+            return {bufferId, document: buffer.document, active, transaction, delivery, cleanRefresh};
+        } catch {
+            this.invalidateEditorBase(active);
+            return undefined;
+        }
+    }
+
+    private stageHistoryCleanRemoteEditorRefresh(
+        prepared: PreparedHistoryRemoteEditorUpdate,
+    ): boolean {
+        const {active, bufferId, cleanRefresh, document, transaction} = prepared;
+        const buffer = this.editorBuffers.get(bufferId);
+        const sender = this.currentSenderWitness();
+        if (prepared.delivery !== 'provider-refresh'
+            || !cleanRefresh
+            || transaction.expectedChange === undefined
+            || buffer?.document !== document
+            || !this.bufferMatchesIncarnation(buffer)
+            || this.activeEditorBases.get(bufferId) !== active
+            || document.isDirty
+            || document.version !== transaction.beforeDocumentVersion
+            || document.getText() !== transaction.beforeEditorContent
+            || sender?.generation !== transaction.socketGeneration
+            || this.historyCleanEditorRefreshMap().has(bufferId)) {
+            this.invalidateEditorBase(active);
+            return false;
+        }
+        this.historyCleanEditorRefreshMap().set(bufferId, cleanRefresh);
+        return true;
+    }
+
+    private async applyPreparedHistoryRemoteEditorUpdate(
+        prepared: PreparedHistoryRemoteEditorUpdate,
+    ): Promise<boolean> {
+        const {active, bufferId, document, transaction} = prepared;
+        const history = active.historyCausality;
+        const buffer = this.editorBuffers.get(bufferId);
+        const sender = this.currentSenderWitness();
+        if (!history
+            || buffer?.document !== document
+            || !this.bufferMatchesIncarnation(buffer)
+            || this.activeEditorBases.get(bufferId) !== active
+            || document.version !== transaction.beforeDocumentVersion
+            || document.getText() !== transaction.beforeEditorContent
+            || sender?.generation !== transaction.socketGeneration) {
+            this.invalidateEditorBase(active);
+            return false;
+        }
+        if (!transaction.expectedChange) {
+            const next = commitHistoryRemoteEditorTransaction(
+                history,
+                transaction,
+                document.version,
+                [],
+                document.getText(),
+            );
+            active.historyCausality = next;
+            if (!next.valid) { return false; }
+            if (next.inflightWire === undefined) {
+                active.version = next.remoteVersion;
+                active.content = getVisibleHistoryOtText(next.remoteSnapshot);
+            }
+            return true;
+        }
+        const pending: PendingHistoryRemoteEditorTransaction = {
+            document,
+            active,
+            transaction,
+            consumed: false,
+        };
+        this.historyRemoteEditorTransactionMap().set(bufferId, pending);
+        const change = transaction.expectedChange;
+        const edit = new vscode.WorkspaceEdit();
+        edit.replace(
+            document.uri,
+            new vscode.Range(
+                document.positionAt(change.rangeOffset),
+                document.positionAt(change.rangeOffset + change.rangeLength),
+            ),
+            change.text,
+        );
+        let applied = false;
+        try {
+            applied = await vscode.workspace.applyEdit(edit);
+        } catch (error) {
+            console.warn('Unable to apply a witnessed History OT collaborator edit', error);
+        }
+        if (this.historyRemoteEditorTransactionMap().get(bufferId) === pending) {
+            this.historyRemoteEditorTransactionMap().delete(bufferId);
+        }
+        const committed = active.historyCausality;
+        const exact = applied
+            && pending.consumed
+            && committed?.valid === true
+            && committed.remoteVersion === transaction.baseRemoteVersion + 1
+            && committed.editorContent === document.getText();
+        if (!exact) {
+            this.invalidateEditorBase(active);
+            return false;
+        }
+        if (committed.inflightWire === undefined) {
+            active.version = committed.remoteVersion;
+            active.content = getVisibleHistoryOtText(committed.remoteSnapshot);
+            const record = await this.provenanceStore.createOrUpdateCurrent({
+                identity: active.identity,
+                bufferIncarnationId: bufferId,
+                baseVersion: active.version,
+                baseText: active.content,
+                dirtyText: document.getText(),
+            });
+            active.recordName = record.recordName;
+            active.persistence = Promise.resolve(record);
+        }
+        return true;
+    }
+
+    private async applyHistoryOtDocumentUpdate(
+        update: unknown,
+        eventSender?: ProjectSenderWitness,
+    ): Promise<void> {
+        const parsed = parseHistoryOtRealtimeEnvelope(update);
+        const docId = parsed.doc;
+        const sender = this.currentSenderWitness();
+        if (!parsed.safe || !docId || parsed.version === undefined) {
+            if (docId) {
+                this.invalidateDocumentSession(
+                    docId,
+                    new Error(`Unsafe History OT realtime update: ${parsed.unsafeReasons.join('; ')}`),
+                );
+            }
+            return;
+        }
+        if (!sender
+            || eventSender?.publicId !== sender.publicId
+            || eventSender.generation !== sender.generation) {
+            this.invalidateDocumentSession(
+                docId,
+                new Error('History OT update belongs to an unproven realtime generation'),
+            );
+            return;
+        }
+        const resolved = this._resolveById(docId);
+        if (!resolved || resolved.fileType !== 'doc') { return; }
+        const doc = resolved.fileEntity as DocumentEntity;
+        const session = doc.historyOtSession;
+        if (doc.otType !== 'history-ot' || !session) {
+            this.invalidateDocumentSession(
+                docId,
+                new Error('History OT update arrived without an authoritative History OT session'),
+            );
+            return;
+        }
+
+        if (parsed.classification === 'sender-ack') {
+            const matching = [...this.pendingDocumentUpdates.values()].filter(pending => {
+                const active = this.activeEditorBases.get(pending.bufferId);
+                return pending.otType === 'history-ot'
+                    && pending.docId === docId
+                    && pending.historySession === session
+                    && pending.socketGeneration === sender.generation
+                    && pending.submittedPublicIds.includes(sender.publicId)
+                    && (active === undefined
+                        || active.historyCausality?.inflightToken === pending.submissionToken);
+            });
+            if (matching.length !== 1) {
+                this.invalidateDocumentSession(docId, new Error('Unproven History OT sender ACK'));
+                return;
+            }
+            const pending = matching[0];
+            const result = session.receiveApplied(sender.generation, update);
+            if (result.kind === 'late-ack-ignored') { return; }
+            if (result.kind !== 'sender-commit') {
+                this.invalidateDocumentSession(
+                    docId,
+                    new Error(result.reason ?? 'History OT sender ACK was not accepted'),
+                );
+                return;
+            }
+            const active = this.activeEditorBases.get(pending.bufferId);
+            if (active?.historyCausality) {
+                active.historyCausality = acknowledgeHistorySubmission(
+                    active.historyCausality,
+                    pending.submissionToken,
+                    parsed.version,
+                );
+            }
+            pending.confirmationVersion = parsed.version;
+            doc.version = undefined;
+            doc.remoteCache = undefined;
+            doc.historyOtSnapshot = undefined;
+            doc.historyOtPresentation = undefined;
+            doc.historyOtEpoch = undefined;
+            this.resolveDocumentVersionWaiters(docId, parsed.version);
+            this.markSourceDirty();
+            return;
+        }
+
+        if (parsed.classification !== 'collaborator-update' || parsed.operation === undefined) {
+            this.invalidateDocumentSession(docId, new Error('Unsupported History OT realtime event'));
+            return;
+        }
+        const beforeVersion = doc.version;
+        const beforeContent = doc.remoteCache;
+        if (!isNonnegativeSafeInteger(beforeVersion)
+            || beforeContent === undefined
+            || doc.historyOtSnapshot === undefined) {
+            this.invalidateDocumentSession(docId, new Error('History OT update has no exact document base'));
+            return;
+        }
+        const remoteOperations = serializeHistoryOtWireOperation(parsed.operation);
+        const prepared = this.prepareHistoryLiveRemoteEditorUpdate(
+            doc,
+            beforeVersion,
+            remoteOperations,
+        );
+        const result = session.receiveApplied(sender.generation, update);
+        if (!result.applied || result.requiresRejoin) {
+            this.invalidateDocumentSession(
+                docId,
+                new Error(result.reason ?? 'History OT update requires an authoritative rejoin'),
+            );
+            return;
+        }
+        const sessionState = session.getState();
+        if (prepared && (sessionState.snapshot === undefined
+            || !historyOtJsonEqual(
+                sessionState.snapshot,
+                prepared.transaction.transformed.serverSnapshot.raw,
+            ))) {
+            this.invalidateEditorBase(prepared.active);
+        }
+        const content = this.refreshHistoryOtRuntime(doc);
+        let liveApplied = false;
+        let stagedClean = false;
+        if (prepared?.active.historyCausality?.valid) {
+            stagedClean = prepared.delivery === 'provider-refresh'
+                && prepared.transaction.expectedChange !== undefined
+                ? this.stageHistoryCleanRemoteEditorRefresh(prepared) : false;
+            liveApplied = !stagedClean
+                ? await this.applyPreparedHistoryRemoteEditorUpdate(prepared) : false;
+        }
+        const uri = this.pathToUri(resolved.path);
+        if (stagedClean) {
+            doc.localCache = content;
+        } else if (liveApplied && prepared?.document.isDirty) {
+            doc.localCache = undefined;
+        } else if (!prepared) {
+            const editor = vscode.workspace.textDocuments.find(
+                item => item.uri.toString() === uri.toString(),
+            );
+            if (editor && !editor.isDirty) { doc.localCache = content; }
+        }
+        this.markSourceDirty();
+        if (!liveApplied || stagedClean || prepared?.transaction.expectedChange === undefined) {
+            this.notify([{type: vscode.FileChangeType.Changed, uri}]);
+        }
+    }
+
+    private queueHistoryOtDocumentUpdate(update: unknown, sender?: ProjectSenderWitness) {
+        const docId = realtimeUpdateDocId(update);
+        if (!docId) {
+            this.invalidateDocumentSessions(this.root);
+            return;
+        }
+        const queues = this.remoteUpdateQueueMap();
+        const previous = queues.get(docId);
+        const applyIfCurrent = () => {
+            const current = this.currentSenderWitness();
+            if (!sender
+                || current?.publicId !== sender.publicId
+                || current.generation !== sender.generation) {
+                return Promise.resolve();
+            }
+            return this.applyHistoryOtDocumentUpdate(update, sender);
+        };
+        const operation = previous ? previous.catch(() => undefined).then(applyIfCurrent) : applyIfCurrent();
+        let queued!: Promise<void>;
+        queued = operation.catch(error => {
+            this.invalidateDocumentSession(
+                docId,
+                error instanceof Error ? error : new Error(String(error)),
+            );
+        }).finally(() => {
+            if (queues.get(docId) === queued) { queues.delete(docId); }
+        });
+        queues.set(docId, queued);
+    }
+
     private queueDocumentUpdate(update: UpdateSchema, sender?: ProjectSenderWitness) {
         const queues = this.remoteUpdateQueueMap();
         const previous = queues.get(update.doc);
@@ -3116,6 +3953,8 @@ export class VirtualFileSystem extends vscode.Disposable {
                 this.publicId = undefined;
                 this.permissionsLevel = undefined;
                 this.protocolVersion = undefined;
+                this.resetCommentThreadProjection();
+                this.resetChangesUsers();
                 // Gate filesystem operations immediately. The shared initialization
                 // task waits for transport reconnect and then joins the project.
                 void this.startInitialization(true).catch(() => {});
@@ -3139,6 +3978,41 @@ export class VirtualFileSystem extends vscode.Disposable {
             },
             onFatalError: (error: RealtimeFatalError) => {
                 this.handleFatalRealtime(error);
+            },
+            onPermissionsInvalidated: () => {
+                this.handlePermissionsInvalidated();
+            },
+            onHistoryOtThreadEvent: (event: HistoryOtThreadEventName, args: unknown[]) => {
+                try {
+                    const candidate = appendHistoryOtThreadEvent(
+                        this.historyOtThreadEvents,
+                        event,
+                        args,
+                    );
+                    const accepted = candidate.events[candidate.events.length - 1];
+                    // Validate every event even before its REST base is available.
+                    const projected = reduceHistoryOtThreadEvent(
+                        this.commentThreads ?? {},
+                        accepted,
+                    );
+                    this.historyOtThreadEvents = candidate;
+                    if (this.commentThreads !== undefined) {
+                        this.commentThreads = projected;
+                        this.appliedHistoryOtThreadEventCount = candidate.events.length;
+                        this.refreshHistoryOtPresentationsForThreadEvent();
+                    }
+                } catch (error) {
+                    try {
+                        this.rejectedHistoryOtThreadEvents.push({
+                            event,
+                            args: deepCloneJson(args),
+                            reason: error instanceof Error ? error.message : String(error),
+                        });
+                    } catch {
+                        // Non-JSON socket data cannot enter the JSON event log.
+                    }
+                    console.warn('Ignoring unsafe History OT comment event', error);
+                }
             },
             onFileCreated: (parentFolderId:string, type:FileType, entity:FileEntity) => {
                 const res = this._resolveById(parentFolderId);
@@ -3193,7 +4067,8 @@ export class VirtualFileSystem extends vscode.Disposable {
                 }
             },
             onFileChanged: (update:unknown, sender?: ProjectSenderWitness) => {
-                if (!isRealtimeUpdateSchema(update)) {
+                const docId = realtimeUpdateDocId(update);
+                if (!docId) {
                     const error = new Error('Realtime document update has no valid document identity');
                     this.joiningDocuments.forEach(joining => {
                         joining.invalid = error;
@@ -3201,9 +4076,28 @@ export class VirtualFileSystem extends vscode.Disposable {
                     this.invalidateDocumentSessions(this.root);
                     return;
                 }
-                const joining = this.joiningDocuments.get(update.doc);
+                const joining = this.joiningDocuments.get(docId);
                 if (joining && joining.generation === this.socket.generation) {
-                    joining.updates.push(this.snapshotReceivedDocumentUpdate(update, sender));
+                    try {
+                        joining.updates.push(this.snapshotReceivedDocumentUpdate(update, sender));
+                    } catch (error) {
+                        joining.invalid = error instanceof Error ? error : new Error(String(error));
+                    }
+                    return;
+                }
+                const resolved = this._resolveById(docId);
+                const doc = resolved?.fileType === 'doc'
+                    ? resolved.fileEntity as DocumentEntity
+                    : undefined;
+                if (doc?.otType === 'history-ot') {
+                    this.queueHistoryOtDocumentUpdate(update, sender);
+                    return;
+                }
+                if (!isRealtimeUpdateSchema(update)) {
+                    this.invalidateDocumentSession(
+                        docId,
+                        new Error('ShareJS realtime update is malformed or has the wrong OT type'),
+                    );
                     return;
                 }
                 this.queueDocumentUpdate(update, sender);
@@ -3236,7 +4130,10 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     async resolve(uri: vscode.Uri): Promise<File> {
         const {fileName, fileEntity, fileType} = await this._resolveUri(uri);
-        const readonly = fileEntity?.readonly || this.isProjectReadOnly() ?
+        const reviewDocument = this.permissionsLevel === 'review' && fileType === 'doc';
+        const readonly = fileEntity?.readonly
+            || this.permissionsLevel === 'readOnly'
+            || (this.permissionsLevel === 'review' && !reviewDocument) ?
             vscode.FilePermission.Readonly : undefined;
         switch (fileType) {
             case undefined:
@@ -3507,60 +4404,51 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
-    private async performDocumentJoin(docId: string): Promise<{doc: DocumentEntity, content: string}> {
-        // init() is a project-ready barrier. joinDoc then creates a fresh document
-        // session for the current socket generation. The snapshot and every
-        // catch-up packet are validated and replayed before any session state is
-        // committed.
-        await this.init();
-        const connectionGeneration = await this.socket.waitUntilConnected();
-        const joining: {
+    private async performDocumentJoinAttempt(
+        docId: string,
+        connectionGeneration: number,
+        joining: {
             generation: number,
             updates: ReceivedDocumentUpdate[],
             invalid?: Error,
-        } = {generation: connectionGeneration, updates: []};
-        this.joiningDocuments.set(docId, joining);
-        try {
-            const joiningSender = this.currentSenderWitness();
-            if (!joiningSender || joiningSender.generation !== connectionGeneration) {
-                throw new Error('Document join started without a current sender witness');
-            }
-            const response: unknown = await this.socket.joinDoc(docId);
-            assertCurrentConnection(
-                connectionGeneration,
-                this.socket.generation,
-                this.socket.isConnected,
-            );
-            // The project tree may have been replaced while the async join was in
-            // progress. Commit session state only to the current entity generation.
-            const doc = this.currentDocument(docId);
-            const queuedUpdateCount = joining.updates.length;
-            if (joining.invalid) { throw joining.invalid; }
-            const prepared = this.prepareDocumentJoin(
-                docId,
-                response,
-                joining.updates.slice(),
-            );
-            const sender = this.currentSenderWitness();
-            assertCurrentConnection(
-                connectionGeneration,
-                this.socket.generation,
-                this.socket.isConnected,
-            );
-            if (this.joiningDocuments.get(docId) !== joining
-                || joining.updates.length !== queuedUpdateCount
-                || this.currentDocument(docId) !== doc
-                || joining.invalid
-                || sender?.publicId !== joiningSender.publicId
-                || sender.generation !== joiningSender.generation) {
-                throw new Error('Document join authority changed before the causal state could be committed');
-            }
+        },
+        refreshAttempt: 0 | 1,
+    ): Promise<{doc: DocumentEntity, content: string}> {
+        const joiningSender = this.currentSenderWitness();
+        if (!joiningSender || joiningSender.generation !== connectionGeneration) {
+            throw new Error('Document join started without a current sender witness');
+        }
+        const response: DocumentJoin = await this.socket.joinDoc(docId);
+        assertCurrentConnection(
+            connectionGeneration,
+            this.socket.generation,
+            this.socket.isConnected,
+        );
+        if (refreshAttempt === 1 && response.otType !== 'history-ot') {
+            throw new Error('History OT commit refresh changed the document protocol');
+        }
 
+        const doc = this.currentDocument(docId);
+        const receivedUpdates = joining.updates.slice();
+        const queuedUpdateCount = receivedUpdates.length;
+        if (joining.invalid) { throw joining.invalid; }
+        this.assertReceivedDocumentUpdateAuthority(docId, receivedUpdates, joiningSender);
+
+        let content: string;
+        let changedDuringJoin = false;
+        let historySession: HistoryOtSession | undefined;
+        if (response.otType === 'sharejs-text-ot') {
+            const prepared = this.prepareDocumentJoin(docId, response, receivedUpdates);
             const ledger = this.startPreparedRemoteCausality(
                 docId,
                 prepared,
                 connectionGeneration,
             );
+            doc.otType = 'sharejs-text-ot';
+            doc.historyOtSession = undefined;
+            doc.historyOtSnapshot = undefined;
+            doc.historyOtPresentation = undefined;
+            doc.historyOtEpoch = undefined;
             doc.version = prepared.headVersion;
             doc.remoteCache = prepared.headContent;
             this.touchDocumentProviderStat(doc, prepared.headContent);
@@ -3577,9 +4465,116 @@ export class VirtualFileSystem extends vscode.Disposable {
                 })) {
                 throw new Error('Document join replay does not match its authoritative causal witness');
             }
-            this.joiningDocuments.delete(docId);
-            if (prepared.headVersion !== prepared.anchorVersion) {
-                this.markSourceDirty();
+            content = prepared.headContent;
+            changedDuringJoin = prepared.headVersion !== prepared.anchorVersion;
+        } else {
+            this.invalidateRemoteCausality(docId);
+            let session = doc.historyOtSession;
+            if (session) {
+                const state = session.getState();
+                if (connectionGeneration > state.generation) {
+                    session.reconnect(connectionGeneration);
+                } else if (connectionGeneration < state.generation) {
+                    throw new Error('History OT session generation is newer than the active socket');
+                }
+                const permission = session.updatePermission(connectionGeneration, {
+                    level: this.permissionsLevel,
+                    userId: this.userId,
+                });
+                if (permission.requiresRejoin && !permission.state.hasPendingOperation) {
+                    session = undefined;
+                }
+            }
+            session ??= new HistoryOtSession(docId, connectionGeneration, {
+                level: this.permissionsLevel,
+                userId: this.userId,
+            });
+            const joined = session.acceptJoin(connectionGeneration, {
+                snapshot: response.snapshot,
+                version: response.version,
+                operations: response.updates,
+                ranges: response.ranges,
+                otType: response.otType,
+            });
+            if (joined.requiresRejoin) {
+                const blocked = joined.state.pendingRecoveryBlockedReason;
+                if (blocked) {
+                    throw new SocketRequestError(
+                        'stale_connection',
+                        `Pending History OT outcome is unresolved: ${blocked}`,
+                        true,
+                        {docId, reason: blocked},
+                    );
+                }
+                throw new Error(joined.reason ?? 'Unsafe History OT join state');
+            }
+            doc.otType = 'history-ot';
+            doc.historyOtSession = session;
+            doc.historyOtEpoch = randomUUID();
+            historySession = session;
+            doc.lastVersion = undefined;
+            content = this.refreshHistoryOtRuntime(doc);
+
+            const orderedUpdates = receivedUpdates.map(received => ({
+                received,
+                parsed: parseHistoryOtRealtimeEnvelope(received.update),
+            })).sort((left, right) => (left.parsed.version ?? -1) - (right.parsed.version ?? -1));
+            for (const {received, parsed} of orderedUpdates) {
+                if (!parsed.safe || parsed.doc !== docId || parsed.version === undefined) {
+                    throw new Error(`Unsafe History OT update buffered during join: ${parsed.unsafeReasons.join('; ')}`);
+                }
+                const result: HistoryOtSessionResult = session.receiveApplied(
+                    connectionGeneration,
+                    received.update,
+                );
+                if (result.kind === 'sender-commit') {
+                    throw new HistoryOtCommitDuringJoinError(docId);
+                }
+                if (result.requiresRejoin) {
+                    throw new Error(result.reason ?? 'History OT join replay requires another authoritative join');
+                }
+                if (result.applied) {
+                    changedDuringJoin = true;
+                    content = this.refreshHistoryOtRuntime(doc);
+                }
+            }
+        }
+
+        const sender = this.currentSenderWitness();
+        assertCurrentConnection(
+            connectionGeneration,
+            this.socket.generation,
+            this.socket.isConnected,
+        );
+        if (this.joiningDocuments.get(docId) !== joining
+            || joining.updates.length !== queuedUpdateCount
+            || this.currentDocument(docId) !== doc
+            || joining.invalid
+            || sender?.publicId !== joiningSender.publicId
+            || sender.generation !== joiningSender.generation
+            || doc.version === undefined
+            || doc.remoteCache !== content) {
+            throw new Error('Document join authority changed before the causal state could be committed');
+        }
+        if (changedDuringJoin) {
+            this.markSourceDirty();
+            const resolved = this._resolveById(docId);
+            if (resolved) {
+                this.notify([{
+                    type: vscode.FileChangeType.Changed,
+                    uri: this.pathToUri(resolved.path),
+                }]);
+            }
+        }
+        if (doc.otType === 'history-ot') {
+            void Promise.all([this.ensureCommentThreads(), this.ensureChangesUsers()]).then(() => {
+                const current = this.currentSenderWitness();
+                if (current?.generation !== connectionGeneration
+                    || this.currentDocument(docId) !== doc
+                    || doc.historyOtSession !== historySession) {
+                    return;
+                }
+                this.refreshHistoryOtRuntime(doc);
                 const resolved = this._resolveById(docId);
                 if (resolved) {
                     this.notify([{
@@ -3587,16 +4582,50 @@ export class VirtualFileSystem extends vscode.Disposable {
                         uri: this.pathToUri(resolved.path),
                     }]);
                 }
-            }
-            return {doc, content: prepared.headContent};
+            }).catch(error => {
+                console.warn('Unable to load History OT presentation metadata', error);
+            });
+        }
+        return {doc, content};
+    }
+
+    private async performDocumentJoin(docId: string): Promise<{doc: DocumentEntity, content: string}> {
+        // Each attempt installs its raw realtime buffer synchronously before
+        // joinDoc can yield. One sender-commit race is retried from a fresh join.
+        await this.init();
+        const connectionGeneration = await this.socket.waitUntilConnected();
+        try {
+            const joined = await runHistoryOtJoinWithCommitRefresh(
+                () => {
+                    assertCurrentConnection(
+                        connectionGeneration,
+                        this.socket.generation,
+                        this.socket.isConnected,
+                    );
+                    const joining = {
+                        generation: connectionGeneration,
+                        updates: [] as ReceivedDocumentUpdate[],
+                    };
+                    this.joiningDocuments.set(docId, joining);
+                    return joining;
+                },
+                (joining, attempt) => this.performDocumentJoinAttempt(
+                    docId,
+                    connectionGeneration,
+                    joining,
+                    attempt,
+                ),
+                joining => {
+                    if (this.joiningDocuments.get(docId) === joining) {
+                        this.joiningDocuments.delete(docId);
+                    }
+                },
+            );
+            return joined.value;
         } catch (error) {
             const failure = error instanceof Error ? error : new Error(String(error));
             this.invalidateDocumentSession(docId, failure);
             throw failure;
-        } finally {
-            if (this.joiningDocuments.get(docId) === joining) {
-                this.joiningDocuments.delete(docId);
-            }
         }
     }
 
@@ -3623,8 +4652,12 @@ export class VirtualFileSystem extends vscode.Disposable {
                 'this dirty editor was never bound to a remote document identity',
             );
         }
-        await this.assertProjectWritable('Unable to write file');
+        this.assertAuthenticatedAccount(uri);
         const resolved = await this._resolveUri(uri);
+        const reviewHistoryMutation = !create
+            && resolved.fileType === 'doc'
+            && (resolved.fileEntity as DocumentEntity | undefined)?.otType === 'history-ot';
+        await this.assertProjectWritable('Unable to write file', reviewHistoryMutation);
         const keys = [
             `path:${this.projectId}:${parseUri(uri).pathParts.join('/')}`,
             ...(resolved.fileType === 'doc' && resolved.fileEntity ?
@@ -3682,10 +4715,11 @@ export class VirtualFileSystem extends vscode.Disposable {
     private pendingWritePayload(
         pending: PendingDocumentUpdate,
         state = 'submitted',
-        extra: {[key: string]: JsonValue} = {},
-    ): JsonValue {
+        extra: {[key: string]: ProvenanceJsonValue} = {},
+    ): ProvenanceJsonValue {
         return JSON.parse(JSON.stringify({
             state,
+            otType: pending.otType ?? 'sharejs-text-ot',
             docId: pending.docId,
             bufferId: pending.bufferId,
             update: pending.update,
@@ -3696,8 +4730,9 @@ export class VirtualFileSystem extends vscode.Disposable {
             submittedPublicIds: pending.submittedPublicIds,
             socketGeneration: pending.socketGeneration,
             submissionToken: pending.submissionToken,
+            historyIntent: pending.historyIntent,
             ...extra,
-        })) as JsonValue;
+        })) as ProvenanceJsonValue;
     }
 
     private pendingRecordMatches(
@@ -3892,6 +4927,310 @@ export class VirtualFileSystem extends vscode.Disposable {
         };
     }
 
+    private async reconcileConfirmedHistoryPending(
+        pending: PendingDocumentUpdate,
+        authoritative: {doc: DocumentEntity, content: string},
+        witness: EditorBufferWitness,
+    ): Promise<{
+        submissionWitnessStillMatches: boolean,
+        currentMatchesAuthoritative: boolean,
+    }> {
+        const version = authoritative.doc.version;
+        const snapshot = authoritative.doc.historyOtSnapshot;
+        const epoch = authoritative.doc.historyOtEpoch;
+        const sender = this.currentSenderWitness();
+        const active = this.activeEditorBases.get(pending.bufferId);
+        const live = this.editorBuffers.get(pending.bufferId);
+        if (pending.otType !== 'history-ot'
+            || pending.confirmationVersion === undefined
+            || !isNonnegativeSafeInteger(version)
+            || authoritative.doc.otType !== 'history-ot'
+            || snapshot === undefined
+            || !epoch
+            || !sender
+            || !active?.historyCausality
+            || !live
+            || !this.bufferMatchesIncarnation(live)
+            || this.pendingDocumentUpdates.get(pending.bufferId) !== pending) {
+            throw new Error('The confirmed History OT write has no exact live reconciliation state');
+        }
+        const history = reconcileHistoryEditorAfterJoin(active.historyCausality, {
+            socketGeneration: sender.generation,
+            remoteEpoch: epoch,
+            remoteVersion: version,
+            remoteSnapshot: snapshot,
+            documentVersion: live.document.version,
+            editorContent: live.document.getText(),
+        });
+        if (!history.valid || history.authority !== 'ready') {
+            throw new Error('The fresh History OT snapshot does not exactly witness the committed operation');
+        }
+        const identity = this.documentProvenanceIdentity(pending.docId, live);
+        if (!identity || identity.otType !== 'history-ot') {
+            throw new Error('The History OT sender identity changed before durable reconciliation');
+        }
+        const record = await this.provenanceStore.reconcilePendingWrite(
+            pending.provenanceRecordName,
+            this.pendingWritePayload(pending),
+            {
+                identity,
+                bufferIncarnationId: pending.bufferId,
+                baseVersion: version,
+                baseText: authoritative.content,
+                dirtyText: live.document.getText(),
+            },
+        );
+        if (this.pendingDocumentUpdates.get(pending.bufferId) !== pending
+            || this.activeEditorBases.get(pending.bufferId) !== active
+            || !this.bufferMatchesIncarnation(live)
+            || live.document.version !== history.documentVersion
+            || live.document.getText() !== history.editorContent) {
+            throw new Error('The History OT editor changed during durable reconciliation');
+        }
+        this.pendingDocumentUpdates.delete(pending.bufferId);
+        active.identity = identity;
+        active.version = version;
+        active.content = authoritative.content;
+        active.recordName = record.recordName;
+        active.persistence = Promise.resolve(record);
+        active.causality = this.createLocalEditorCausality(
+            live.document,
+            pending.docId,
+            version,
+            authoritative.content,
+        );
+        active.historyCausality = history;
+        this.stageEditorBase(live.document.uri, authoritative.doc, authoritative.content);
+        const currentMatchesAuthoritative = live.document.getText() === authoritative.content
+            && this.documentMatchesAuthority(authoritative.doc, version, authoritative.content);
+        if (currentMatchesAuthoritative) {
+            authoritative.doc.localCache = authoritative.content;
+            this.editorSaveReceipts.set(pending.bufferId, {
+                document: live.document,
+                identity,
+                bufferId: pending.bufferId,
+                version,
+                content: authoritative.content,
+            });
+        } else {
+            this.editorSaveReceipts.delete(pending.bufferId);
+        }
+        return {
+            submissionWitnessStillMatches: this.bufferMatchesWitness(witness),
+            currentMatchesAuthoritative,
+        };
+    }
+
+    private async writeHistoryOtDocument(
+        uri: vscode.Uri,
+        content: Uint8Array,
+        desiredContent: string,
+        doc: DocumentEntity,
+        remoteContent: string,
+        sessionVersion: number,
+        witness: EditorBufferWitness,
+        provenance: Extract<EditorProvenanceResolution, {kind: 'valid'}>['value'],
+    ): Promise<void> {
+        if (desiredContent === remoteContent) {
+            await this.acceptEditorBase(
+                witness,
+                doc,
+                sessionVersion,
+                remoteContent,
+                provenance.recordsToClear,
+            );
+            return;
+        }
+        this.assertAuthenticatedAccount(uri);
+        const sender = this.currentSenderWitness();
+        const active = this.activeEditorBases.get(witness.bufferId);
+        const history = active?.historyCausality;
+        const historySession = doc.historyOtSession;
+        const state = historySession?.getState();
+        const descriptor = history?.pendingWriteDescriptor;
+        const intent: HistoryOtWriteIntent | undefined = descriptor?.kind === 'tracked-write'
+            ? {kind: 'tracked-write'}
+            : descriptor?.kind === 'plain-write' ? {kind: 'plain-write'} : undefined;
+        if (!sender
+            || !active
+            || !history?.valid
+            || history.authority !== 'ready'
+            || !historySession
+            || !intent
+            || state?.phase !== 'ready'
+            || state.version !== sessionVersion
+            || history.socketGeneration !== sender.generation
+            || history.remoteVersion !== sessionVersion
+            || doc.historyOtSnapshot === undefined
+            || !historyOtJsonEqual(history.remoteSnapshot.raw, doc.historyOtSnapshot)
+            || history.editorContent !== desiredContent
+            || history.documentVersion !== witness.documentVersion
+            || history.inflightWire !== undefined
+            || history.inflightView !== undefined
+            || history.inflightToken !== undefined
+            || history.pending === undefined
+            || active.version !== provenance.record.baseVersion
+            || active.content !== provenance.record.baseText
+            || provenance.record.pendingWrite !== undefined) {
+            this.blockDocumentWrite(
+                uri,
+                content,
+                'the History OT save does not match one exact captured local operation',
+            );
+        }
+        const operation = serializeHistoryOtOperations(history.pending);
+        if (!Array.isArray(operation) || operation.length !== 1) {
+            this.blockDocumentWrite(
+                uri,
+                content,
+                'the History OT operation cannot be represented as one frozen wire operation',
+            );
+        }
+        let staged: HistoryOtSessionResult;
+        try {
+            staged = historySession.stage(sender.generation, {
+                operation,
+                meta: intent.kind === 'tracked-write' ? {tc: randomUUID()} : undefined,
+                intent,
+                publicId: sender.publicId,
+            });
+        } catch (error) {
+            throw error;
+        }
+        if (!staged.envelope || !staged.submissionToken) {
+            throw new Error('History OT staging did not produce an exact authorized submission');
+        }
+        try {
+            active.historyCausality = beginHistorySubmission(
+                history,
+                staged.submissionToken,
+                operation,
+                descriptor,
+            );
+        } catch (error) {
+            historySession.cancelStagedSubmission(sender.generation, staged.submissionToken);
+            throw error;
+        }
+        const pending: PendingDocumentUpdate = {
+            otType: 'history-ot',
+            docId: doc._id,
+            bufferId: witness.bufferId,
+            provenanceRecordName: provenance.record.recordName,
+            update: staged.envelope as unknown as UpdateSchema,
+            desiredContent,
+            mergedContent: desiredContent,
+            baseVersion: provenance.record.baseVersion,
+            baseContent: provenance.record.baseText,
+            submittedPublicIds: [sender.publicId],
+            socketGeneration: sender.generation,
+            submissionToken: staged.submissionToken,
+            historyIntent: intent,
+            historySession,
+        };
+        let pendingRecord: DocumentProvenanceRecord;
+        try {
+            pendingRecord = await this.provenanceStore.markPendingWrite(
+                pending.provenanceRecordName,
+                this.pendingWritePayload(pending),
+            );
+        } catch (error) {
+            historySession.cancelStagedSubmission(sender.generation, staged.submissionToken);
+            active.historyCausality = rejectHistorySubmission(
+                active.historyCausality,
+                staged.submissionToken,
+            );
+            throw error;
+        }
+        let preEmitError: unknown;
+        try {
+            this.assertAuthenticatedAccount(uri);
+            const senderBeforeSend = this.currentSenderWitness();
+            if (!this.documentMatchesAuthority(doc, sessionVersion, remoteContent)
+                || !this.bufferMatchesWitness(witness)
+                || senderBeforeSend?.publicId !== sender.publicId
+                || senderBeforeSend.generation !== sender.generation
+                || this.activeEditorBases.get(witness.bufferId) !== active
+                || active.historyCausality?.inflightToken !== staged.submissionToken
+                || doc.historyOtSession !== historySession) {
+                throw new Error('History OT authority changed before transport submission');
+            }
+        } catch (error) {
+            preEmitError = error;
+        }
+        if (preEmitError !== undefined) {
+            historySession.cancelStagedSubmission(sender.generation, staged.submissionToken);
+            active.historyCausality = rejectHistorySubmission(
+                active.historyCausality!,
+                staged.submissionToken,
+            );
+            await this.provenanceStore.clearPendingWrite(pendingRecord.recordName);
+            throw preEmitError;
+        }
+        this.pendingDocumentUpdates.set(witness.bufferId, pending);
+        this.markSourceDirty();
+        const waiter = this.waitForDocumentVersion(doc._id, sessionVersion);
+        try {
+            await awaitHistoryOtSubmissionCommit(
+                this.socket.applyHistoryOtUpdate(
+                    doc._id,
+                    staged.envelope,
+                    intent,
+                    staged.submissionToken,
+                    historySession,
+                    sender,
+                ),
+                waiter.promise.then(version => {
+                    pending.confirmationVersion = version;
+                }),
+                () => {
+                    historySession.markQueueAccepted(sender.generation, staged.submissionToken!);
+                },
+                error => error instanceof SocketRequestError && error.outcomeUnknown,
+            );
+        } catch (error) {
+            waiter.cancel();
+            const sessionAfterFailure = historySession.getState();
+            const outcomeUnknown = sessionAfterFailure.pendingWireAttempted
+                || !(error instanceof SocketRequestError)
+                || error.outcomeUnknown;
+            if (!outcomeUnknown) {
+                historySession.cancelStagedSubmission(sender.generation, staged.submissionToken);
+                const current = this.activeEditorBases.get(witness.bufferId);
+                if (current?.historyCausality) {
+                    current.historyCausality = rejectHistorySubmission(
+                        current.historyCausality,
+                        staged.submissionToken,
+                    );
+                }
+                this.pendingDocumentUpdates.delete(witness.bufferId);
+                await this.provenanceStore.clearPendingWrite(pending.provenanceRecordName);
+                throw error;
+            }
+            throw new SocketRequestError(
+                'stale_connection',
+                `The History OT write outcome is unknown: ${String(error)}`,
+                true,
+                error,
+            );
+        }
+
+        const authoritative = await this.joinFreshDocumentSession(doc._id);
+        const reconciled = await this.reconcileConfirmedHistoryPending(
+            pending,
+            authoritative,
+            witness,
+        );
+        setTimeout(() => this.notify([{type: vscode.FileChangeType.Changed, uri}]), 10);
+        if (reconciled.submissionWitnessStillMatches
+            && !reconciled.currentMatchesAuthoritative) {
+            this.blockDocumentWrite(
+                uri,
+                content,
+                'the History OT save committed with collaborator text absent from this editor',
+            );
+        }
+    }
+
     /**
      * Retry an outcome-unknown write only inside the same extension-host
      * session, from its exact durable intent, and under a fresh socket public
@@ -3899,6 +5238,168 @@ export class VirtualFileSystem extends vscode.Disposable {
      * unapplied write is committed once, while an already-applied write is only
      * confirmed to the new sender and is not broadcast again.
      */
+    private async recoverPendingHistoryDocumentUpdate(
+        uri: vscode.Uri,
+        content: Uint8Array,
+        docId: string,
+        witness: EditorBufferWitness,
+        pending: PendingDocumentUpdate,
+    ): Promise<boolean> {
+        if (pending.confirmationVersion !== undefined) {
+            const authoritative = await this.joinFreshDocumentSession(docId);
+            const reconciled = await this.reconcileConfirmedHistoryPending(
+                pending,
+                authoritative,
+                witness,
+            );
+            return reconciled.currentMatchesAuthoritative;
+        }
+        this.assertAuthenticatedAccount(uri);
+        const joined = await this.ensureDocumentSession(docId);
+        const historySession = joined.doc.historyOtSession;
+        const historySnapshot = joined.doc.historyOtSnapshot;
+        const historyEpoch = joined.doc.historyOtEpoch;
+        const sender = this.currentSenderWitness();
+        const active = this.activeEditorBases.get(witness.bufferId);
+        const history = active?.historyCausality;
+        if (joined.doc.otType !== 'history-ot'
+            || !historySession
+            || historySession !== pending.historySession
+            || historySession.getState().phase !== 'recovery-ready'
+            || historySnapshot === undefined
+            || !historyEpoch
+            || !isNonnegativeSafeInteger(joined.doc.version)
+            || !sender
+            || pending.submittedPublicIds.includes(sender.publicId)
+            || !pending.historyIntent
+            || !active
+            || !history?.valid
+            || history.inflightWire === undefined) {
+            this.blockDocumentWrite(
+                uri,
+                content,
+                'the pending History OT write has no exact fresh recovery session',
+            );
+        }
+        const staged = historySession.prepareRecovery(sender.generation, sender.publicId);
+        if (!staged.envelope || !staged.submissionToken) {
+            throw new Error('History OT recovery did not produce an exact authorized submission');
+        }
+        active.historyCausality = rebindHistorySubmissionForRecovery(history, {
+            socketGeneration: sender.generation,
+            remoteEpoch: historyEpoch,
+            submissionToken: staged.submissionToken,
+            joinVersion: joined.doc.version,
+            joinSnapshot: historySnapshot,
+            documentVersion: witness.documentVersion,
+            editorContent: witness.content,
+        });
+        if (!active.historyCausality.valid) {
+            historySession.cancelStagedSubmission(sender.generation, staged.submissionToken);
+            this.blockDocumentWrite(
+                uri,
+                content,
+                'the fresh History OT join contains collaborator ancestry that cannot be recovered exactly',
+            );
+        }
+        const retryPending: PendingDocumentUpdate = {
+            ...pending,
+            update: staged.envelope as unknown as UpdateSchema,
+            submittedPublicIds: [...pending.submittedPublicIds, sender.publicId],
+            socketGeneration: sender.generation,
+            submissionToken: staged.submissionToken,
+            historySession,
+        };
+        await this.provenanceStore.markPendingWrite(
+            retryPending.provenanceRecordName,
+            this.pendingWritePayload(retryPending),
+        );
+        let authorizationError: unknown;
+        try {
+            this.assertAuthenticatedAccount(uri);
+            const currentSender = this.currentSenderWitness();
+            if (currentSender?.publicId !== sender.publicId
+                || currentSender.generation !== sender.generation
+                || this.pendingDocumentUpdates.get(witness.bufferId) !== pending
+                || this.activeEditorBases.get(witness.bufferId) !== active
+                || active.historyCausality.inflightToken !== staged.submissionToken
+                || !this.bufferMatchesWitness(witness)
+                || joined.doc.historyOtSession !== historySession) {
+                throw new Error('History OT recovery authority changed before transport submission');
+            }
+        } catch (error) {
+            authorizationError = error;
+        }
+        if (authorizationError !== undefined) {
+            historySession.cancelStagedSubmission(sender.generation, staged.submissionToken);
+            active.historyCausality = {...active.historyCausality, valid: false};
+            await this.provenanceStore.markPendingWrite(
+                pending.provenanceRecordName,
+                this.pendingWritePayload(pending),
+            );
+            throw authorizationError;
+        }
+        this.pendingDocumentUpdates.set(witness.bufferId, retryPending);
+        const waiter = this.waitForDocumentVersion(docId, retryPending.update.v);
+        try {
+            await awaitHistoryOtSubmissionCommit(
+                this.socket.applyHistoryOtUpdate(
+                    docId,
+                    staged.envelope,
+                    pending.historyIntent,
+                    staged.submissionToken,
+                    historySession,
+                    sender,
+                ),
+                waiter.promise.then(version => {
+                    retryPending.confirmationVersion = version;
+                }),
+                () => historySession.markQueueAccepted(
+                    sender.generation,
+                    staged.submissionToken!,
+                ),
+                error => error instanceof SocketRequestError && error.outcomeUnknown,
+            );
+        } catch (error) {
+            waiter.cancel();
+            const outcomeUnknown = historySession.getState().pendingWireAttempted
+                || !(error instanceof SocketRequestError)
+                || error.outcomeUnknown;
+            if (!outcomeUnknown) {
+                historySession.cancelStagedSubmission(sender.generation, staged.submissionToken);
+                await this.provenanceStore.markPendingWrite(
+                    pending.provenanceRecordName,
+                    this.pendingWritePayload(pending),
+                );
+                this.pendingDocumentUpdates.set(witness.bufferId, pending);
+                this.forceFreshConnection();
+                throw error;
+            }
+            throw new SocketRequestError(
+                'stale_connection',
+                `The History OT recovery outcome is unknown: ${String(error)}`,
+                true,
+                error,
+            );
+        }
+        const authoritative = await this.joinFreshDocumentSession(docId);
+        const reconciled = await this.reconcileConfirmedHistoryPending(
+            retryPending,
+            authoritative,
+            witness,
+        );
+        setTimeout(() => this.notify([{type: vscode.FileChangeType.Changed, uri}]), 10);
+        if (reconciled.submissionWitnessStillMatches
+            && !reconciled.currentMatchesAuthoritative) {
+            this.blockDocumentWrite(
+                uri,
+                content,
+                'the recovered History OT save committed with remote text absent from this editor',
+            );
+        }
+        return true;
+    }
+
     private async recoverPendingDocumentUpdate(
         uri: vscode.Uri,
         content: Uint8Array,
@@ -3961,6 +5462,16 @@ export class VirtualFileSystem extends vscode.Disposable {
             );
         }
 
+        if (pending.otType === 'history-ot') {
+            return this.recoverPendingHistoryDocumentUpdate(
+                uri,
+                content,
+                docId,
+                witness,
+                pending,
+            );
+        }
+
         if (pending.confirmationVersion !== undefined) {
             let authoritative: {doc: DocumentEntity, content: string};
             try {
@@ -3986,7 +5497,8 @@ export class VirtualFileSystem extends vscode.Disposable {
 
         const retrySession = await this.ensureDocumentSession(docId);
         const retrySessionVersion = retrySession.doc.version;
-        if (!isNonnegativeSafeInteger(retrySessionVersion)
+        if (retrySession.doc.otType !== 'sharejs-text-ot'
+            || !isNonnegativeSafeInteger(retrySessionVersion)
             || !isNonnegativeSafeInteger(retrySessionVersion + 1)) {
             this.blockDocumentWrite(
                 uri,
@@ -4162,6 +5674,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (fileType && fileType==='doc' && fileEntity) {
             const docId = fileEntity._id;
             const _content = new TextDecoder().decode(content);
+            await this.remoteUpdateQueueMap().get(docId);
             if (this.isInvisibleMode) {
                 this.blockDocumentWrite(
                     uri,
@@ -4205,6 +5718,35 @@ export class VirtualFileSystem extends vscode.Disposable {
                     uri,
                     content,
                     'the remote document changed while its provenance was being checked',
+                );
+            }
+            if (doc.otType === 'history-ot') {
+                if (provenance.kind === 'blocked') {
+                    this.blockDocumentWrite(uri, content, provenance.reason);
+                }
+                return this.writeHistoryOtDocument(
+                    uri,
+                    content,
+                    _content,
+                    doc,
+                    remoteContent,
+                    sessionVersion,
+                    witness,
+                    provenance.value,
+                );
+            }
+            if (doc.otType !== 'sharejs-text-ot') {
+                this.blockDocumentWrite(
+                    uri,
+                    content,
+                    'the joined document did not prove a supported realtime protocol',
+                );
+            }
+            if (this.permissionsLevel === 'review') {
+                this.blockDocumentWrite(
+                    uri,
+                    content,
+                    'review permission requires a History OT tracked write',
                 );
             }
             const exactBase = provenance.kind === 'valid' ? {
@@ -5171,6 +6713,44 @@ export class VirtualFileSystem extends vscode.Disposable {
             return false;
         }
     }
+
+    async getTrackChangesPresentation(
+        uri: vscode.Uri,
+    ): Promise<RealtimeHistoryOtPresentationModel | undefined> {
+        const {fileType, fileEntity} = await this._resolveUri(uri);
+        if (fileType !== 'doc' || !fileEntity) { return undefined; }
+        const joined = await this.ensureDocumentSession(fileEntity._id);
+        if (joined.doc.otType !== 'history-ot') { return undefined; }
+        await Promise.all([this.ensureCommentThreads(), this.ensureChangesUsers()]);
+        this.refreshHistoryOtRuntime(joined.doc);
+        return joined.doc.historyOtPresentation;
+    }
+
+    async getTrackChangesContext(uri: vscode.Uri) {
+        const presentation = await this.getTrackChangesPresentation(uri);
+        if (!presentation) { return undefined; }
+        const {fileType, fileEntity} = await this._resolveUri(uri);
+        const version = fileType === 'doc' && fileEntity
+            ? (fileEntity as DocumentEntity).version : undefined;
+        if (!isNonnegativeSafeInteger(version)) {
+            throw new Error('Track Changes context has no authoritative document version');
+        }
+        return {presentation, permissionsLevel: this.permissionsLevel, userId: this.userId, version};
+    }
+
+    getHistoryOtThreadEventLog(): HistoryOtRawThreadEventLog {
+        return deepCloneJson(this.historyOtThreadEvents) as unknown as HistoryOtRawThreadEventLog;
+    }
+
+    async applyTrackChangesDecision(
+        _uri: vscode.Uri,
+        _decision: 'accept' | 'reject',
+        _request: unknown,
+    ): Promise<void> {
+        throw vscode.FileSystemError.Unavailable(
+            'Tracked-change decisions require a separately witnessed History OT selection bridge',
+        );
+    }
 }
 
 export class RemoteFileSystemProvider implements vscode.FileSystemProvider, vscode.Disposable {
@@ -5259,6 +6839,23 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider, vsco
 
     prefetch(uri: vscode.Uri): Promise<VirtualFileSystem> {
         return this.getVFS(uri).then((vfs) => {return vfs;});
+    }
+
+    getTrackChangesPresentation(uri: vscode.Uri) {
+        return this.getVFS(uri).then(vfs => vfs.getTrackChangesPresentation(uri));
+    }
+
+    getTrackChangesContext(uri: vscode.Uri) {
+        return this.getVFS(uri).then(vfs => vfs.getTrackChangesContext(uri));
+    }
+
+    applyTrackChangesDecision(
+        uri: vscode.Uri,
+        decision: 'accept' | 'reject',
+        request: unknown,
+    ) {
+        return this.getVFS(uri).then(vfs =>
+            vfs.applyTrackChangesDecision(uri, decision, request));
     }
 
     notify(events :vscode.FileChangeEvent[]) {
