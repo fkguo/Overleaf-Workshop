@@ -520,6 +520,52 @@ describe('DocumentProvenanceStore', () => {
         assert.equal(reconciled.dirtyText, 'abXYc');
     });
 
+    it('updates post-submit dirty recovery text without mutating the pending wire intent', async () => {
+        const storage = new MemoryStorage();
+        const store = createStore(storage, 'window-a');
+        const created = await store.createOrUpdateCurrent({
+            identity: baseIdentity,
+            bufferIncarnationId: defaultBufferIncarnationId,
+            baseVersion: 12,
+            baseText: 'abc',
+            dirtyText: 'abXc',
+        });
+        const pending: JsonValue = {
+            state: 'submitted',
+            update: {v: 12, op: [{p: 2, i: 'X'}]},
+        };
+        await store.markPendingWrite(created.recordName, pending);
+
+        const updated = await store.updatePendingDirtyText(
+            created.recordName,
+            pending,
+            'abXYc',
+        );
+        assert.deepEqual(updated.pendingWrite, pending);
+        assert.equal(updated.baseVersion, 12);
+        assert.equal(updated.baseText, 'abc');
+        assert.equal(updated.dirtyText, 'abXYc');
+        await assert.rejects(
+            () => store.updatePendingDirtyText(
+                created.recordName,
+                {state: 'different'},
+                'should-not-commit',
+            ),
+            /pending-write mismatch/,
+        );
+        const retained = await store.resolveCurrentRecord(created.recordName, {
+            identity: baseIdentity,
+            bufferIncarnationId: defaultBufferIncarnationId,
+            baseVersion: 12,
+            baseText: 'abc',
+            dirtyText: 'abXYc',
+        });
+        assert.equal(retained.kind, 'valid');
+        if (retained.kind === 'valid') {
+            assert.deepEqual(retained.record.pendingWrite, pending);
+        }
+    });
+
     it('flush waits for already queued atomic storage operations', async () => {
         const storage = new BlockingMemoryStorage();
         const store = createStore(storage, 'window-a');

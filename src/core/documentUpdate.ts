@@ -281,7 +281,7 @@ function transformComponent(
  * Transform both operations exactly as Overleaf's pinned ShareJS helper does.
  * The first operation has left/server precedence; the second has right/client precedence.
  */
-function transformOperationPair(
+export function transformOperationPair(
     leftInput: TextOperation[],
     rightInput: TextOperation[],
 ): [TextOperation[], TextOperation[]] {

@@ -9,6 +9,7 @@ import {
     HarnessStorage,
     LooseJoinDocResponse,
     openAuthoritativeText,
+    productionWorkspaceEvents,
     resetHarnessDocuments,
     resetHarnessRuntime,
     settleAsyncWork,
@@ -96,7 +97,6 @@ async function assertJoinCatchUpFailsClosed(
             // abc@9 before this edit. Continue through the public lifecycle so
             // the regression observes any stale wire attempt before asserting
             // that the initial read must have been rejected.
-            harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
             editor.openClean(harness.events);
             await settleAsyncWork();
             await settleAsyncWork();
@@ -284,11 +284,11 @@ describe('stale-buffer rollback safety', () => {
                 new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
                 authoritative,
             );
-            harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
             const editor = new SimulatedDirtyEditor(harness.uri, authoritative);
             editor.openClean(harness.events);
             await settleAsyncWork();
             await settleAsyncWork();
+            assert.equal(harness.events.warningMessages.length, 0);
 
             editor.editThroughEvents(desired, harness.events);
             const result = await editor.saveThroughProvider(harness.provider, harness.events);
@@ -347,11 +347,11 @@ describe('stale-buffer rollback safety', () => {
             new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
             base,
         );
-        harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
         const editor = new SimulatedDirtyEditor(harness.uri, base);
         editor.openClean(harness.events);
         await settleAsyncWork();
         await settleAsyncWork();
+        assert.equal(harness.events.warningMessages.length, 0);
 
         editor.editThroughEvents(desired, harness.events);
         const result = await editor.saveThroughProvider(harness.provider, harness.events);
@@ -379,11 +379,11 @@ describe('stale-buffer rollback safety', () => {
             new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
             base,
         );
-        harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
         const editor = new SimulatedDirtyEditor(harness.uri, base);
         editor.openClean(harness.events);
         await settleAsyncWork();
         await settleAsyncWork();
+        assert.equal(harness.events.warningMessages.length, 0);
         editor.editThroughEvents(desired, harness.events);
 
         let saveError: unknown;
@@ -420,11 +420,11 @@ describe('stale-buffer rollback safety', () => {
             new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
             base,
         );
-        harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
         const editor = new SimulatedDirtyEditor(harness.uri, base);
         editor.openClean(harness.events);
         await settleAsyncWork();
         await settleAsyncWork();
+        assert.equal(harness.events.warningMessages.length, 0);
         editor.editThroughEvents(beforeFormat, harness.events);
 
         const result = await editor.saveThroughProvider(
@@ -490,11 +490,11 @@ describe('stale-buffer rollback safety', () => {
             new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
             base,
         );
-        harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
         const editor = new SimulatedDirtyEditor(harness.uri, base);
         editor.openClean(harness.events);
         await settleAsyncWork();
         await settleAsyncWork();
+        assert.equal(harness.events.warningMessages.length, 0);
         assert.equal(editor.dirty, false);
 
         await harness.provider.writeFile(
@@ -524,12 +524,13 @@ describe('stale-buffer rollback safety', () => {
             new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
             base,
         );
-        harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
         const editor = new SimulatedDirtyEditor(harness.uri, base);
         editor.openClean(harness.events);
         await settleAsyncWork();
         await settleAsyncWork();
+        assert.equal(harness.events.warningMessages.length, 0);
         server.collaboratorUpdate(PROJECT_A, [{p: 0, i: 'REMOTE '}]);
+        await settleAsyncWork();
 
         await assert.rejects(
             harness.provider.writeFile(
@@ -540,8 +541,8 @@ describe('stale-buffer rollback safety', () => {
             (error: any) => error?.code === 'Unavailable',
         );
 
-        assert.equal(editor.dirty, false);
-        assert.equal(editor.document.getText(), base);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), remote);
         assert.equal(server.capturedUpdates.length, 0);
         assert.equal(server.text(PROJECT_A), remote);
         harness.dispose();
@@ -563,11 +564,11 @@ describe('stale-buffer rollback safety', () => {
             new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
             base,
         );
-        harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
         const editor = new SimulatedDirtyEditor(harness.uri, base);
         editor.openClean(harness.events);
         await settleAsyncWork();
         await settleAsyncWork();
+        assert.equal(harness.events.warningMessages.length, 0);
 
         harness.events.fireDidChange(editor.document, []);
         editor.editThroughEvents(desired, harness.events);
@@ -595,11 +596,11 @@ describe('stale-buffer rollback safety', () => {
             new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
             base,
         );
-        harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
         const editor = new SimulatedDirtyEditor(harness.uri, base);
         editor.openClean(harness.events);
         await settleAsyncWork();
         await settleAsyncWork();
+        assert.equal(harness.events.warningMessages.length, 0);
 
         editor.version += 1;
         harness.events.fireDidChange(editor.document, []);
@@ -624,13 +625,13 @@ describe('stale-buffer rollback safety', () => {
             projectId: PROJECT_A,
         });
 
+        const confirmation = harness.events.deferWarningResponse();
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.openClean(harness.events);
         assert.equal(
             new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
             base,
         );
-        const confirmation = harness.events.deferWarningResponse();
-        const editor = new SimulatedDirtyEditor(harness.uri, base);
-        editor.openClean(harness.events);
         assert.equal(harness.events.warningMessages.length, 1);
 
         editor.version += 1;
@@ -661,13 +662,13 @@ describe('stale-buffer rollback safety', () => {
             projectId: PROJECT_A,
         });
 
+        const confirmation = harness.events.deferWarningResponse();
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.openClean(harness.events);
         assert.equal(
             new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
             base,
         );
-        const confirmation = harness.events.deferWarningResponse();
-        const editor = new SimulatedDirtyEditor(harness.uri, base);
-        editor.openClean(harness.events);
         assert.equal(harness.events.warningMessages.length, 1);
 
         editor.editThroughEvents(desired, harness.events);
@@ -696,9 +697,8 @@ describe('stale-buffer rollback safety', () => {
             projectId: PROJECT_A,
         });
         const editor = new SimulatedDirtyEditor(harness.uri, base);
-        editor.dirty = false;
-        editor.attach();
         harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
+        editor.openClean(harness.events);
 
         assert.equal(
             new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
@@ -731,6 +731,7 @@ describe('stale-buffer rollback safety', () => {
         });
         const editor = new SimulatedDirtyEditor(harness.uri, restored);
         editor.attach();
+        harness.events.fireDidOpen(editor.document);
 
         assert.equal(
             new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
@@ -801,8 +802,7 @@ describe('stale-buffer rollback safety', () => {
             projectId: PROJECT_A,
         });
         const editor = new SimulatedDirtyEditor(harness.uri, base);
-        editor.dirty = false;
-        editor.attach();
+        editor.openClean(harness.events);
         const firstConfirmation = harness.events.deferWarningResponse();
         assert.equal(new TextDecoder().decode(await harness.provider.readFile(harness.uri)), base);
 
@@ -843,8 +843,7 @@ describe('stale-buffer rollback safety', () => {
             projectId: PROJECT_A,
         });
         const editor = new SimulatedDirtyEditor(harness.uri, base);
-        editor.dirty = false;
-        editor.attach();
+        editor.openClean(harness.events);
         const firstConfirmation = harness.events.deferWarningResponse();
         assert.equal(new TextDecoder().decode(await harness.provider.readFile(harness.uri)), base);
 
@@ -882,12 +881,12 @@ describe('stale-buffer rollback safety', () => {
             projectId: PROJECT_A,
         });
 
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.openClean(harness.events);
         assert.equal(
             new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
             base,
         );
-        const editor = new SimulatedDirtyEditor(harness.uri, base);
-        editor.openClean(harness.events);
         await settleAsyncWork();
         await settleAsyncWork();
         assert.equal(harness.events.warningMessages.length, 1);
@@ -904,7 +903,7 @@ describe('stale-buffer rollback safety', () => {
         harness.dispose();
     });
 
-    it('keeps a public merged save dirty until host refresh, then saves a later edit', async () => {
+    it('applies a collaborator edit to the live dirty buffer before saving it', async () => {
         const base = 'LEFT middle RIGHT';
         const local = 'LOCAL middle RIGHT';
         const merged = 'LOCAL middle REMOTE';
@@ -918,22 +917,25 @@ describe('stale-buffer rollback safety', () => {
             projectId: PROJECT_A,
         });
         assert.equal(new TextDecoder().decode(await harness.provider.readFile(harness.uri)), base);
-        harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
         const editor = new SimulatedDirtyEditor(harness.uri, base);
         editor.openClean(harness.events);
         await settleAsyncWork();
         await settleAsyncWork();
+        assert.equal(harness.events.warningMessages.length, 0);
 
         editor.editThroughEvents(local, harness.events);
         server.collaboratorUpdate(PROJECT_A, replaceAt(base, 'RIGHT', 'REMOTE'));
-        const mergedSave = await editor.saveThroughProvider(harness.provider, harness.events);
-        assert.equal(mergedSave.saved, false);
+        await settleAsyncWork();
         assert.equal(editor.dirty, true);
-        assert.equal(editor.document.getText(), local);
+        assert.equal(editor.document.getText(), merged);
+
+        const mergedSave = await editor.saveThroughProvider(harness.provider, harness.events);
+        assert.equal(mergedSave.saved, true);
+        assert.equal(editor.dirty, false);
+        assert.equal(editor.document.getText(), merged);
         assert.equal(server.text(PROJECT_A), merged);
         assert.equal(server.capturedUpdates.length, 1);
 
-        await editor.reloadAuthoritative(harness.vfs, merged);
         editor.editThroughEvents(followUp, harness.events);
         const secondSave = await editor.saveThroughProvider(harness.provider, harness.events);
         assert.equal(secondSave.saved, true);
@@ -955,13 +957,13 @@ describe('stale-buffer rollback safety', () => {
             projectId: PROJECT_A,
         });
 
+        const confirmation = harness.events.deferWarningResponse();
+        const editor = new SimulatedDirtyEditor(harness.uri, advanced);
+        editor.openClean(harness.events);
         assert.equal(
             new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
             advanced,
         );
-        const confirmation = harness.events.deferWarningResponse();
-        const editor = new SimulatedDirtyEditor(harness.uri, advanced);
-        editor.openClean(harness.events);
         editor.editThroughEvents(restored, harness.events);
         confirmation.resolve(ENABLE_CLEAN_EDITOR);
         await settleAsyncWork();
@@ -996,11 +998,11 @@ describe('stale-buffer rollback safety', () => {
                 base,
                 trigger,
             );
-            harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
             const editor = new SimulatedDirtyEditor(harness.uri, base);
             editor.openClean(harness.events);
             await settleAsyncWork();
             await settleAsyncWork();
+            assert.equal(harness.events.warningMessages.length, 0, trigger);
             editor.editThroughEvents(desired, harness.events);
 
             const host = new SimulatedEditorHost();
@@ -1055,19 +1057,20 @@ describe('stale-buffer rollback safety', () => {
             new TextDecoder().decode(await harness.provider.readFile(harness.encodedUri)),
             base,
         );
-        harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
         const aliasA = new SimulatedDirtyEditor(harness.encodedUri, base);
         aliasA.openClean(harness.events);
         await settleAsyncWork();
         await settleAsyncWork();
+        assert.equal(harness.events.warningMessages.length, 0);
 
+        const aliasBConfirmation = harness.events.deferWarningResponse();
+        const aliasB = new SimulatedDirtyEditor(harness.reorderedUri, base);
+        aliasB.openClean(harness.events);
         assert.equal(
             new TextDecoder().decode(await harness.provider.readFile(harness.reorderedUri)),
             base,
         );
-        const aliasBConfirmation = harness.events.deferWarningResponse();
-        const aliasB = new SimulatedDirtyEditor(harness.reorderedUri, base);
-        aliasB.openClean(harness.events);
+        assert.equal(harness.events.warningMessages.length, 1);
 
         aliasA.editThroughEvents(aliasAContent, harness.events);
         const aliasASave = await aliasA.saveThroughProvider(harness.provider, harness.events);
@@ -1079,6 +1082,7 @@ describe('stale-buffer rollback safety', () => {
             PROJECT_A,
             replaceAt(aliasAContent, 'RIGHT', 'REMOTE'),
         );
+        await settleAsyncWork();
         assert.equal(server.text(PROJECT_A), expectedRemote);
 
         aliasBConfirmation.resolve(ENABLE_CLEAN_EDITOR);
@@ -1641,9 +1645,13 @@ describe('stale-buffer rollback safety', () => {
         addProject(server, base, PROJECT_A, 'Remote Superset Noop', 6);
         const harness = createHarness(server);
         assert.equal(await openAuthoritativeText(harness), base);
-        const editor = new SimulatedDirtyEditor(harness.uri, local);
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
         editor.attach();
         await editor.confirmStagedBase(harness.vfs, base);
+        editor.editThroughEvents(local, productionWorkspaceEvents);
+        // Deliberately model a buffer outside this window: this regression is
+        // about rejecting a stale no-op, not the live-editor transform path.
+        editor.hideFromCurrentWindow();
         server.collaboratorUpdate(PROJECT_A, [
             ...replaceAt(base, 'RIGHT', 'REMOTE'),
         ]);
@@ -1651,6 +1659,8 @@ describe('stale-buffer rollback safety', () => {
             PROJECT_A,
             replaceAt('LEFT middle REMOTE', 'LEFT', 'LOCAL'),
         );
+        await settleAsyncWork();
+        editor.attach();
 
         const result = await editor.save(harness.vfs);
 
@@ -1683,9 +1693,8 @@ describe('stale-buffer rollback safety', () => {
         assert.equal(server.text(PROJECT_A), remote);
     });
 
-    it('retains the recovery-save causal base when remote advances strictly afterward', async () => {
+    it('advances a recovery-save editor base when remote text arrives strictly afterward', async () => {
         const base = 'LEFT middle RIGHT';
-        const local = 'LOCAL middle RIGHT';
         const remote = 'LEFT middle REMOTE';
         const expected = 'LOCAL middle REMOTE';
         const server = new DeterministicRealtimeServer();
@@ -1708,19 +1717,22 @@ describe('stale-buffer rollback safety', () => {
         assert.equal(linearizedBase?.content, base);
 
         server.collaboratorUpdate(PROJECT_A, replaceAt(base, 'RIGHT', 'REMOTE'));
+        await settleAsyncWork();
         assert.equal(server.text(PROJECT_A), remote);
         assert.equal(server.version(PROJECT_A), 5);
-        assert.equal(editor.dirty, false);
-        assert.equal(editor.document.getText(), base);
-        assert.equal(await harness.vfs.confirmEditorBase(editor.document), false);
-        assert.strictEqual(harness.vfs.activeEditorBases.get(bufferId), linearizedBase);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), remote);
+        const advancedBase = harness.vfs.activeEditorBases.get(bufferId);
+        assert.strictEqual(advancedBase, linearizedBase);
+        assert.equal(advancedBase?.version, 5);
+        assert.equal(advancedBase?.content, remote);
 
-        editor.edit(local);
+        editor.editThroughEvents(expected, productionWorkspaceEvents);
         const laterSave = await editor.save(harness.vfs);
 
-        assert.equal(laterSave.saved, false);
-        assert.equal(editor.dirty, true);
-        assert.equal(editor.document.getText(), local);
+        assert.equal(laterSave.saved, true);
+        assert.equal(editor.dirty, false);
+        assert.equal(editor.document.getText(), expected);
         assert.equal(server.capturedUpdates.length, 1);
         const sent = server.capturedUpdates[0].update;
         assert.equal(sent.v, 5);
@@ -1752,7 +1764,7 @@ describe('stale-buffer rollback safety', () => {
         assert.equal(server.logicalApplyCount, 1);
     });
 
-    it('merges non-overlapping edits, keeps the stale host dirty, and supports a refreshed second save', async () => {
+    it('merges non-overlapping edits into the live host and supports a second save', async () => {
         const base = 'LEFT middle RIGHT';
         const local = 'LOCAL middle RIGHT';
         const expected = 'LOCAL middle REMOTE';
@@ -1760,17 +1772,21 @@ describe('stale-buffer rollback safety', () => {
         addProject(server, base, PROJECT_A, 'Nonoverlap', 2);
         const harness = createHarness(server);
         assert.equal(await openAuthoritativeText(harness), base);
-        const editor = new SimulatedDirtyEditor(harness.uri, local);
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
         editor.attach();
         await editor.confirmStagedBase(harness.vfs, base);
+        editor.editThroughEvents(local, productionWorkspaceEvents);
 
         server.collaboratorUpdate(PROJECT_A, replaceAt(base, 'RIGHT', 'REMOTE'));
+        await settleAsyncWork();
         const remoteBeforeSave = server.text(PROJECT_A);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), expected);
         const result = await editor.save(harness.vfs);
 
-        assert.equal(result.saved, false);
-        assert.equal(editor.dirty, true);
-        assert.equal(editor.document.getText(), local);
+        assert.equal(result.saved, true);
+        assert.equal(editor.dirty, false);
+        assert.equal(editor.document.getText(), expected);
         assert.equal(server.capturedUpdates.length, 1);
         assert.equal(
             applyTextOperations(remoteBeforeSave, server.capturedUpdates[0].update.op),
@@ -1780,15 +1796,14 @@ describe('stale-buffer rollback safety', () => {
         assert.match(server.text(PROJECT_A), /LOCAL/);
         assert.match(server.text(PROJECT_A), /REMOTE/);
 
-        await editor.reloadAuthoritative(harness.vfs, expected);
         const followUp = `${expected} NEXT`;
-        editor.edit(followUp);
+        editor.editThroughEvents(followUp, productionWorkspaceEvents);
         assert.equal((await editor.save(harness.vfs)).saved, true);
         assert.equal(server.capturedUpdates.length, 2);
         assert.equal(server.text(PROJECT_A), followUp);
     });
 
-    it('preserves post-base remote edits for manual, autosave, and compile saveAll writes', async () => {
+    it('presents post-base remote edits before manual, autosave, and compile saveAll writes', async () => {
         for (const trigger of ['manual', 'auto', 'compile-save-all'] as const) {
             const base = `HEAD-${trigger} middle TAIL-${trigger}`;
             const local = `LOCAL-${trigger} middle TAIL-${trigger}`;
@@ -1797,14 +1812,18 @@ describe('stale-buffer rollback safety', () => {
             addProject(server, base, PROJECT_A, `Save ${trigger}`, 20);
             const harness = createHarness(server, new HarnessStorage(), `window-${trigger}`);
             assert.equal(await openAuthoritativeText(harness), base);
-            const editor = new SimulatedDirtyEditor(harness.uri, local);
+            const editor = new SimulatedDirtyEditor(harness.uri, base);
             editor.attach();
             await editor.confirmStagedBase(harness.vfs, base);
+            editor.editThroughEvents(local, productionWorkspaceEvents);
 
             server.collaboratorUpdate(
                 PROJECT_A,
                 replaceAt(base, `TAIL-${trigger}`, `REMOTE-${trigger}`),
             );
+            await settleAsyncWork();
+            assert.equal(editor.dirty, true, trigger);
+            assert.equal(editor.document.getText(), expected, trigger);
             const host = new SimulatedEditorHost();
             let result: {saved: boolean};
             let compileCalls = 0;
@@ -1816,16 +1835,16 @@ describe('stale-buffer rollback safety', () => {
                 assert.equal(host.autoSaveCalls, 1);
             } else {
                 const saved = await host.saveAll([{editor, vfs: harness.vfs}]);
-                assert.throws(() => requireSavedCompileInputs(saved), /could not be saved safely/);
+                assert.doesNotThrow(() => requireSavedCompileInputs(saved));
                 if (saved) { compileCalls += 1; }
                 result = {saved};
                 assert.equal(host.saveAllCalls, 1);
-                assert.equal(compileCalls, 0, 'compile must not start while the host lacks merged text');
+                assert.equal(compileCalls, 1, 'compile may start only after the merged text saves');
             }
 
-            assert.equal(result.saved, false, trigger);
-            assert.equal(editor.dirty, true, trigger);
-            assert.equal(editor.document.getText(), local, trigger);
+            assert.equal(result.saved, true, trigger);
+            assert.equal(editor.dirty, false, trigger);
+            assert.equal(editor.document.getText(), expected, trigger);
             assert.equal(server.capturedUpdates.length, 1, trigger);
             assert.equal(server.text(PROJECT_A), expected, trigger);
             assert.match(server.text(PROJECT_A), new RegExp(`LOCAL-${trigger}`));
@@ -1860,26 +1879,32 @@ describe('stale-buffer rollback safety', () => {
         assert.equal(editor.dirty, true);
     });
 
-    it('rejects overlapping collaborator and local edits without emitting OT', async () => {
+    it('preserves both overlapping collaborator and local replacements through OT', async () => {
         const base = 'same line\n';
         const local = 'local line\n';
         const remote = 'remote line\n';
+        const merged = 'remotelocal line\n';
         const server = new DeterministicRealtimeServer();
         addProject(server, base, PROJECT_A, 'Overlap', 3);
         const harness = createHarness(server);
         assert.equal(await openAuthoritativeText(harness), base);
-        const editor = new SimulatedDirtyEditor(harness.uri, local);
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
         editor.attach();
         await editor.confirmStagedBase(harness.vfs, base);
+        editor.editThroughEvents(local, productionWorkspaceEvents);
 
         server.collaboratorUpdate(PROJECT_A, replaceAt(base, 'same', 'remote'));
+        await settleAsyncWork();
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), merged);
         const result = await editor.save(harness.vfs);
 
-        assert.equal(result.saved, false);
-        assert.equal(editor.dirty, true);
-        assert.equal(editor.document.getText(), local);
-        assert.equal(server.capturedUpdates.length, 0);
-        assert.equal(server.text(PROJECT_A), remote);
+        assert.equal(result.saved, true);
+        assert.equal(editor.dirty, false);
+        assert.equal(editor.document.getText(), merged);
+        assert.equal(server.capturedUpdates.length, 1);
+        assert.equal(applyTextOperations(remote, server.capturedUpdates[0].update.op), merged);
+        assert.equal(server.text(PROJECT_A), merged);
     });
 
     it('blocks the actual whole-buffer replacement when a remote deletion overlaps its base range', async () => {
@@ -1910,14 +1935,17 @@ describe('stale-buffer rollback safety', () => {
         const editor = new SimulatedDirtyEditor(harness.uri, 'bb');
         editor.attach();
         await editor.confirmStagedBase(harness.vfs, 'bb');
-        editor.edit('bRb');
+        editor.editThroughEvents('bRb', productionWorkspaceEvents);
         server.collaboratorUpdate(PROJECT_A, [{p: 0, i: 'b'}]);
+        await settleAsyncWork();
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), 'bbRb');
 
         const result = await editor.save(harness.vfs);
 
-        assert.equal(result.saved, false);
-        assert.equal(editor.dirty, true);
-        assert.equal(editor.document.getText(), 'bRb');
+        assert.equal(result.saved, true);
+        assert.equal(editor.dirty, false);
+        assert.equal(editor.document.getText(), 'bbRb');
         assert.equal(server.capturedUpdates.length, 1);
         assert.deepEqual(server.capturedUpdates[0].update.op, [{p: 2, i: 'R'}]);
         assert.equal(server.text(PROJECT_A), 'bbRb');
@@ -1941,6 +1969,7 @@ describe('stale-buffer rollback safety', () => {
             [{p: 2, i: 'X'}],
         );
         server.collaboratorUpdate(PROJECT_A, [{p: 0, i: 'Y'}], docId);
+        await settleAsyncWork();
 
         const cached = harness.vfs._resolveById(docId)?.fileEntity;
         assert.equal(cached?.version, undefined);
@@ -2330,13 +2359,9 @@ describe('stale-buffer rollback safety', () => {
         server.releaseHeldApplicationWithTransform();
         const result = await saving;
 
-        assert.equal(result.saved, false, 'the host lacks the collaborator prefix and must remain dirty');
-        assert.match(
-            String(result.error),
-            /remote save was confirmed with collaborator text absent from this editor/i,
-        );
-        assert.equal(editor.dirty, true);
-        assert.equal(editor.document.getText(), desired);
+        assert.equal(result.saved, true);
+        assert.equal(editor.dirty, false);
+        assert.equal(editor.document.getText(), expected);
         assert.equal(server.logicalApplyCount, 1);
         assert.equal(server.senderConfirmationCount, 1);
         assert.equal(server.text(PROJECT_A), expected);
@@ -2350,9 +2375,9 @@ describe('stale-buffer rollback safety', () => {
             {
                 identity: active.identity,
                 bufferIncarnationId: bufferId,
-                baseVersion: 9,
-                baseText: base,
-                dirtyText: desired,
+                baseVersion: 11,
+                baseText: expected,
+                dirtyText: expected,
             },
         );
         assert.equal(persisted.kind, 'valid', JSON.stringify(persisted));
@@ -2373,18 +2398,24 @@ describe('stale-buffer rollback safety', () => {
         await editor.confirmStagedBase(harness.vfs, base);
         server.holdNextApplicationAfterAck();
 
-        const saving = editor.save(harness.vfs);
+        let saveSettled = false;
+        const saving = editor.save(harness.vfs).then(result => {
+            saveSettled = true;
+            return result;
+        });
         await settleAsyncWork();
         assert.equal(server.logicalApplyCount, 0);
         harness.socket.emitAnonymousSenderConfirmation('same-doc-id', 9);
-        const result = await saving;
+        await settleAsyncWork();
 
-        assert.equal(result.saved, false, 'an anonymous confirmation must not complete the save');
+        assert.equal(saveSettled, false, 'an anonymous confirmation must not complete the save');
         assert.equal(editor.dirty, true);
         assert.equal(server.logicalApplyCount, 0);
         assert.equal(server.text(PROJECT_A), base);
         server.releaseHeldApplication();
-        await settleAsyncWork();
+        const result = await saving;
+        assert.equal(result.saved, true);
+        assert.equal(editor.dirty, false);
         assert.equal(server.text(PROJECT_A), desired);
     });
 
@@ -2401,9 +2432,6 @@ describe('stale-buffer rollback safety', () => {
         const editor = new SimulatedDirtyEditor(harness.uri, desired);
         editor.attach();
         await editor.confirmStagedBase(harness.vfs, base);
-        const observerEditor = new SimulatedDirtyEditor(observer.uri, base);
-        observerEditor.attach();
-        await observerEditor.confirmStagedBase(observer.vfs, base);
         server.loseNextAckAfterCommit();
 
         const interrupted = await editor.save(harness.vfs);
@@ -2416,11 +2444,19 @@ describe('stale-buffer rollback safety', () => {
         assert.equal(server.collaboratorBroadcastCount, 1);
         assert.equal(server.capturedUpdates.length, 1);
         const first = server.capturedUpdates[0];
-
         editor.hideFromCurrentWindow();
-        observerEditor.edit(`${COLLABORATOR}:Y${base}`);
-        assert.equal((await observerEditor.save(observer.vfs)).saved, false);
-        assert.equal(observerEditor.dirty, true);
+        assert.equal(await openAuthoritativeText(observer), desired);
+        const observerEditor = new SimulatedDirtyEditor(observer.uri, desired);
+        observerEditor.attach();
+        await observerEditor.confirmStagedBase(observer.vfs, desired);
+        assert.equal(observerEditor.document.getText(), desired);
+
+        observerEditor.editThroughEvents(
+            `${COLLABORATOR}:Y${desired}`,
+            productionWorkspaceEvents,
+        );
+        assert.equal((await observerEditor.save(observer.vfs)).saved, true);
+        assert.equal(observerEditor.dirty, false);
         assert.equal(server.text(PROJECT_A), `${COLLABORATOR}:Y${desired}`);
 
         observerEditor.hideFromCurrentWindow();
@@ -2474,6 +2510,7 @@ describe('stale-buffer rollback safety', () => {
         rightEditor.attach();
         assert.equal((await rightEditor.save(rightWindow.vfs)).saved, false);
         assert.equal(rightEditor.dirty, true);
+        assert.equal(rightEditor.document.getText(), 'left middle RIGHT');
         rightEditor.hideFromCurrentWindow();
 
         const projectB = createHarness(server, storage, 'window-left', PROJECT_B);
@@ -2485,11 +2522,11 @@ describe('stale-buffer rollback safety', () => {
         await projectBEditor.confirmStagedBase(projectB.vfs, 'project b');
         assert.equal((await projectBEditor.save(projectB.vfs)).saved, true);
 
-        assert.equal(server.text(PROJECT_A), 'LEFT middle RIGHT');
+        assert.equal(server.text(PROJECT_A), 'LEFT middle right');
         assert.equal(server.text(PROJECT_B), 'PROJECT B');
         assert.deepEqual(
             server.capturedUpdates.map(update => update.projectId),
-            [PROJECT_A, PROJECT_A, PROJECT_B],
+            [PROJECT_A, PROJECT_B],
         );
         assert.notEqual(
             server.capturedUpdates[0].publicId,

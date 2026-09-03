@@ -542,6 +542,36 @@ export class DocumentProvenanceStore {
         });
     }
 
+    /**
+     * Preserve later dirty editor text without changing the immutable pending
+     * wire intent. This is recovery data only; it does not manufacture OT
+     * ancestry for a new connection generation.
+     */
+    async updatePendingDirtyText(
+        recordName: string,
+        expectedPendingWrite: JsonValue,
+        dirtyText: string,
+    ): Promise<DocumentProvenanceRecord> {
+        if (!isJsonValue(expectedPendingWrite) || typeof dirtyText !== 'string') {
+            throw new Error('pendingWrite and dirtyText must be valid recovery data');
+        }
+        return this.enqueue(async () => {
+            const current = this.requireValidCurrent(recordName, await this.readRecord(recordName));
+            if (current.pendingWrite === undefined
+                || JSON.stringify(current.pendingWrite) !== JSON.stringify(expectedPendingWrite)) {
+                throw new Error(`Cannot update provenance record ${recordName}: pending-write mismatch`);
+            }
+            const updated: DocumentProvenanceRecord = {
+                ...current,
+                dirtyText,
+                dirtyHash: sha256Text(dirtyText),
+                updatedAt: nextTimestamp(this.now, current.updatedAt),
+            };
+            await this.writeRecord(updated);
+            return updated;
+        });
+    }
+
     async clearPendingWrite(recordName: string): Promise<DocumentProvenanceRecord> {
         return this.enqueue(async () => {
             const current = this.requireValidCurrent(recordName, await this.readRecord(recordName));

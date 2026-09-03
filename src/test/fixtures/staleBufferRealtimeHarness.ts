@@ -351,6 +351,8 @@ const workspaceDocuments: Array<{
     readonly isClosed: boolean,
     readonly version: number,
     getText(): string,
+    positionAt(offset: number): {offset: number},
+    applyHarnessEdit?(rangeOffset: number, rangeLength: number, text: string): void,
 }> = [];
 
 type HarnessTextDocument = typeof workspaceDocuments[number];
@@ -456,6 +458,38 @@ class ProductionWorkspaceEventHarness {
 
 export const productionWorkspaceEvents = new ProductionWorkspaceEventHarness();
 
+class RangeStub {
+    constructor(
+        readonly start: {offset: number},
+        readonly end: {offset: number},
+    ) {}
+}
+
+class WorkspaceEditStub {
+    readonly replacements: Array<{
+        uri: UriStub,
+        range: RangeStub,
+        text: string,
+    }> = [];
+
+    replace(uri: UriStub, range: RangeStub, text: string): void {
+        this.replacements.push({uri, range, text});
+    }
+}
+
+async function applyWorkspaceEdit(edit: WorkspaceEditStub): Promise<boolean> {
+    for (const replacement of edit.replacements) {
+        const matches = workspaceDocuments.filter(document =>
+            document.uri.toString() === replacement.uri.toString()
+        );
+        if (matches.length !== 1 || !matches[0].applyHarnessEdit) { return false; }
+        const start = replacement.range.start.offset;
+        const end = replacement.range.end.offset;
+        matches[0].applyHarnessEdit(start, end - start, replacement.text);
+    }
+    return true;
+}
+
 const workspaceFileBytes = new Map<string, Uint8Array>();
 
 function workspaceFileKey(uri: UriStub): string {
@@ -508,6 +542,8 @@ const vscodeStub = {
     ProgressLocation: {Notification: 15},
     StatusBarAlignment: {Left: 1, Right: 2},
     Uri: UriStub,
+    Range: RangeStub,
+    WorkspaceEdit: WorkspaceEditStub,
     l10n: {
         t: (message: string, values?: Record<string, unknown>) => {
             if (!values) { return message; }
@@ -537,6 +573,7 @@ const vscodeStub = {
         getConfiguration: () => ({
             get: (_key: string, fallback: unknown) => fallback,
         }),
+        applyEdit: applyWorkspaceEdit,
         fs: {
             readFile: readWorkspaceFile,
             writeFile: writeWorkspaceFile,
@@ -1436,7 +1473,11 @@ export function createVirtualProject(options: {
         uri,
         (events: unknown[]) => notifications.push(events),
         options.storage.provenanceStore(options.windowId),
+        () => false,
     );
+    productionWorkspaceEvents.onDidChange(event => {
+        vfs.observeChangedTextDocument(event);
+    });
     const socket = (vfs as {socket: DeterministicSocket}).socket;
     return {vfs, uri, socket, notifications};
 }
@@ -1546,6 +1587,8 @@ export class SimulatedDirtyEditor {
         readonly isClosed: boolean,
         readonly version: number,
         getText(): string,
+        positionAt(offset: number): {offset: number},
+        applyHarnessEdit(rangeOffset: number, rangeLength: number, text: string): void,
     };
 
     constructor(readonly uri: UriStub, text: string) {
@@ -1557,6 +1600,23 @@ export class SimulatedDirtyEditor {
             get isClosed() { return editor.closed; },
             get version() { return editor.version; },
             getText: () => editor.currentText,
+            positionAt: (offset: number) => ({offset}),
+            applyHarnessEdit: (rangeOffset: number, rangeLength: number, replacement: string) => {
+                const before = editor.currentText;
+                if (rangeOffset < 0 || rangeOffset + rangeLength > before.length) {
+                    throw new Error('Harness edit range is outside the document');
+                }
+                editor.currentText = before.slice(0, rangeOffset)
+                    + replacement
+                    + before.slice(rangeOffset + rangeLength);
+                editor.dirty = true;
+                editor.version += 1;
+                productionWorkspaceEvents.fireDidChange(editor.document, [{
+                    rangeOffset,
+                    rangeLength,
+                    text: replacement,
+                }]);
+            },
         };
     }
 

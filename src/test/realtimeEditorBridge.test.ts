@@ -1,12 +1,23 @@
 import {strict as assert} from 'assert';
-import {applyTextOperations} from '../core/documentUpdate';
+import {applyTextOperations, TextOperation} from '../core/documentUpdate';
 import {
     applyUtf16TextOperations,
+    beginLocalEditorSubmission,
     commitRemoteEditorTransaction,
+    confirmLocalEditorSubmission,
     createRealtimeEditorBridgeState,
     prepareRemoteEditorTransaction,
     recordLocalEditorChange,
+    rejectLocalEditorSubmission,
+    transformHistoryRemoteOperation,
+    transformLegacyRemoteOperation,
 } from '../core/realtimeEditorBridge';
+import {
+    getVisibleHistoryOtText,
+    parseHistoryOtOperations,
+    parseHistoryOtSnapshot,
+    serializeHistoryOtOperations,
+} from '../core/historyOt';
 
 function bound(content = 'abc') {
     return createRealtimeEditorBridgeState({
@@ -204,6 +215,167 @@ describe('realtime editor bridge', () => {
         assert.throws(
             () => prepareRemoteEditorTransaction(multi, 'blocked', 12, [{p: 0, i: 'X'}]),
             /no exact remote\/local base/,
+        );
+    });
+
+    it('keeps the sent wire immutable while rebasing its view and later local input', () => {
+        const dirty = recordLocalEditorChange(
+            bound('ab'),
+            8,
+            [{rangeOffset: 1, rangeLength: 0, text: 'L'}],
+            'aLb',
+        );
+        const originalWire: TextOperation[] = [{p: 1, i: 'L'}];
+        const submitted = beginLocalEditorSubmission(dirty, 'submission-1', originalWire);
+        originalWire[0].p = 0;
+        const typedAgain = recordLocalEditorChange(
+            submitted,
+            9,
+            [{rangeOffset: 3, rangeLength: 0, text: '!'}],
+            'aLb!',
+        );
+        const transaction = prepareRemoteEditorTransaction(
+            typedAgain,
+            'remote-inflight',
+            12,
+            [{p: 1, i: 'R'}],
+        );
+        const remoteCommitted = commitRemoteEditorTransaction(
+            typedAgain,
+            transaction,
+            10,
+            [transaction.expectedChange!],
+            'aRLb!',
+        );
+
+        assert.deepEqual(remoteCommitted.inflightWire, [{p: 1, i: 'L'}]);
+        assert.deepEqual(remoteCommitted.inflightView, [{p: 2, i: 'L'}]);
+        assert.deepEqual(remoteCommitted.pendingOperations, [{p: 4, i: '!'}]);
+        const acknowledged = confirmLocalEditorSubmission(
+            remoteCommitted,
+            'submission-1',
+            13,
+            [{p: 1, i: 'L'}],
+        );
+        assert.equal(acknowledged.valid, true);
+        assert.equal(acknowledged.remoteVersion, 14);
+        assert.equal(acknowledged.remoteContent, 'aRLb');
+        assert.equal(acknowledged.editorContent, 'aRLb!');
+        assert.equal(acknowledged.documentVersion, 10, 'ACK emits no editor change');
+        assert.equal(acknowledged.inflightWire, undefined);
+        assert.equal(acknowledged.inflightView, undefined);
+        assert.deepEqual(acknowledged.localOperations, [{p: 4, i: '!'}]);
+    });
+
+    it('rejects a repeated-text wire that is textually equal but causally different', () => {
+        const dirty = recordLocalEditorChange(
+            bound('aaaa'),
+            8,
+            [{rangeOffset: 0, rangeLength: 1, text: ''}],
+            'aaa',
+        );
+        assert.throws(
+            () => beginLocalEditorSubmission(
+                dirty,
+                'ambiguous-wire',
+                [{p: 1, d: 'a'}],
+            ),
+            /exact unsent local operation/,
+        );
+        const submitted = beginLocalEditorSubmission(
+            dirty,
+            'exact-wire',
+            [{p: 0, d: 'a'}],
+        );
+        assert.deepEqual(submitted.inflightWire, [{p: 0, d: 'a'}]);
+    });
+
+    it('restores a known-rejected rebased wire view ahead of later pending input', () => {
+        const dirty = recordLocalEditorChange(
+            bound('ab'),
+            8,
+            [{rangeOffset: 1, rangeLength: 0, text: 'L'}],
+            'aLb',
+        );
+        const submitted = beginLocalEditorSubmission(
+            dirty,
+            'submission-reject',
+            [{p: 1, i: 'L'}],
+        );
+        const typedAgain = recordLocalEditorChange(
+            submitted,
+            9,
+            [{rangeOffset: 3, rangeLength: 0, text: '!'}],
+            'aLb!',
+        );
+        const remote = prepareRemoteEditorTransaction(
+            typedAgain,
+            'remote-before-reject',
+            12,
+            [{p: 1, i: 'R'}],
+        );
+        const committed = commitRemoteEditorTransaction(
+            typedAgain,
+            remote,
+            10,
+            [remote.expectedChange!],
+            'aRLb!',
+        );
+        const rejected = rejectLocalEditorSubmission(
+            committed,
+            'submission-reject',
+            [{p: 1, i: 'L'}],
+        );
+        assert.equal(rejected.valid, true);
+        assert.equal(rejected.inflightWire, undefined);
+        assert.deepEqual(rejected.pendingOperations, [
+            {p: 2, i: 'L'},
+            {p: 4, i: '!'},
+        ]);
+        assert.equal(
+            applyTextOperations(rejected.remoteContent, rejected.localOperations),
+            rejected.editorContent,
+        );
+        assert.equal(
+            confirmLocalEditorSubmission(
+                committed,
+                'wrong-token',
+                13,
+                [{p: 1, i: 'L'}],
+            ).valid,
+            false,
+        );
+    });
+
+    it('exposes convergent layered transforms for legacy and History OT', () => {
+        const wire: TextOperation[] = [{p: 1, i: 'L'}];
+        const legacy = transformLegacyRemoteOperation(
+            'ab',
+            [{p: 1, i: 'R'}],
+            {
+                inflightWire: wire,
+                inflightView: wire,
+                pending: [{p: 3, i: '!'}],
+            },
+        );
+        assert.deepEqual(legacy.inflightWire, wire);
+        assert.deepEqual(legacy.inflightView, [{p: 2, i: 'L'}]);
+        assert.equal(legacy.serverContent, 'aRb');
+        assert.equal(legacy.visibleContent, 'aRLb!');
+
+        const server = parseHistoryOtSnapshot({content: 'ab'});
+        const local = parseHistoryOtOperations([{textOperation: [1, 'L', 1]}]);
+        const historyRemote = parseHistoryOtOperations([{textOperation: [1, 'R', 1]}]);
+        const history = transformHistoryRemoteOperation(
+            server,
+            historyRemote,
+            {pending: local},
+        );
+        assert.equal(getVisibleHistoryOtText(history.serverSnapshot), 'aRb');
+        assert.equal(getVisibleHistoryOtText(history.visibleSnapshot), 'aRLb');
+        assert.deepEqual(
+            serializeHistoryOtOperations(history.pending!),
+            [{textOperation: [2, 'L', 1]}],
         );
     });
 });
