@@ -1,13 +1,21 @@
 import {strict as assert} from 'assert';
 import {applyTextOperations, TextOperation} from '../core/documentUpdate';
 import {
+    acknowledgeHistorySubmission,
     applyUtf16TextOperations,
+    beginHistorySubmission,
     beginLocalEditorSubmission,
+    commitHistoryRemoteEditorTransaction,
     commitRemoteEditorTransaction,
     confirmLocalEditorSubmission,
+    createHistoryRealtimeEditorBridgeState,
     createRealtimeEditorBridgeState,
+    prepareHistoryRemoteEditorTransaction,
     prepareRemoteEditorTransaction,
+    reconcileHistoryEditorAfterJoin,
+    recordHistoryLocalEditorChange,
     recordLocalEditorChange,
+    rejectHistorySubmission,
     rejectLocalEditorSubmission,
     transformHistoryRemoteOperation,
     transformLegacyRemoteOperation,
@@ -477,5 +485,360 @@ describe('realtime editor bridge', () => {
             comments: [{ranges: [{length: 1, pos: 0}, {length: 1, pos: 2}], id: 'c'}],
             content: 'aXb',
         });
+    });
+
+    it('records tracked local metadata and composes only under one frozen descriptor', () => {
+        const descriptor = {
+            kind: 'tracked-write' as const,
+            tracking: {userId: 'local-user', ts: '2026-08-31T08:00:00+02:00'},
+        };
+        const base = createHistoryRealtimeEditorBridgeState({
+            socketGeneration: 4,
+            remoteEpoch: 'history-epoch',
+            remoteVersion: 12,
+            remoteSnapshot: {content: 'ab'},
+            documentVersion: 7,
+            editorContent: 'ab',
+        });
+        const inserted = recordHistoryLocalEditorChange(
+            base,
+            8,
+            [{rangeOffset: 1, rangeLength: 0, text: 'L'}],
+            'aLb',
+            descriptor,
+        );
+        const deleted = recordHistoryLocalEditorChange(
+            inserted,
+            9,
+            [{rangeOffset: 2, rangeLength: 1, text: ''}],
+            'aL',
+            descriptor,
+        );
+
+        assert.equal(deleted.valid, true);
+        assert.deepEqual(deleted.pendingWriteDescriptor, {
+            kind: 'tracked-write',
+            tracking: {userId: 'local-user', ts: historyTimestamp},
+        });
+        assert.deepEqual(serializeHistoryOtSnapshot(
+            applyHistoryOtOperations(deleted.remoteSnapshot, deleted.pending!),
+        ), {
+            content: 'aLb',
+            trackedChanges: [
+                {
+                    range: {pos: 1, length: 1},
+                    tracking: {
+                        type: 'insert',
+                        userId: 'local-user',
+                        ts: historyTimestamp,
+                    },
+                },
+                {
+                    range: {pos: 2, length: 1},
+                    tracking: {
+                        type: 'delete',
+                        userId: 'local-user',
+                        ts: historyTimestamp,
+                    },
+                },
+            ],
+        });
+    });
+
+    it('keeps History wire immutable through a remote interleave and later local input', () => {
+        const base = createHistoryRealtimeEditorBridgeState({
+            socketGeneration: 4,
+            remoteEpoch: 'history-epoch',
+            remoteVersion: 12,
+            remoteSnapshot: {content: 'ab'},
+            documentVersion: 7,
+            editorContent: 'ab',
+        });
+        const dirty = recordHistoryLocalEditorChange(
+            base,
+            8,
+            [{rangeOffset: 1, rangeLength: 0, text: 'L'}],
+            'aLb',
+        );
+        const wire = serializeHistoryOtOperations(dirty.pending!);
+        const submitted = beginHistorySubmission(
+            dirty,
+            'history-submission-1',
+            dirty.pending!,
+        );
+        const remote = prepareHistoryRemoteEditorTransaction(
+            submitted,
+            'history-remote-1',
+            12,
+            [{textOperation: [1, 'R', 1]}],
+        );
+        const remoteCommitted = commitHistoryRemoteEditorTransaction(
+            submitted,
+            remote,
+            9,
+            [remote.expectedChange!],
+            'aRLb',
+        );
+        const later = recordHistoryLocalEditorChange(
+            remoteCommitted,
+            10,
+            [{rangeOffset: 4, rangeLength: 0, text: '!'}],
+            'aRLb!',
+        );
+
+        assert.equal(later.valid, true);
+        assert.deepEqual(serializeHistoryOtOperations(later.inflightWire!), wire);
+        assert.deepEqual(
+            serializeHistoryOtOperations(later.inflightView!),
+            [{textOperation: [2, 'L', 1]}],
+        );
+        assert.deepEqual(
+            serializeHistoryOtOperations(later.pending!),
+            [{textOperation: [4, '!']}],
+        );
+
+        const rejected = rejectHistorySubmission(later, 'history-submission-1');
+        assert.equal(rejected.valid, true);
+        assert.equal(rejected.inflightWire, undefined);
+        assert.equal(rejected.inflightView, undefined);
+        assert.equal(
+            getVisibleHistoryOtText(
+                applyHistoryOtOperations(rejected.remoteSnapshot, rejected.pending!),
+            ),
+            'aRLb!',
+        );
+    });
+
+    it('binds zero-wire rejection and sender commit to the exact submission token', () => {
+        const base = createHistoryRealtimeEditorBridgeState({
+            socketGeneration: 4,
+            remoteEpoch: 'history-epoch',
+            remoteVersion: 12,
+            remoteSnapshot: {content: 'ab'},
+            documentVersion: 7,
+            editorContent: 'ab',
+        });
+        const dirty = recordHistoryLocalEditorChange(
+            base,
+            8,
+            [{rangeOffset: 1, rangeLength: 0, text: 'L'}],
+            'aLb',
+        );
+        const submitted = beginHistorySubmission(dirty, 'exact-token', dirty.pending!);
+
+        assert.equal(rejectHistorySubmission(submitted, 'wrong-token').valid, false);
+        assert.equal(
+            acknowledgeHistorySubmission(submitted, 'wrong-token', 12).valid,
+            false,
+        );
+        assert.equal(rejectHistorySubmission(submitted, 'exact-token').valid, true);
+    });
+
+    it('fails closed if tracking mode changes while a logical local batch is pending', () => {
+        const tracked = {
+            kind: 'tracked-write' as const,
+            tracking: {userId: 'local-user', ts: historyTimestamp},
+        };
+        const base = createHistoryRealtimeEditorBridgeState({
+            socketGeneration: 4,
+            remoteEpoch: 'history-epoch',
+            remoteVersion: 12,
+            remoteSnapshot: {content: 'ab'},
+            documentVersion: 7,
+            editorContent: 'ab',
+        });
+        const pending = recordHistoryLocalEditorChange(
+            base,
+            8,
+            [{rangeOffset: 2, rangeLength: 0, text: 'L'}],
+            'abL',
+            tracked,
+        );
+        assert.equal(recordHistoryLocalEditorChange(
+            pending,
+            9,
+            [{rangeOffset: 3, rangeLength: 0, text: '!'}],
+            'abL!',
+            {kind: 'plain-write'},
+        ).valid, false);
+
+        const inflight = beginHistorySubmission(
+            pending,
+            'tracked-token',
+            pending.pending!,
+            tracked,
+        );
+        assert.equal(recordHistoryLocalEditorChange(
+            inflight,
+            9,
+            [{rangeOffset: 3, rangeLength: 0, text: '!'}],
+            'abL!',
+            {kind: 'plain-write'},
+        ).valid, false);
+    });
+
+    it('advances a metadata-only History revision without inventing an editor change', () => {
+        const base = createHistoryRealtimeEditorBridgeState({
+            socketGeneration: 4,
+            remoteEpoch: 'history-epoch',
+            remoteVersion: 12,
+            remoteSnapshot: {
+                content: 'ab',
+                trackedChanges: [{
+                    range: {pos: 0, length: 1},
+                    tracking: {type: 'insert', userId: 'old', ts: historyTimestamp},
+                }],
+            },
+            documentVersion: 7,
+            editorContent: 'ab',
+        });
+        const transaction = prepareHistoryRemoteEditorTransaction(
+            base,
+            'metadata-only',
+            12,
+            [{textOperation: [{r: 1, tracking: {type: 'none'}}, 1]}],
+        );
+        assert.equal(transaction.expectedChange, undefined);
+        const committed = commitHistoryRemoteEditorTransaction(
+            base,
+            transaction,
+            7,
+            [],
+            'ab',
+        );
+        assert.equal(committed.valid, true);
+        assert.equal(committed.remoteVersion, 13);
+        assert.deepEqual(serializeHistoryOtSnapshot(committed.remoteSnapshot), {content: 'ab'});
+
+        const emptyRevision = prepareHistoryRemoteEditorTransaction(
+            committed,
+            'empty-metadata-revision',
+            13,
+            [],
+        );
+        const emptyCommitted = commitHistoryRemoteEditorTransaction(
+            committed,
+            emptyRevision,
+            7,
+            [],
+            'ab',
+        );
+        assert.equal(emptyCommitted.valid, true);
+        assert.equal(emptyCommitted.remoteVersion, 14);
+    });
+
+    it('rejects History local and remote operations that split a surrogate pair', () => {
+        const base = createHistoryRealtimeEditorBridgeState({
+            socketGeneration: 4,
+            remoteEpoch: 'history-epoch',
+            remoteVersion: 12,
+            remoteSnapshot: {content: 'a😀b'},
+            documentVersion: 7,
+            editorContent: 'a😀b',
+        });
+        assert.equal(recordHistoryLocalEditorChange(
+            base,
+            8,
+            [{rangeOffset: 2, rangeLength: 0, text: 'X'}],
+            'a\uD83DX\uDE00b',
+        ).valid, false);
+        assert.throws(
+            () => prepareHistoryRemoteEditorTransaction(
+                base,
+                'surrogate-split',
+                12,
+                [{textOperation: [2, 'X', 2]}],
+            ),
+            /surrogate|UTF-16/i,
+        );
+    });
+
+    it('treats a sender ACK prediction as non-authoritative until an exact fresh join', () => {
+        const descriptor = {
+            kind: 'tracked-write' as const,
+            tracking: {userId: 'local-user', ts: historyTimestamp},
+        };
+        const base = createHistoryRealtimeEditorBridgeState({
+            socketGeneration: 4,
+            remoteEpoch: 'history-epoch',
+            remoteVersion: 12,
+            remoteSnapshot: {content: 'ab'},
+            documentVersion: 7,
+            editorContent: 'ab',
+        });
+        const dirty = recordHistoryLocalEditorChange(
+            base,
+            8,
+            [{rangeOffset: 1, rangeLength: 0, text: 'L'}],
+            'aLb',
+            descriptor,
+        );
+        const submitted = beginHistorySubmission(
+            dirty,
+            'sender-token',
+            dirty.pending!,
+            descriptor,
+        );
+        const later = recordHistoryLocalEditorChange(
+            submitted,
+            9,
+            [{rangeOffset: 3, rangeLength: 0, text: '!'}],
+            'aLb!',
+            descriptor,
+        );
+        const acknowledged = acknowledgeHistorySubmission(
+            later,
+            'sender-token',
+            12,
+        );
+
+        assert.equal(acknowledged.valid, true);
+        assert.equal(acknowledged.authority, 'rejoin-required');
+        assert.equal(acknowledged.remoteVersion, 12);
+        assert.deepEqual(serializeHistoryOtSnapshot(acknowledged.remoteSnapshot), {content: 'ab'});
+        assert.equal(
+            getVisibleHistoryOtText(acknowledged.senderCommitWitness!.predictedRemoteSnapshot),
+            'aLb',
+        );
+        assert.throws(
+            () => prepareHistoryRemoteEditorTransaction(
+                acknowledged,
+                'blocked-before-join',
+                12,
+                [],
+            ),
+            /no exact remote\/local base/,
+        );
+
+        const reconciled = reconcileHistoryEditorAfterJoin(acknowledged, {
+            socketGeneration: 5,
+            remoteEpoch: 'history-epoch-2',
+            remoteVersion: 13,
+            remoteSnapshot: {
+                trackedChanges: [{
+                    tracking: {
+                        ts: historyTimestamp,
+                        type: 'insert',
+                        userId: 'local-user',
+                    },
+                    range: {length: 1, pos: 1},
+                }],
+                content: 'aLb',
+            },
+            documentVersion: 9,
+            editorContent: 'aLb!',
+        });
+        assert.equal(reconciled.valid, true);
+        assert.equal(reconciled.authority, 'ready');
+        assert.equal(reconciled.remoteVersion, 13);
+        assert.equal(reconciled.socketGeneration, 5);
+        assert.equal(reconciled.senderCommitWitness, undefined);
+        assert.ok(reconciled.pending);
+        assert.equal(
+            getVisibleHistoryOtText(
+                applyHistoryOtOperations(reconciled.remoteSnapshot, reconciled.pending),
+            ),
+            'aLb!',
+        );
     });
 });

@@ -7,15 +7,22 @@ import {
 } from './documentUpdate';
 import {
     applyHistoryOtOperations,
+    composeHistoryOtOperationsWithSnapshot,
+    getVisibleHistoryOtText,
     HistoryOtOperationsInput,
     HistoryOtSnapshotInput,
+    HistoryOtTrackingInput,
     historyOtJsonEqual,
     parseHistoryOtOperations,
+    parseHistoryOtSnapshot,
     ParsedHistoryOtOperations,
     ParsedHistoryOtSnapshot,
     serializeHistoryOtOperations,
+    serializeHistoryOtSnapshot,
     transformHistoryOtOperationsWithSnapshot,
 } from './historyOt';
+import {prepareHistoryOtDocumentUpdate} from './historyOtDocument';
+import {normalizeHistoryOtTimestamp} from './historyOt/protocol';
 
 export type RealtimeEditorBridgeState = {
     socketGeneration: number,
@@ -381,6 +388,551 @@ export function transformHistoryRemoteOperation(
         inflightView,
         pending,
     };
+}
+
+export type HistoryEditorWriteDescriptor =
+    | {readonly kind: 'plain-write'}
+    | {
+        readonly kind: 'tracked-write',
+        readonly tracking: HistoryOtTrackingInput,
+    };
+
+export interface HistorySenderCommitWitness {
+    readonly submissionToken: string,
+    readonly acknowledgedBaseVersion: number,
+    readonly committedVersion: number,
+    readonly predictedRemoteSnapshot: ParsedHistoryOtSnapshot,
+    readonly wire: ParsedHistoryOtOperations,
+    readonly writeDescriptor: HistoryEditorWriteDescriptor,
+}
+
+export interface HistoryRealtimeEditorBridgeState extends HistoryLocalOperationState {
+    readonly socketGeneration: number,
+    readonly remoteEpoch: string,
+    readonly remoteVersion: number,
+    readonly remoteSnapshot: ParsedHistoryOtSnapshot,
+    readonly documentVersion: number,
+    readonly editorContent: string,
+    readonly inflightToken?: string,
+    readonly inflightBaseVersion?: number,
+    readonly inflightWriteDescriptor?: HistoryEditorWriteDescriptor,
+    readonly pendingWriteDescriptor?: HistoryEditorWriteDescriptor,
+    readonly authority: 'ready' | 'rejoin-required',
+    readonly senderCommitWitness?: HistorySenderCommitWitness,
+    readonly valid: boolean,
+}
+
+export interface HistoryRemoteEditorTransaction {
+    readonly token: string,
+    readonly socketGeneration: number,
+    readonly remoteEpoch: string,
+    readonly baseRemoteVersion: number,
+    readonly beforeDocumentVersion: number,
+    readonly beforeEditorContent: string,
+    readonly transformed: HistoryRemoteTransformResult,
+    readonly expectedChange?: ObservedTextChange,
+}
+
+function cloneHistoryOperations(
+    operations: HistoryOtOperationsInput | undefined,
+): ParsedHistoryOtOperations | undefined {
+    return operations === undefined ? undefined : parseHistoryOtOperations(
+        serializeHistoryOtOperations(operations),
+    );
+}
+
+function cloneHistorySnapshot(snapshot: HistoryOtSnapshotInput): ParsedHistoryOtSnapshot {
+    return parseHistoryOtSnapshot(serializeHistoryOtSnapshot(snapshot));
+}
+
+function cloneWriteDescriptor(
+    descriptor: HistoryEditorWriteDescriptor | undefined,
+): HistoryEditorWriteDescriptor | undefined {
+    if (descriptor === undefined || descriptor.kind === 'plain-write') {
+        return descriptor;
+    }
+    return {
+        kind: 'tracked-write',
+        tracking: {...descriptor.tracking},
+    };
+}
+
+function normalizeWriteDescriptor(
+    descriptor: HistoryEditorWriteDescriptor | undefined,
+): HistoryEditorWriteDescriptor {
+    if (descriptor === undefined || descriptor.kind === 'plain-write') {
+        return {kind: 'plain-write'};
+    }
+    const {userId, ts} = descriptor.tracking;
+    if (typeof userId !== 'string' || userId.length === 0 || typeof ts !== 'string') {
+        throw new Error('History OT tracked writes require an exact user and timestamp');
+    }
+    return {
+        kind: 'tracked-write',
+        tracking: {userId, ts: normalizeHistoryOtTimestamp(ts)},
+    };
+}
+
+function sameWriteDescriptor(
+    left: HistoryEditorWriteDescriptor | undefined,
+    right: HistoryEditorWriteDescriptor | undefined,
+): boolean {
+    if (left === undefined || right === undefined) { return left === right; }
+    if (left.kind !== right.kind) { return false; }
+    return left.kind === 'plain-write'
+        || (right.kind === 'tracked-write'
+            && left.tracking.userId === right.tracking.userId
+            && left.tracking.ts === right.tracking.ts);
+}
+
+function cloneSenderCommitWitness(
+    witness: HistorySenderCommitWitness | undefined,
+): HistorySenderCommitWitness | undefined {
+    return witness === undefined ? undefined : {
+        ...witness,
+        predictedRemoteSnapshot: cloneHistorySnapshot(witness.predictedRemoteSnapshot),
+        wire: cloneHistoryOperations(witness.wire)!,
+        writeDescriptor: cloneWriteDescriptor(witness.writeDescriptor)!,
+    };
+}
+
+function cloneHistoryState(
+    state: HistoryRealtimeEditorBridgeState,
+): HistoryRealtimeEditorBridgeState {
+    return {
+        ...state,
+        remoteSnapshot: cloneHistorySnapshot(state.remoteSnapshot),
+        inflightWire: cloneHistoryOperations(state.inflightWire),
+        inflightView: cloneHistoryOperations(state.inflightView),
+        pending: cloneHistoryOperations(state.pending),
+        inflightWriteDescriptor: cloneWriteDescriptor(state.inflightWriteDescriptor),
+        pendingWriteDescriptor: cloneWriteDescriptor(state.pendingWriteDescriptor),
+        senderCommitWitness: cloneSenderCommitWitness(state.senderCommitWitness),
+    };
+}
+
+function historyVisibleSnapshot(
+    state: HistoryRealtimeEditorBridgeState,
+): ParsedHistoryOtSnapshot {
+    if (state.authority === 'rejoin-required') {
+        if (state.senderCommitWitness === undefined) {
+            throw new Error('History OT editor bridge lost its sender commit witness');
+        }
+        return applyHistoryOtOperations(
+            state.senderCommitWitness.predictedRemoteSnapshot,
+            state.pending ?? [],
+        );
+    }
+    return applyHistoryOtOperations(
+        applyHistoryOtOperations(state.remoteSnapshot, state.inflightView ?? []),
+        state.pending ?? [],
+    );
+}
+
+function hasExactHistoryState(state: HistoryRealtimeEditorBridgeState): boolean {
+    const hasInflight = state.inflightWire !== undefined;
+    if (hasInflight !== (state.inflightView !== undefined)
+        || hasInflight !== (state.inflightToken !== undefined)
+        || hasInflight !== (state.inflightBaseVersion !== undefined)
+        || hasInflight !== (state.inflightWriteDescriptor !== undefined)
+        || (state.pending !== undefined) !== (state.pendingWriteDescriptor !== undefined)
+        || (state.authority === 'ready') !== (state.senderCommitWitness === undefined)
+        || (state.authority === 'rejoin-required' && hasInflight)) {
+        return false;
+    }
+    try {
+        const visible = historyVisibleSnapshot(state);
+        return visible.safe
+            && getVisibleHistoryOtText(visible) === state.editorContent
+            && isWellFormedUtf16(state.editorContent);
+    } catch {
+        return false;
+    }
+}
+
+export function createHistoryRealtimeEditorBridgeState(input: {
+    socketGeneration: number,
+    remoteEpoch: string,
+    remoteVersion: number,
+    remoteSnapshot: HistoryOtSnapshotInput,
+    documentVersion: number,
+    editorContent: string,
+}): HistoryRealtimeEditorBridgeState {
+    const remoteSnapshot = cloneHistorySnapshot(input.remoteSnapshot);
+    const visible = getVisibleHistoryOtText(remoteSnapshot);
+    if (!remoteSnapshot.safe
+        || !Number.isSafeInteger(input.socketGeneration)
+        || input.socketGeneration < 0
+        || !input.remoteEpoch
+        || !Number.isSafeInteger(input.remoteVersion)
+        || input.remoteVersion < 0
+        || !Number.isSafeInteger(input.documentVersion)
+        || input.documentVersion < 0
+        || input.editorContent !== visible
+        || !isWellFormedUtf16(visible)) {
+        throw new Error('History OT editor bridge requires one exact UTF-16 base');
+    }
+    return {
+        ...input,
+        remoteSnapshot,
+        authority: 'ready',
+        valid: true,
+    };
+}
+
+export function recordHistoryLocalEditorChange(
+    stateInput: HistoryRealtimeEditorBridgeState,
+    documentVersion: number,
+    changes: readonly ObservedTextChange[],
+    editorContent: string,
+    descriptorInput?: HistoryEditorWriteDescriptor,
+): HistoryRealtimeEditorBridgeState {
+    const state = cloneHistoryState(stateInput);
+    let descriptor: HistoryEditorWriteDescriptor;
+    try {
+        descriptor = normalizeWriteDescriptor(descriptorInput);
+    } catch {
+        return {...state, documentVersion, editorContent, valid: false};
+    }
+    if (!state.valid
+        || state.authority !== 'ready'
+        || !hasExactHistoryState(state)
+        || documentVersion !== state.documentVersion + 1
+        || !isWellFormedUtf16(editorContent)
+        || (state.inflightWriteDescriptor !== undefined
+            && !sameWriteDescriptor(state.inflightWriteDescriptor, descriptor))
+        || (state.pendingWriteDescriptor !== undefined
+            && !sameWriteDescriptor(state.pendingWriteDescriptor, descriptor))) {
+        return {...state, documentVersion, editorContent, valid: false};
+    }
+    const operations = operationsFromObservedTextChanges(
+        state.editorContent,
+        changes,
+        editorContent,
+    );
+    if (!operations || operations.length === 0) {
+        return {...state, documentVersion, editorContent, valid: false};
+    }
+    try {
+        const visibleBefore = historyVisibleSnapshot(state);
+        const prepared = prepareHistoryOtDocumentUpdate(
+            visibleBefore,
+            state.editorContent,
+            editorContent,
+            operations,
+            descriptor.kind === 'tracked-write' ? descriptor.tracking : undefined,
+        );
+        if (!prepared.mergeApplied || prepared.operation === undefined) {
+            return {...state, documentVersion, editorContent, valid: false};
+        }
+        const pendingBase = applyHistoryOtOperations(
+            state.remoteSnapshot,
+            state.inflightView ?? [],
+        );
+        const pending = state.pending === undefined
+            ? cloneHistoryOperations(prepared.operation)!
+            : composeHistoryOtOperationsWithSnapshot(
+                pendingBase,
+                state.pending,
+                prepared.operation,
+            );
+        const expected = applyHistoryOtOperations(visibleBefore, prepared.operation);
+        const actual = applyHistoryOtOperations(pendingBase, pending);
+        if (!historyOtJsonEqual(expected.raw, actual.raw)
+            || getVisibleHistoryOtText(actual) !== editorContent) {
+            return {...state, documentVersion, editorContent, valid: false};
+        }
+        return {
+            ...state,
+            documentVersion,
+            editorContent,
+            pending,
+            pendingWriteDescriptor: cloneWriteDescriptor(descriptor),
+        };
+    } catch {
+        return {...state, documentVersion, editorContent, valid: false};
+    }
+}
+
+export function prepareHistoryRemoteEditorTransaction(
+    stateInput: HistoryRealtimeEditorBridgeState,
+    token: string,
+    remoteVersion: number,
+    remoteOperations: HistoryOtOperationsInput,
+): HistoryRemoteEditorTransaction {
+    const state = cloneHistoryState(stateInput);
+    if (!state.valid
+        || state.authority !== 'ready'
+        || !token
+        || remoteVersion !== state.remoteVersion
+        || !Number.isSafeInteger(remoteVersion + 1)
+        || !hasExactHistoryState(state)) {
+        throw new Error('History OT editor bridge has no exact remote/local base');
+    }
+    const transformed = transformHistoryRemoteOperation(
+        state.remoteSnapshot,
+        remoteOperations,
+        state,
+    );
+    const nextEditorContent = getVisibleHistoryOtText(transformed.visibleSnapshot);
+    if (!historyOtJsonEqual(
+        applyHistoryOtOperations(state.remoteSnapshot, remoteOperations).raw,
+        transformed.serverSnapshot.raw,
+    ) || !historyOtJsonEqual(
+        applyHistoryOtOperations(historyVisibleSnapshot(state), transformed.editorOperations).raw,
+        transformed.visibleSnapshot.raw,
+    ) || !historyOtJsonEqual(
+        serializeHistoryOtOperations(transformed.inflightWire ?? []),
+        serializeHistoryOtOperations(state.inflightWire ?? []),
+    )) {
+        throw new Error('History OT editor transaction failed its exact snapshot witness');
+    }
+    return {
+        token,
+        socketGeneration: state.socketGeneration,
+        remoteEpoch: state.remoteEpoch,
+        baseRemoteVersion: state.remoteVersion,
+        beforeDocumentVersion: state.documentVersion,
+        beforeEditorContent: state.editorContent,
+        transformed,
+        expectedChange: oneReplacement(state.editorContent, nextEditorContent),
+    };
+}
+
+export function commitHistoryRemoteEditorTransaction(
+    stateInput: HistoryRealtimeEditorBridgeState,
+    transaction: HistoryRemoteEditorTransaction,
+    documentVersion: number,
+    changes: readonly ObservedTextChange[],
+    editorContent: string,
+): HistoryRealtimeEditorBridgeState {
+    const state = cloneHistoryState(stateInput);
+    const expectedChanges = transaction.expectedChange ? [transaction.expectedChange] : [];
+    const nextEditorContent = getVisibleHistoryOtText(transaction.transformed.visibleSnapshot);
+    const matches = state.valid
+        && state.authority === 'ready'
+        && hasExactHistoryState(state)
+        && transaction.socketGeneration === state.socketGeneration
+        && transaction.remoteEpoch === state.remoteEpoch
+        && transaction.baseRemoteVersion === state.remoteVersion
+        && transaction.beforeDocumentVersion === state.documentVersion
+        && transaction.beforeEditorContent === state.editorContent
+        && documentVersion === state.documentVersion + (transaction.expectedChange ? 1 : 0)
+        && changes.length === expectedChanges.length
+        && changes.every((change, index) => sameChange(change, expectedChanges[index]))
+        && editorContent === nextEditorContent
+        && historyOtJsonEqual(
+            serializeHistoryOtOperations(transaction.transformed.inflightWire ?? []),
+            serializeHistoryOtOperations(state.inflightWire ?? []),
+        );
+    if (!matches) {
+        return {...state, documentVersion, editorContent, valid: false};
+    }
+    const next: HistoryRealtimeEditorBridgeState = {
+        ...state,
+        remoteVersion: state.remoteVersion + 1,
+        remoteSnapshot: cloneHistorySnapshot(transaction.transformed.serverSnapshot),
+        documentVersion,
+        editorContent,
+        inflightView: cloneHistoryOperations(transaction.transformed.inflightView),
+        pending: cloneHistoryOperations(transaction.transformed.pending),
+    };
+    return hasExactHistoryState(next) ? next : {...next, valid: false};
+}
+
+export function beginHistorySubmission(
+    stateInput: HistoryRealtimeEditorBridgeState,
+    submissionToken: string,
+    wireInput: HistoryOtOperationsInput,
+    descriptorInput?: HistoryEditorWriteDescriptor,
+): HistoryRealtimeEditorBridgeState {
+    const state = cloneHistoryState(stateInput);
+    const descriptor = normalizeWriteDescriptor(descriptorInput);
+    const wire = cloneHistoryOperations(wireInput)!;
+    const wireRaw = serializeHistoryOtOperations(wire);
+    if (!state.valid
+        || state.authority !== 'ready'
+        || !hasExactHistoryState(state)
+        || state.inflightWire !== undefined
+        || !submissionToken
+        || state.pending === undefined
+        || !sameWriteDescriptor(state.pendingWriteDescriptor, descriptor)
+        || !Array.isArray(wireRaw)
+        || wireRaw.length !== 1
+        || !historyOtJsonEqual(wireRaw, serializeHistoryOtOperations(state.pending))) {
+        throw new Error('History OT editor bridge cannot bind this exact submission');
+    }
+    return {
+        ...state,
+        inflightWire: cloneHistoryOperations(wire),
+        inflightView: cloneHistoryOperations(wire),
+        inflightToken: submissionToken,
+        inflightBaseVersion: state.remoteVersion,
+        inflightWriteDescriptor: cloneWriteDescriptor(descriptor),
+        pending: undefined,
+        pendingWriteDescriptor: undefined,
+    };
+}
+
+/** Restore a definitely-unsent rebased operation ahead of later local input. */
+export function rejectHistorySubmission(
+    stateInput: HistoryRealtimeEditorBridgeState,
+    submissionToken: string,
+): HistoryRealtimeEditorBridgeState {
+    const state = cloneHistoryState(stateInput);
+    if (!state.valid
+        || state.authority !== 'ready'
+        || !hasExactHistoryState(state)
+        || state.inflightWire === undefined
+        || state.inflightView === undefined
+        || state.inflightToken !== submissionToken
+        || state.inflightWriteDescriptor === undefined
+        || (state.pendingWriteDescriptor !== undefined
+            && !sameWriteDescriptor(
+                state.inflightWriteDescriptor,
+                state.pendingWriteDescriptor,
+            ))) {
+        return {...state, valid: false};
+    }
+    try {
+        const pending = state.pending === undefined
+            ? cloneHistoryOperations(state.inflightView)!
+            : composeHistoryOtOperationsWithSnapshot(
+                state.remoteSnapshot,
+                state.inflightView,
+                state.pending,
+            );
+        const expected = historyVisibleSnapshot(state);
+        const actual = applyHistoryOtOperations(state.remoteSnapshot, pending);
+        if (!historyOtJsonEqual(expected.raw, actual.raw)
+            || getVisibleHistoryOtText(actual) !== state.editorContent) {
+            return {...state, valid: false};
+        }
+        return {
+            ...state,
+            inflightWire: undefined,
+            inflightView: undefined,
+            inflightToken: undefined,
+            inflightBaseVersion: undefined,
+            inflightWriteDescriptor: undefined,
+            pending,
+            pendingWriteDescriptor: cloneWriteDescriptor(state.inflightWriteDescriptor),
+        };
+    } catch {
+        return {...state, valid: false};
+    }
+}
+
+/**
+ * Record a sender ACK only as a prediction witness. The old remote snapshot is
+ * deliberately retained and all further edits remain blocked until a fresh
+ * authoritative join exactly confirms the prediction.
+ */
+export function acknowledgeHistorySubmission(
+    stateInput: HistoryRealtimeEditorBridgeState,
+    submissionToken: string,
+    acknowledgedBaseVersion: number,
+): HistoryRealtimeEditorBridgeState {
+    const state = cloneHistoryState(stateInput);
+    if (!state.valid
+        || state.authority !== 'ready'
+        || !hasExactHistoryState(state)
+        || state.inflightWire === undefined
+        || state.inflightView === undefined
+        || state.inflightToken !== submissionToken
+        || state.inflightBaseVersion === undefined
+        || state.inflightWriteDescriptor === undefined
+        || acknowledgedBaseVersion !== state.remoteVersion
+        || !Number.isSafeInteger(acknowledgedBaseVersion + 1)) {
+        return {...state, valid: false};
+    }
+    try {
+        const predictedRemoteSnapshot = applyHistoryOtOperations(
+            state.remoteSnapshot,
+            state.inflightView,
+        );
+        const visible = applyHistoryOtOperations(
+            predictedRemoteSnapshot,
+            state.pending ?? [],
+        );
+        if (!historyOtJsonEqual(visible.raw, historyVisibleSnapshot(state).raw)
+            || getVisibleHistoryOtText(visible) !== state.editorContent) {
+            return {...state, valid: false};
+        }
+        const senderCommitWitness: HistorySenderCommitWitness = {
+            submissionToken,
+            acknowledgedBaseVersion,
+            committedVersion: acknowledgedBaseVersion + 1,
+            predictedRemoteSnapshot: cloneHistorySnapshot(predictedRemoteSnapshot),
+            wire: cloneHistoryOperations(state.inflightWire)!,
+            writeDescriptor: cloneWriteDescriptor(state.inflightWriteDescriptor)!,
+        };
+        return {
+            ...state,
+            inflightWire: undefined,
+            inflightView: undefined,
+            inflightToken: undefined,
+            inflightBaseVersion: undefined,
+            inflightWriteDescriptor: undefined,
+            authority: 'rejoin-required',
+            senderCommitWitness,
+        };
+    } catch {
+        return {...state, valid: false};
+    }
+}
+
+export function reconcileHistoryEditorAfterJoin(
+    stateInput: HistoryRealtimeEditorBridgeState,
+    input: {
+        socketGeneration: number,
+        remoteEpoch: string,
+        remoteVersion: number,
+        remoteSnapshot: HistoryOtSnapshotInput,
+        documentVersion: number,
+        editorContent: string,
+    },
+): HistoryRealtimeEditorBridgeState {
+    const state = cloneHistoryState(stateInput);
+    const remoteSnapshot = cloneHistorySnapshot(input.remoteSnapshot);
+    const witness = state.senderCommitWitness;
+    if (!state.valid
+        || state.authority !== 'rejoin-required'
+        || witness === undefined
+        || !hasExactHistoryState(state)
+        || !remoteSnapshot.safe
+        || !Number.isSafeInteger(input.socketGeneration)
+        || input.socketGeneration < 0
+        || !input.remoteEpoch
+        || input.remoteVersion !== witness.committedVersion
+        || !Number.isSafeInteger(input.documentVersion)
+        || input.documentVersion < 0
+        || input.documentVersion !== state.documentVersion
+        || input.editorContent !== state.editorContent
+        || !historyOtJsonEqual(remoteSnapshot.raw, witness.predictedRemoteSnapshot.raw)) {
+        return {...state, valid: false};
+    }
+    try {
+        const visible = applyHistoryOtOperations(remoteSnapshot, state.pending ?? []);
+        if (!historyOtJsonEqual(visible.raw, historyVisibleSnapshot(state).raw)
+            || getVisibleHistoryOtText(visible) !== input.editorContent) {
+            return {...state, valid: false};
+        }
+        const next: HistoryRealtimeEditorBridgeState = {
+            ...state,
+            socketGeneration: input.socketGeneration,
+            remoteEpoch: input.remoteEpoch,
+            remoteVersion: input.remoteVersion,
+            remoteSnapshot,
+            documentVersion: input.documentVersion,
+            editorContent: input.editorContent,
+            authority: 'ready',
+            senderCommitWitness: undefined,
+        };
+        return hasExactHistoryState(next) ? next : {...next, valid: false};
+    } catch {
+        return {...state, valid: false};
+    }
 }
 
 /** Freeze exactly what is about to be sent while retaining a separate rebasable view. */
