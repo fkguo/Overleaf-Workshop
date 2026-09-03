@@ -600,8 +600,59 @@ describe('stale-buffer rollback safety', () => {
         harness.dispose();
     });
 
+    it('changes the provider etag and tolerates clean intermediate events for an equal-size refresh', async () => {
+        const base = 'alpha omega';
+        const remote = 'ALPHA omega';
+        const desired = 'ALPHA LOCAL omega';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Equal Size Clean Refresh', 4);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'equal-size-clean-refresh',
+            projectId: PROJECT_A,
+        });
+
+        assert.equal(new TextDecoder().decode(await harness.provider.readFile(harness.uri)), base);
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.openClean(harness.events);
+        await settleAsyncWork();
+        await settleAsyncWork();
+        const beforeStat = await harness.provider.stat(harness.uri);
+
+        server.collaboratorUpdate(PROJECT_A, replaceAt(base, 'alpha', 'ALPHA'));
+        await settleAsyncWork();
+        const afterStat = await harness.provider.stat(harness.uri);
+        assert.equal(beforeStat.size, Buffer.byteLength(base, 'utf8'));
+        assert.equal(afterStat.size, beforeStat.size);
+        assert.ok(afterStat.mtime > beforeStat.mtime);
+        assert.equal(new TextDecoder().decode(await harness.provider.readFile(harness.uri)), remote);
+
+        // VS Code may report clean, empty/non-content model events before the
+        // FileSystemProvider reload reaches its final text.
+        editor.version += 1;
+        harness.events.fireDidChange(editor.document, []);
+        await settleAsyncWork();
+        assert.equal(editor.dirty, false);
+        assert.equal(editor.document.getText(), base);
+
+        editor.refreshThroughEvents(remote, harness.events, true);
+        await settleAsyncWork();
+        assert.equal(editor.dirty, false);
+        assert.equal(harness.events.warningMessages.length, 0);
+
+        editor.editThroughEvents(desired, harness.events);
+        const result = await editor.saveThroughProvider(harness.provider, harness.events);
+        assert.equal(result.saved, true);
+        assert.equal(server.capturedUpdates.length, 1);
+        assert.equal(server.capturedUpdates[0].update.v, 5);
+        assert.equal(server.text(PROJECT_A), desired);
+        harness.dispose();
+    });
+
     it('coalesces consecutive clean collaborator revisions into one witnessed provider refresh', async () => {
         const base = 'alpha omega';
+        const firstRemote = 'REMOTE alpha omega';
         const remote = 'REMOTE alpha OMEGA';
         const desired = `${remote}!`;
         const server = new DeterministicRealtimeServer();
@@ -620,11 +671,23 @@ describe('stale-buffer rollback safety', () => {
         await settleAsyncWork();
 
         server.collaboratorUpdate(PROJECT_A, [{p: 0, i: 'REMOTE '}]);
-        server.collaboratorUpdate(PROJECT_A, replaceAt('REMOTE alpha omega', 'omega', 'OMEGA'));
+        await settleAsyncWork();
+        assert.equal(
+            new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
+            firstRemote,
+        );
+        server.collaboratorUpdate(PROJECT_A, replaceAt(firstRemote, 'omega', 'OMEGA'));
         await settleAsyncWork();
         await settleAsyncWork();
         assert.equal(editor.dirty, false);
         assert.equal(editor.document.getText(), base);
+
+        // A running host reload may finish on the earlier target after a newer
+        // provider notification has already been queued. It remains a clean,
+        // known intermediate state rather than a commit witness for the latest.
+        editor.refreshThroughEvents(firstRemote, harness.events, true);
+        await settleAsyncWork();
+        assert.equal(editor.dirty, false);
         assert.equal(new TextDecoder().decode(await harness.provider.readFile(harness.uri)), remote);
 
         editor.refreshThroughEvents(remote, harness.events, true);
