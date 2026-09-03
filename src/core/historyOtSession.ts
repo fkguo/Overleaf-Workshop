@@ -1,4 +1,5 @@
 /* eslint-disable @typescript-eslint/naming-convention */
+import {randomUUID} from 'crypto';
 import {
     applyHistoryOtOperations,
     buildAcceptTrackedChangesOperation,
@@ -391,6 +392,7 @@ export interface HistoryOtSessionView {
     readonly ranges?: JsonObject,
     readonly hasPendingOperation: boolean,
     readonly pendingBaseVersion?: number,
+    readonly pendingWireAttempted: boolean,
     readonly pendingQueued: boolean,
     readonly pendingRecoveryBlockedReason?: string,
     readonly rejoinReason?: string,
@@ -399,7 +401,9 @@ export interface HistoryOtSessionView {
 export type HistoryOtSessionResultKind =
     | 'joined'
     | 'staged'
+    | 'wire-attempted'
     | 'queue-accepted'
+    | 'staged-cancelled'
     | 'recovery-staged'
     | 'sender-commit'
     | 'collaborator-applied'
@@ -417,6 +421,7 @@ export interface HistoryOtSessionResult {
     readonly requiresRejoin: boolean,
     readonly reason?: string,
     readonly envelope?: JsonValue,
+    readonly submissionToken?: string,
     readonly state: HistoryOtSessionView,
 }
 
@@ -427,7 +432,10 @@ interface PendingUpdate {
     baseVersion: number,
     intent: HistoryOtWriteIntent,
     publicIds: string[],
+    wireAttempted: boolean,
     queued: boolean,
+    submissionToken?: string,
+    recoveryAttempt: boolean,
     recoveryJoinVersion?: number,
     recoveryBlockedReason?: string,
 }
@@ -541,6 +549,11 @@ export class HistoryOtSession {
     private pending?: PendingUpdate;
     private rejoinReason?: string;
     private lastCommittedBaseVersion?: number;
+    private lastCommittedSubmissionToken?: string;
+    private joinAnchorVersion?: number;
+    private readonly appliedUpdateWitnesses = new Map<number, JsonValue>();
+    private readonly sessionNonce = randomUUID();
+    private submissionSequence = 0;
 
     constructor(
         readonly docId: string,
@@ -574,6 +587,7 @@ export class HistoryOtSession {
                 : undefined,
             hasPendingOperation: this.pending !== undefined,
             pendingBaseVersion: this.pending?.baseVersion,
+            pendingWireAttempted: this.pending?.wireAttempted ?? false,
             pendingQueued: this.pending?.queued ?? false,
             pendingRecoveryBlockedReason: this.pending?.recoveryBlockedReason,
             rejoinReason: this.rejoinReason,
@@ -585,15 +599,22 @@ export class HistoryOtSession {
         applied = false,
         envelope?: JsonValue,
         reason?: string,
+        submissionToken?: string,
     ): HistoryOtSessionResult {
         return {
             kind,
             applied,
             requiresRejoin: this.phase === 'rejoin-required',
             envelope: envelope === undefined ? undefined : deepCloneJson(envelope),
+            submissionToken,
             reason,
             state: this.getState(),
         };
+    }
+
+    private nextSubmissionToken(): string {
+        this.submissionSequence += 1;
+        return `history-ot:${this.sessionNonce}:${this.generation}:${this.submissionSequence}`;
     }
 
     private requireRejoin(reason: string): HistoryOtSessionResult {
@@ -670,9 +691,14 @@ export class HistoryOtSession {
         if (this.permission === undefined) {
             return this.requireRejoin('permission-uncertain');
         }
+        if (this.pending !== undefined && join.version < this.pending.baseVersion) {
+            return this.requireRejoin('recovery-join-predates-pending-base');
+        }
         this.version = join.version;
         this.snapshot = join.snapshot;
         this.ranges = join.ranges;
+        this.joinAnchorVersion = join.version;
+        this.appliedUpdateWitnesses.clear();
         if (this.pending === undefined) {
             this.phase = 'ready';
             this.rejoinReason = undefined;
@@ -821,6 +847,7 @@ export class HistoryOtSession {
         const parsedEnvelope = parseHistoryOtRealtimeEnvelope(envelope);
         assertHistoryOtRealtimeEnvelopeSafe(parsedEnvelope);
         const raw = serializeHistoryOtRealtimeEnvelope(parsedEnvelope) as JsonObject;
+        const submissionToken = this.nextSubmissionToken();
         this.pending = {
             originalEnvelope: cloneObject(raw),
             originalOperation: deepCloneJson(operationRaw),
@@ -828,22 +855,108 @@ export class HistoryOtSession {
             baseVersion: this.version,
             intent,
             publicIds: [request.publicId],
+            wireAttempted: false,
             queued: false,
+            submissionToken,
+            recoveryAttempt: false,
         };
         this.phase = 'pending';
-        return this.result('staged', false, raw);
+        return this.result('staged', false, raw, undefined, submissionToken);
     }
 
-    markQueueAccepted(eventGeneration: number): HistoryOtSessionResult {
+    /** Mark the exact synchronous transition after final authorization and before emit. */
+    markWireAttempted(
+        eventGeneration: number,
+        submissionToken: string,
+    ): HistoryOtSessionResult {
         const generationResult = this.checkGeneration(eventGeneration);
         if (generationResult !== undefined) {
             return generationResult;
         }
-        if (this.pending === undefined || this.phase !== 'pending') {
+        if (this.phase !== 'pending' || this.pending === undefined
+            || this.pending.submissionToken !== submissionToken) {
+            throw new HistoryOtSessionError(
+                'NO_PENDING_OPERATION',
+                'No exact pending History OT operation can cross the wire boundary',
+            );
+        }
+        if (this.pending.wireAttempted) {
+            throw new HistoryOtSessionError(
+                'SUBMISSION_ALREADY_ATTEMPTED',
+                'The exact History OT submission token has already crossed the wire boundary',
+            );
+        }
+        this.pending.wireAttempted = true;
+        return this.result('wire-attempted');
+    }
+
+    markQueueAccepted(
+        eventGeneration: number,
+        submissionToken: string,
+    ): HistoryOtSessionResult {
+        const generationResult = this.checkGeneration(eventGeneration);
+        if (generationResult !== undefined) {
+            return generationResult;
+        }
+        if (this.pending === undefined) {
+            if (this.lastCommittedSubmissionToken === submissionToken) {
+                return this.result('queue-accepted', false, undefined, 'commit-witness-arrived-first');
+            }
+            throw new HistoryOtSessionError('NO_PENDING_OPERATION', 'No pending operation can be queued');
+        }
+        if (this.pending.submissionToken !== submissionToken
+            || !this.pending.wireAttempted) {
             throw new HistoryOtSessionError('NO_PENDING_OPERATION', 'No pending operation can be queued');
         }
         this.pending.queued = true;
         return this.result('queue-accepted');
+    }
+
+    /**
+     * Cancel only the exact staged attempt after a deterministic zero-wire
+     * rejection. A recovery retry is peeled off without deleting the durable
+     * outcome-unknown operation it was attempting to recover.
+     */
+    cancelStagedSubmission(
+        eventGeneration: number,
+        submissionToken: string,
+    ): HistoryOtSessionResult {
+        const generationResult = this.checkGeneration(eventGeneration);
+        if (generationResult !== undefined) {
+            return generationResult;
+        }
+        if (this.pending === undefined
+            || this.pending.submissionToken !== submissionToken) {
+            throw new HistoryOtSessionError(
+                'STAGED_SUBMISSION_MISMATCH',
+                'Cancellation token does not match the exact staged History OT submission',
+            );
+        }
+        if (this.pending.wireAttempted) {
+            throw new HistoryOtSessionError(
+                'SUBMISSION_OUTCOME_UNKNOWN',
+                'A History OT submission that may have crossed the wire cannot be cancelled deterministically',
+            );
+        }
+        if (this.pending.recoveryAttempt) {
+            this.pending.publicIds.pop();
+            this.pending.authorizedEnvelope = cloneObject(this.pending.originalEnvelope);
+            this.pending.submissionToken = undefined;
+            this.pending.recoveryAttempt = false;
+            this.pending.wireAttempted = false;
+            if (this.pending.recoveryBlockedReason === undefined
+                && this.phase !== 'rejoin-required') {
+                this.phase = 'recovery-ready';
+                this.rejoinReason = undefined;
+            }
+        } else {
+            this.pending = undefined;
+            if (this.phase !== 'rejoin-required') {
+                this.phase = 'ready';
+                this.rejoinReason = undefined;
+            }
+        }
+        return this.result('staged-cancelled');
     }
 
     reconnect(nextGeneration: number): HistoryOtSessionResult {
@@ -855,9 +968,14 @@ export class HistoryOtSession {
         this.version = undefined;
         this.snapshot = undefined;
         this.ranges = undefined;
+        this.joinAnchorVersion = undefined;
+        this.appliedUpdateWitnesses.clear();
         this.rejoinReason = undefined;
         if (this.pending !== undefined) {
             this.pending.queued = false;
+            this.pending.submissionToken = undefined;
+            this.pending.recoveryAttempt = false;
+            this.pending.wireAttempted = false;
             this.pending.recoveryJoinVersion = undefined;
         }
         return this.result('reconnect-started', false, undefined, 'reconnect-join-required');
@@ -894,11 +1012,15 @@ export class HistoryOtSession {
         recovery.meta = meta;
         const parsed = parseHistoryOtRealtimeEnvelope(recovery);
         assertHistoryOtRealtimeEnvelopeSafe(parsed);
+        const submissionToken = this.nextSubmissionToken();
         this.pending.authorizedEnvelope = deepCloneJson(recovery);
         this.pending.publicIds.push(publicId);
+        this.pending.wireAttempted = false;
         this.pending.queued = false;
+        this.pending.submissionToken = submissionToken;
+        this.pending.recoveryAttempt = true;
         this.phase = 'pending';
-        return this.result('recovery-staged', false, recovery);
+        return this.result('recovery-staged', false, recovery, undefined, submissionToken);
     }
 
     /**
@@ -907,6 +1029,7 @@ export class HistoryOtSession {
      */
     assertPendingSubmission(
         eventGeneration: number,
+        submissionToken: string,
         envelope: unknown,
         intent: HistoryOtWriteIntent,
     ): JsonValue {
@@ -917,7 +1040,8 @@ export class HistoryOtSession {
                 generationResult.reason ?? 'History OT submission belongs to a stale generation',
             );
         }
-        if (this.phase !== 'pending' || this.pending === undefined) {
+        if (this.phase !== 'pending' || this.pending === undefined
+            || this.pending.submissionToken !== submissionToken) {
             throw new HistoryOtSessionError(
                 'NO_AUTHORIZED_SUBMISSION',
                 'History OT transport submission requires one staged pending operation',
@@ -951,31 +1075,27 @@ export class HistoryOtSession {
         if (update.doc !== this.docId) {
             return this.requireRejoin('wrong-document');
         }
-        if (this.permission === undefined) {
-            return this.requireRejoin('permission-uncertain');
-        }
         if (update.classification === 'sender-ack') {
             return this.receiveSenderAck(update.version);
+        }
+        if (this.permission === undefined) {
+            return this.requireRejoin('permission-uncertain');
         }
         if (update.operation === undefined) {
             return this.requireRejoin('missing-operation');
         }
         const operationRaw = serializeHistoryOtWireOperation(update.operation);
-        if (update.duplicate) {
-            return this.receiveDuplicateAcknowledgement(update, operationRaw);
-        }
-        if (this.pending !== undefined
-            && typeof update.source === 'string'
-            && this.pending.publicIds.includes(update.source)
-            && jsonEqual(operationRaw, this.pending.originalOperation)) {
-            if (update.version !== this.pending.baseVersion) {
-                return this.requireRejoin('sender-full-update-version-mismatch');
+        if (this.pending !== undefined) {
+            const knownSource = typeof update.source === 'string'
+                && this.pending.publicIds.includes(update.source);
+            if (knownSource) {
+                return this.requireRejoin('unexpected-sender-full-update');
             }
-            this.lastCommittedBaseVersion = update.version;
-            this.pending = undefined;
-            return this.senderCommitted('sender-full-update-committed');
         }
-        return this.receiveCollaboratorUpdate(update.version, operationRaw);
+        if (update.duplicate) {
+            return this.requireRejoin('unexpected-duplicate-full-update');
+        }
+        return this.receiveCollaboratorUpdate(update.version, operationRaw, update.raw);
     }
 
     private receiveSenderAck(version: number): HistoryOtSessionResult {
@@ -988,55 +1108,41 @@ export class HistoryOtSession {
             }
             return this.requireRejoin('unexpected-sender-ack');
         }
+        if (!this.pending.wireAttempted) {
+            return this.requireRejoin('sender-ack-without-wire-attempt');
+        }
         if (version < this.pending.baseVersion) {
             return this.result('late-ack-ignored', false, undefined, 'old-sender-ack');
         }
         if (version !== this.pending.baseVersion) {
-            return this.requireRejoin('sender-ack-version-gap');
+            return this.requireRejoin('sender-ack-version-mismatch');
         }
+        // The pinned real-time server emits only {doc, v} to the socket whose
+        // current public id matches meta.source. The provider has already bound
+        // this event to the current socket generation, and this session permits
+        // exactly one pending submission, so the version-only event is the
+        // authoritative sender commit witness for that exact pending envelope.
         this.lastCommittedBaseVersion = version;
+        this.lastCommittedSubmissionToken = this.pending.submissionToken;
         this.pending = undefined;
         return this.senderCommitted('sender-commit-needs-authoritative-join');
     }
 
-    private receiveDuplicateAcknowledgement(
-        update: ParsedHistoryOtRealtimeEnvelope,
+    private receiveCollaboratorUpdate(
+        version: number,
         operationRaw: JsonValue,
+        rawUpdate: JsonValue,
     ): HistoryOtSessionResult {
-        if (this.pending === undefined
-            || !jsonEqual(operationRaw, this.pending.originalOperation)) {
-            if (this.version !== undefined && (update.version as number) < this.version) {
-                return this.result('duplicate-ignored');
-            }
-            return this.requireRejoin('unmatched-duplicate-acknowledgement');
-        }
-        if (update.version !== this.pending.baseVersion) {
-            return this.requireRejoin('duplicate-acknowledgement-version-mismatch');
-        }
-        const sourceMatches = typeof update.source === 'string'
-            && this.pending.publicIds.includes(update.source);
-        const dedupeMatches = update.dupIfSource.some(source => this.pending?.publicIds.includes(source));
-        if (!sourceMatches && !dedupeMatches) {
-            return this.requireRejoin('duplicate-source-mismatch');
-        }
-        const recoveryJoinVersion = this.pending.recoveryJoinVersion;
-        const baseVersion = this.pending.baseVersion;
-        this.lastCommittedBaseVersion = baseVersion;
-        this.pending = undefined;
-        if (recoveryJoinVersion !== undefined && this.snapshot !== undefined && this.version === recoveryJoinVersion
-            && recoveryJoinVersion > baseVersion) {
-            this.phase = 'ready';
-            this.rejoinReason = undefined;
-            return this.result('duplicate-acknowledged');
-        }
-        return this.requireRejoin('duplicate-confirmed-before-authoritative-join');
-    }
-
-    private receiveCollaboratorUpdate(version: number, operationRaw: JsonValue): HistoryOtSessionResult {
         if (this.version === undefined || this.snapshot === undefined) {
             return this.requireRejoin('update-without-authoritative-join');
         }
         if (version < this.version) {
+            if (this.joinAnchorVersion !== undefined && version >= this.joinAnchorVersion) {
+                const witnessed = this.appliedUpdateWitnesses.get(version);
+                if (witnessed === undefined || !jsonEqual(witnessed, rawUpdate)) {
+                    return this.requireRejoin('conflicting-duplicate-collaborator-update');
+                }
+            }
             return this.result('duplicate-ignored');
         }
         if (version > this.version) {
@@ -1051,17 +1157,8 @@ export class HistoryOtSession {
             const message = error instanceof Error ? error.message : String(error);
             return this.requireRejoin(`collaborator-operation-failed: ${message}`);
         }
+        this.appliedUpdateWitnesses.set(version, deepCloneJson(rawUpdate));
         this.version += 1;
-        if (this.pending !== undefined) {
-            this.phase = 'rejoin-required';
-            this.rejoinReason = 'collaborator-update-while-local-operation-pending';
-            return this.result(
-                'collaborator-applied',
-                true,
-                undefined,
-                'collaborator-update-while-local-operation-pending',
-            );
-        }
         return this.result('collaborator-applied', true);
     }
 }

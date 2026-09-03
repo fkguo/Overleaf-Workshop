@@ -1465,6 +1465,7 @@ export class SocketIOAPI {
         docId: string,
         update: JsonValue,
         intent: HistoryOtWriteIntent,
+        submissionToken: string,
         session: HistoryOtSession,
         expectedSender: ProjectSenderWitness,
     ): Promise<void> {
@@ -1521,6 +1522,7 @@ export class SocketIOAPI {
         try {
             authorizedUpdate = session.assertPendingSubmission(
                 expectedSender.generation,
+                submissionToken,
                 update,
                 intent,
             );
@@ -1556,8 +1558,13 @@ export class SocketIOAPI {
                 try {
                     session.assertPendingSubmission(
                         expectedSender.generation,
+                        submissionToken,
                         authorizedUpdate,
                         intent,
+                    );
+                    session.markWireAttempted(
+                        expectedSender.generation,
+                        submissionToken,
                     );
                 } catch (error) {
                     throw new SocketRequestError(

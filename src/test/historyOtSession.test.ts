@@ -312,7 +312,7 @@ describe('History OT realtime envelope protocol', () => {
 });
 
 describe('HistoryOtSession ordering and recovery', () => {
-    it('does not treat queue acceptance as commit and rejoins after otUpdateApplied', () => {
+    it('does not treat queue acceptance as commit and accepts the official version-only sender ACK', () => {
         const session = readySession();
         const staged = session.stage(1, {
             operation: [{textOperation: [1, 'X', 2]}],
@@ -322,8 +322,11 @@ describe('HistoryOtSession ordering and recovery', () => {
         assert.equal(staged.kind, 'staged');
         assert.equal(staged.state.version, 5);
         assert.ok(staged.envelope);
+        const submissionToken = staged.submissionToken;
+        assert.ok(submissionToken);
         const authorized = session.assertPendingSubmission(
             1,
+            submissionToken,
             staged.envelope,
             {kind: 'plain-write'},
         );
@@ -331,7 +334,7 @@ describe('HistoryOtSession ordering and recovery', () => {
         (staged.envelope as any).v = 99;
         assert.equal((authorized as any).v, 5);
         assert.throws(
-            () => session.assertPendingSubmission(1, {
+            () => session.assertPendingSubmission(1, submissionToken, {
                 ...(staged.envelope as object),
                 v: 6,
             }, {kind: 'plain-write'}),
@@ -339,7 +342,10 @@ describe('HistoryOtSession ordering and recovery', () => {
                 && error.code === 'UNAUTHORIZED_SUBMISSION',
         );
 
-        const queued = session.markQueueAccepted(1);
+        const attempted = session.markWireAttempted(1, submissionToken);
+        assert.equal(attempted.kind, 'wire-attempted');
+        assert.equal(attempted.state.pendingWireAttempted, true);
+        const queued = session.markQueueAccepted(1, submissionToken);
         assert.equal(queued.kind, 'queue-accepted');
         assert.equal(queued.state.hasPendingOperation, true);
         assert.equal(queued.state.pendingQueued, true);
@@ -348,15 +354,57 @@ describe('HistoryOtSession ordering and recovery', () => {
         const committed = session.receiveApplied(1, {doc: 'doc-a', v: 5});
         assert.equal(committed.kind, 'sender-commit');
         assert.equal(committed.requiresRejoin, true);
+        assert.equal(committed.reason, 'sender-commit-needs-authoritative-join');
         assert.equal(committed.state.hasPendingOperation, false);
         assert.equal(committed.state.snapshot, undefined);
 
         const duplicateAck = session.receiveApplied(1, {doc: 'doc-a', v: 5});
         assert.equal(duplicateAck.kind, 'late-ack-ignored');
-        assert.equal(duplicateAck.applied, false);
     });
 
-    it('does not commit a matching self full-update witness at the wrong base version', () => {
+    it('keeps the immutable stage across collaborator updates and accepts its original-base ACK', () => {
+        const session = readySession();
+        const localOperation = [{textOperation: [3, 'L']}];
+        const staged = session.stage(1, {
+            operation: localOperation,
+            meta: {ts: {opaque: 'original-client-time'}},
+            intent: {kind: 'plain-write'},
+            publicId: 'source-one',
+        });
+        assert.ok(staged.envelope);
+        const submissionToken = staged.submissionToken;
+        assert.ok(submissionToken);
+        session.markWireAttempted(1, submissionToken);
+        const originalEnvelope = JSON.parse(JSON.stringify(staged.envelope));
+
+        const collaborator = session.receiveApplied(1, fullUpdate(5, [
+            {textOperation: [1, 'R', 2]},
+        ], 'remote-source'));
+        assert.equal(collaborator.kind, 'collaborator-applied');
+        assert.equal(collaborator.requiresRejoin, false);
+        assert.equal(collaborator.state.phase, 'pending');
+        assert.equal(collaborator.state.version, 6);
+        assert.equal((collaborator.state.snapshot as any).content, 'aRbc');
+        assert.deepEqual(
+            session.assertPendingSubmission(
+                1,
+                submissionToken,
+                originalEnvelope,
+                {kind: 'plain-write'},
+            ),
+            originalEnvelope,
+        );
+        assert.deepEqual(staged.envelope, originalEnvelope);
+
+        const committed = session.receiveApplied(1, {doc: 'doc-a', v: 5});
+        assert.equal(committed.kind, 'sender-commit');
+        assert.equal(committed.requiresRejoin, true);
+        assert.equal(committed.reason, 'sender-commit-needs-authoritative-join');
+        assert.equal(committed.state.hasPendingOperation, false);
+        assert.equal(committed.state.snapshot, undefined);
+    });
+
+    it('rejects a full update carrying the pending local source', () => {
         const session = readySession();
         const operation = [{textOperation: [1, 'X', 2]}];
         session.stage(1, {
@@ -368,12 +416,12 @@ describe('HistoryOtSession ordering and recovery', () => {
         const mismatch = session.receiveApplied(1, fullUpdate(6, operation, 'source-one'));
         assert.equal(mismatch.kind, 'rejoin-required');
         assert.equal(mismatch.requiresRejoin, true);
-        assert.equal(mismatch.reason, 'sender-full-update-version-mismatch');
+        assert.equal(mismatch.reason, 'unexpected-sender-full-update');
         assert.equal(mismatch.state.hasPendingOperation, true);
         assert.equal(mismatch.state.pendingBaseVersion, 5);
     });
 
-    it('does not commit a duplicate full-update witness at the wrong base version', () => {
+    it('rejects a duplicate full update because the server suppresses it for collaborators', () => {
         const session = readySession();
         const staged = session.stage(1, {
             operation: [{textOperation: [1, 'X', 2]}],
@@ -389,9 +437,209 @@ describe('HistoryOtSession ordering and recovery', () => {
         });
         assert.equal(mismatch.kind, 'rejoin-required');
         assert.equal(mismatch.requiresRejoin, true);
-        assert.equal(mismatch.reason, 'duplicate-acknowledgement-version-mismatch');
+        assert.equal(mismatch.reason, 'unexpected-sender-full-update');
         assert.equal(mismatch.state.hasPendingOperation, true);
         assert.equal(mismatch.state.pendingBaseVersion, 5);
+    });
+
+    it('cancels only the exact unqueued staged token', () => {
+        const mismatchSession = readySession();
+        const mismatchStage = mismatchSession.stage(1, {
+            operation: [{textOperation: [1, 'X', 2]}],
+            intent: {kind: 'plain-write'},
+            publicId: 'source-one',
+        });
+        assert.ok(mismatchStage.submissionToken);
+        assert.throws(
+            () => mismatchSession.cancelStagedSubmission(1, `${mismatchStage.submissionToken}-other`),
+            (error: unknown) => error instanceof HistoryOtSessionError
+                && error.code === 'STAGED_SUBMISSION_MISMATCH',
+        );
+        assert.equal(mismatchSession.getState().hasPendingOperation, true);
+
+        const cancelled = mismatchSession.cancelStagedSubmission(
+            1,
+            mismatchStage.submissionToken,
+        );
+        assert.equal(cancelled.kind, 'staged-cancelled');
+        assert.equal(cancelled.state.phase, 'ready');
+        assert.equal(cancelled.state.hasPendingOperation, false);
+
+        const queuedSession = readySession();
+        const queuedStage = queuedSession.stage(1, {
+            operation: [{textOperation: [1, 'X', 2]}],
+            intent: {kind: 'plain-write'},
+            publicId: 'source-two',
+        });
+        assert.ok(queuedStage.submissionToken);
+        queuedSession.markWireAttempted(1, queuedStage.submissionToken);
+        queuedSession.markQueueAccepted(1, queuedStage.submissionToken);
+        assert.throws(
+            () => queuedSession.cancelStagedSubmission(1, queuedStage.submissionToken as string),
+            (error: unknown) => error instanceof HistoryOtSessionError
+                && error.code === 'SUBMISSION_OUTCOME_UNKNOWN',
+        );
+        assert.equal(queuedSession.getState().hasPendingOperation, true);
+        assert.equal(queuedSession.getState().pendingQueued, true);
+    });
+
+    it('binds authorization and queue acceptance to the exact staged token', () => {
+        const session = readySession();
+        const staged = session.stage(1, {
+            operation: [{textOperation: [1, 'X', 2]}],
+            intent: {kind: 'plain-write'},
+            publicId: 'source-one',
+        });
+        assert.ok(staged.submissionToken);
+        assert.throws(
+            () => session.assertPendingSubmission(
+                1,
+                `${staged.submissionToken}-retired`,
+                staged.envelope,
+                {kind: 'plain-write'},
+            ),
+            (error: unknown) => error instanceof HistoryOtSessionError
+                && error.code === 'NO_AUTHORIZED_SUBMISSION',
+        );
+        assert.throws(
+            () => session.markWireAttempted(1, `${staged.submissionToken}-retired`),
+            (error: unknown) => error instanceof HistoryOtSessionError
+                && error.code === 'NO_PENDING_OPERATION',
+        );
+        assert.throws(
+            () => session.markQueueAccepted(1, `${staged.submissionToken}-retired`),
+            (error: unknown) => error instanceof HistoryOtSessionError
+                && error.code === 'NO_PENDING_OPERATION',
+        );
+        assert.equal(session.getState().pendingQueued, false);
+    });
+
+    it('separates never-emitted stages from attempted pre-ACK submissions', () => {
+        const neverEmitted = readySession();
+        const neverEmittedStage = neverEmitted.stage(1, {
+            operation: [{textOperation: [1, 'X', 2]}],
+            intent: {kind: 'plain-write'},
+            publicId: 'source-one',
+        });
+        assert.ok(neverEmittedStage.submissionToken);
+        const impossibleAck = neverEmitted.receiveApplied(1, {doc: 'doc-a', v: 5});
+        assert.equal(impossibleAck.requiresRejoin, true);
+        assert.equal(impossibleAck.reason, 'sender-ack-without-wire-attempt');
+        assert.equal(impossibleAck.state.hasPendingOperation, true);
+
+        const attempted = readySession();
+        const attemptedStage = attempted.stage(1, {
+            operation: [{textOperation: [1, 'Y', 2]}],
+            intent: {kind: 'plain-write'},
+            publicId: 'source-two',
+        });
+        assert.ok(attemptedStage.submissionToken);
+        attempted.markWireAttempted(1, attemptedStage.submissionToken);
+        assert.throws(
+            () => attempted.markWireAttempted(1, attemptedStage.submissionToken as string),
+            (error: unknown) => error instanceof HistoryOtSessionError
+                && error.code === 'SUBMISSION_ALREADY_ATTEMPTED',
+        );
+        assert.throws(
+            () => attempted.cancelStagedSubmission(1, attemptedStage.submissionToken as string),
+            (error: unknown) => error instanceof HistoryOtSessionError
+                && error.code === 'SUBMISSION_OUTCOME_UNKNOWN',
+        );
+        assert.equal(attempted.getState().hasPendingOperation, true);
+        assert.equal(attempted.getState().pendingQueued, false);
+        assert.equal(attempted.getState().pendingWireAttempted, true);
+    });
+
+    it('accepts a late queue ACK after the authoritative sender commit won the race', () => {
+        const session = readySession();
+        const staged = session.stage(1, {
+            operation: [{textOperation: [1, 'X', 2]}],
+            intent: {kind: 'plain-write'},
+            publicId: 'source-one',
+        });
+        assert.ok(staged.submissionToken);
+        session.markWireAttempted(1, staged.submissionToken);
+        const committed = session.receiveApplied(1, {doc: 'doc-a', v: 5});
+        assert.equal(committed.kind, 'sender-commit');
+
+        const lateQueueAck = session.markQueueAccepted(1, staged.submissionToken);
+        assert.equal(lateQueueAck.kind, 'queue-accepted');
+        assert.equal(lateQueueAck.reason, 'commit-witness-arrived-first');
+        assert.equal(lateQueueAck.state.hasPendingOperation, false);
+    });
+
+    it('uses collision-resistant tokens across same-document session incarnations', () => {
+        const first = readySession();
+        const second = readySession();
+        const firstStage = first.stage(1, {
+            operation: [{textOperation: [1, 'X', 2]}],
+            intent: {kind: 'plain-write'},
+            publicId: 'source-one',
+        });
+        const secondStage = second.stage(1, {
+            operation: [{textOperation: [1, 'X', 2]}],
+            intent: {kind: 'plain-write'},
+            publicId: 'source-one',
+        });
+        assert.ok(firstStage.submissionToken);
+        assert.ok(secondStage.submissionToken);
+        assert.notEqual(firstStage.submissionToken, secondStage.submissionToken);
+        assert.throws(
+            () => second.assertPendingSubmission(
+                1,
+                firstStage.submissionToken as string,
+                secondStage.envelope,
+                {kind: 'plain-write'},
+            ),
+            (error: unknown) => error instanceof HistoryOtSessionError
+                && error.code === 'NO_AUTHORIZED_SUBMISSION',
+        );
+    });
+
+    it('cancels an exact zero-wire stage without restoring retired permission authority', () => {
+        const session = readySession();
+        const staged = session.stage(1, {
+            operation: [{textOperation: [1, 'X', 2]}],
+            intent: {kind: 'plain-write'},
+            publicId: 'source-one',
+        });
+        assert.ok(staged.submissionToken);
+        const invalidated = session.updatePermission(1, {level: 'future-permission'});
+        assert.equal(invalidated.state.phase, 'rejoin-required');
+
+        const cancelled = session.cancelStagedSubmission(1, staged.submissionToken);
+        assert.equal(cancelled.kind, 'staged-cancelled');
+        assert.equal(cancelled.state.hasPendingOperation, false);
+        assert.equal(cancelled.state.phase, 'rejoin-required');
+        assert.equal(cancelled.state.permission, undefined);
+    });
+
+    it('cancels an exact recovery retry without deleting outcome-unknown recovery state', () => {
+        const session = readySession();
+        const originalStage = session.stage(1, {
+            operation: [{textOperation: [1, 'X', 2]}],
+            intent: {kind: 'plain-write'},
+            publicId: 'source-old',
+        });
+        assert.ok(originalStage.submissionToken);
+        session.markWireAttempted(1, originalStage.submissionToken);
+        session.markQueueAccepted(1, originalStage.submissionToken);
+        session.reconnect(2);
+        session.acceptJoin(2, join({content: 'abc'}, 5));
+
+        const cancelledRetry = session.prepareRecovery(2, 'source-cancelled');
+        assert.ok(cancelledRetry.submissionToken);
+        assert.deepEqual((cancelledRetry.envelope as any).dupIfSource, ['source-old']);
+        const cancelled = session.cancelStagedSubmission(
+            2,
+            cancelledRetry.submissionToken,
+        );
+        assert.equal(cancelled.state.phase, 'recovery-ready');
+        assert.equal(cancelled.state.hasPendingOperation, true);
+
+        const nextRetry = session.prepareRecovery(2, 'source-new');
+        assert.deepEqual((nextRetry.envelope as any).dupIfSource, ['source-old']);
+        assert.notEqual(nextRetry.submissionToken, cancelledRetry.submissionToken);
     });
 
     it('applies two concurrent collaborator updates only once and in version order', () => {
@@ -421,6 +669,20 @@ describe('HistoryOtSession ordering and recovery', () => {
         const lateAck = session.receiveApplied(1, {doc: 'doc-a', v: 5});
         assert.equal(lateAck.kind, 'late-ack-ignored');
         assert.equal((lateAck.state.snapshot as any).content, 'aXbcY');
+    });
+
+    it('rejects conflicting duplicate ancestry within the current join epoch', () => {
+        const session = readySession();
+        const applied = session.receiveApplied(1, fullUpdate(5, [
+            {textOperation: [1, 'X', 2]},
+        ], 'remote-one'));
+        assert.equal(applied.kind, 'collaborator-applied');
+
+        const conflicting = session.receiveApplied(1, fullUpdate(5, [
+            {textOperation: [2, 'Y', 1]},
+        ], 'remote-two'));
+        assert.equal(conflicting.requiresRejoin, true);
+        assert.equal(conflicting.reason, 'conflicting-duplicate-collaborator-update');
     });
 
     it('requires rejoin on a version gap, wrong document, or malformed update', () => {
@@ -463,13 +725,15 @@ describe('HistoryOtSession ordering and recovery', () => {
     it('recovers with the exact original operation/version and all prior public ids', () => {
         const session = readySession('owner', {content: 'abc'}, 5);
         const originalOperation = [{textOperation: [1, 'X', 2]}];
-        session.stage(1, {
+        const originalStage = session.stage(1, {
             operation: originalOperation,
             meta: {ts: {opaque: 'client-time'}},
             intent: {kind: 'plain-write'},
             publicId: 'source-old',
         });
-        session.markQueueAccepted(1);
+        assert.ok(originalStage.submissionToken);
+        session.markWireAttempted(1, originalStage.submissionToken);
+        session.markQueueAccepted(1, originalStage.submissionToken);
         const unchanged = session.updatePermission(1, {level: 'owner', userId: 'user-a'});
         assert.equal(unchanged.requiresRejoin, false);
         assert.equal(unchanged.state.hasPendingOperation, true);
@@ -491,17 +755,139 @@ describe('HistoryOtSession ordering and recovery', () => {
             dupIfSource: ['source-old'],
         });
         assert.ok(recovered.envelope);
-        session.assertPendingSubmission(2, recovered.envelope, {kind: 'plain-write'});
+        assert.ok(recovered.submissionToken);
+        session.assertPendingSubmission(
+            2,
+            recovered.submissionToken,
+            recovered.envelope,
+            {kind: 'plain-write'},
+        );
+        session.markWireAttempted(2, recovered.submissionToken);
 
-        const duplicate = session.receiveApplied(2, {
-            ...(recovered.envelope as object),
-            dup: true,
+        const duplicateAck = session.receiveApplied(2, {doc: 'doc-a', v: 5});
+        assert.equal(duplicateAck.kind, 'sender-commit');
+        assert.equal(duplicateAck.applied, false);
+        assert.equal(duplicateAck.state.phase, 'rejoin-required');
+        assert.equal(duplicateAck.state.hasPendingOperation, false);
+        assert.equal(duplicateAck.state.snapshot, undefined);
+    });
+
+    it('rejects a recovery join that predates the durable pending base', () => {
+        const session = readySession('owner', {content: 'abc'}, 5);
+        const staged = session.stage(1, {
+            operation: [{textOperation: [1, 'X', 2]}],
+            intent: {kind: 'plain-write'},
+            publicId: 'source-old',
         });
-        assert.equal(duplicate.kind, 'duplicate-acknowledged');
-        assert.equal(duplicate.applied, false);
-        assert.equal(duplicate.state.phase, 'ready');
-        assert.equal((duplicate.state.snapshot as any).content, 'aXbc');
-        assert.equal(duplicate.state.version, 6);
+        assert.ok(staged.submissionToken);
+        session.markWireAttempted(1, staged.submissionToken);
+        session.reconnect(2);
+
+        const staleJoin = session.acceptJoin(2, join({content: 'abc'}, 4));
+        assert.equal(staleJoin.requiresRejoin, true);
+        assert.equal(staleJoin.reason, 'recovery-join-predates-pending-base');
+        assert.equal(staleJoin.state.hasPendingOperation, true);
+        assert.equal(staleJoin.state.snapshot, undefined);
+    });
+
+    it('keeps recovery envelope bytes and dupIfSource frozen while the witness advances', () => {
+        const session = readySession('owner', {content: 'abc'}, 5);
+        const originalOperation = [{textOperation: [1, 'X', 2]}];
+        const originalStage = session.stage(1, {
+            operation: originalOperation,
+            meta: {ts: {opaque: 'client-time'}},
+            intent: {kind: 'plain-write'},
+            publicId: 'source-old',
+        });
+        assert.ok(originalStage.submissionToken);
+        session.markWireAttempted(1, originalStage.submissionToken);
+        session.markQueueAccepted(1, originalStage.submissionToken);
+        session.reconnect(2);
+        session.acceptJoin(2, join({content: 'aXbc'}, 6));
+        const recovery = session.prepareRecovery(2, 'source-new');
+        assert.ok(recovery.envelope);
+        assert.ok(recovery.submissionToken);
+        const frozenEnvelope = JSON.parse(JSON.stringify(recovery.envelope));
+
+        const collaborator = session.receiveApplied(2, fullUpdate(6, [
+            {textOperation: [4, 'Y']},
+        ], 'remote-source'));
+        assert.equal(collaborator.requiresRejoin, false);
+        assert.equal(collaborator.state.version, 7);
+        assert.equal((collaborator.state.snapshot as any).content, 'aXbcY');
+        assert.deepEqual(recovery.envelope, frozenEnvelope);
+        assert.deepEqual((recovery.envelope as any).dupIfSource, ['source-old']);
+        assert.deepEqual(
+            session.assertPendingSubmission(
+                2,
+                recovery.submissionToken,
+                frozenEnvelope,
+                {kind: 'plain-write'},
+            ),
+            frozenEnvelope,
+        );
+        session.markWireAttempted(2, recovery.submissionToken);
+        const committed = session.receiveApplied(2, {doc: 'doc-a', v: 5});
+        assert.equal(committed.kind, 'sender-commit');
+        assert.equal(committed.state.hasPendingOperation, false);
+    });
+
+    it('accepts distinct collaborator sources but rejects any full update from a pending local source', () => {
+        const operation = [{textOperation: [1, 'X', 2]}];
+        const collaboratorSession = readySession();
+        collaboratorSession.stage(1, {
+            operation,
+            intent: {kind: 'plain-write'},
+            publicId: 'source-one',
+        });
+        const collaborator = collaboratorSession.receiveApplied(
+            1,
+            fullUpdate(5, operation, 'other-source'),
+        );
+        assert.equal(collaborator.kind, 'collaborator-applied');
+        assert.equal(collaborator.requiresRejoin, false);
+        assert.equal(collaborator.state.hasPendingOperation, true);
+
+        const localSource = readySession();
+        localSource.stage(1, {
+            operation,
+            intent: {kind: 'plain-write'},
+            publicId: 'source-one',
+        });
+        const impossibleFullUpdate = localSource.receiveApplied(1, fullUpdate(5, [
+            {textOperation: [2, 'Y', 1]},
+        ], 'source-one'));
+        assert.equal(impossibleFullUpdate.requiresRejoin, true);
+        assert.equal(impossibleFullUpdate.reason, 'unexpected-sender-full-update');
+        assert.equal(impossibleFullUpdate.state.hasPendingOperation, true);
+    });
+
+    it('fails closed on malformed or gapped collaborator updates while pending', () => {
+        const gapSession = readySession();
+        gapSession.stage(1, {
+            operation: [{textOperation: [1, 'X', 2]}],
+            intent: {kind: 'plain-write'},
+            publicId: 'source-one',
+        });
+        const gap = gapSession.receiveApplied(1, fullUpdate(6, [
+            {textOperation: [3, 'Y']},
+        ], 'remote-source'));
+        assert.equal(gap.requiresRejoin, true);
+        assert.equal(gap.reason, 'collaborator-version-gap');
+        assert.equal(gap.state.hasPendingOperation, true);
+
+        const malformedSession = readySession();
+        malformedSession.stage(1, {
+            operation: [{textOperation: [1, 'X', 2]}],
+            intent: {kind: 'plain-write'},
+            publicId: 'source-one',
+        });
+        const malformed = malformedSession.receiveApplied(1, fullUpdate(5, [
+            {futureOperation: true},
+        ], 'remote-source'));
+        assert.equal(malformed.requiresRejoin, true);
+        assert.match(malformed.reason ?? '', /unsafe-update/);
+        assert.equal(malformed.state.hasPendingOperation, true);
     });
 
     it('does not call local tracked algebra authoritative when a sender commits', () => {
@@ -510,7 +896,7 @@ describe('HistoryOtSession ordering and recovery', () => {
             trackedChanges: [],
         };
         const session = readySession('owner', snapshot, 9);
-        session.stage(1, {
+        const staged = session.stage(1, {
             operation: [{textOperation: [1, {
                 i: 'X',
                 tracking: {type: 'insert', userId: 'user-a', ts: timestamp},
@@ -519,6 +905,8 @@ describe('HistoryOtSession ordering and recovery', () => {
             intent: {kind: 'tracked-write'},
             publicId: 'source-one',
         });
+        assert.ok(staged.submissionToken);
+        session.markWireAttempted(1, staged.submissionToken);
         const committed = session.receiveApplied(1, {doc: 'doc-a', v: 9});
         assert.equal(committed.requiresRejoin, true);
         assert.equal(committed.state.snapshot, undefined);
@@ -599,14 +987,25 @@ describe('HistoryOtSession permission intent gate', () => {
             intent,
             publicId: 'source',
         });
+        assert.ok(staged.submissionToken);
         intent.kind = 'tracked-write';
 
         assert.throws(
-            () => session.assertPendingSubmission(1, staged.envelope, intent),
+            () => session.assertPendingSubmission(
+                1,
+                staged.submissionToken as string,
+                staged.envelope,
+                intent,
+            ),
             (error: unknown) => error instanceof HistoryOtSessionError
                 && error.code === 'UNAUTHORIZED_SUBMISSION',
         );
-        session.assertPendingSubmission(1, staged.envelope, {kind: 'plain-write'});
+        session.assertPendingSubmission(
+            1,
+            staged.submissionToken,
+            staged.envelope,
+            {kind: 'plain-write'},
+        );
         const transition = session.updatePermission(1, {level: 'review', userId: 'user-a'});
         assert.equal(transition.requiresRejoin, true);
         assert.equal(transition.reason, 'permission-changed-with-pending-operation');

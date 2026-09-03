@@ -1250,9 +1250,13 @@ describe('SocketIOAPI project protocol', () => {
         });
         const envelope = staged.envelope;
         assert.ok(envelope);
+        const submissionToken = staged.submissionToken;
+        assert.ok(submissionToken);
 
         const expectedEnvelope = JSON.parse(JSON.stringify(envelope));
-        const saving = socket.applyHistoryOtUpdate('doc-id', envelope, intent, session, witness);
+        const saving = socket.applyHistoryOtUpdate(
+            'doc-id', envelope, intent, submissionToken, session, witness,
+        );
         (envelope as any).v = 99;
         (envelope as any).meta.source = 'P.mutated-after-authorization';
         await waitForEmission(transport, 'applyOtUpdate');
@@ -1263,6 +1267,7 @@ describe('SocketIOAPI project protocol', () => {
             'the exact authorized snapshot must reach the wire despite caller mutation',
         );
         assert.notStrictEqual(writes()[0].args[1], envelope);
+        assert.equal(session.getState().pendingWireAttempted, true);
         assert.equal(session.getState().pendingQueued, false);
         transport.acknowledge('applyOtUpdate', undefined);
         await saving;
@@ -1277,34 +1282,87 @@ describe('SocketIOAPI project protocol', () => {
             socket.applyHistoryOtUpdate(
                 'doc-id', expectedEnvelope,
                 {kind: 'tracked-decision', decision: 'accept', selectedRanges: []},
-                session, witness,
+                submissionToken, session, witness,
             ),
             socket.applyHistoryOtUpdate(
-                'doc-id', expectedEnvelope, {kind: 'comment-write'}, session, witness,
+                'doc-id', expectedEnvelope, {kind: 'comment-write'},
+                submissionToken, session, witness,
             ),
             socket.applyHistoryOtUpdate(
                 'doc-id',
                 {...expectedEnvelope as object, meta: {source: 'P.other', tc: 'opaque-seed'}},
                 intent,
-                session,
+                submissionToken, session,
                 witness,
             ),
             socket.applyHistoryOtUpdate(
-                'doc-id', expectedEnvelope, intent, session,
+                'doc-id', expectedEnvelope, intent, submissionToken, session,
                 {...witness, generation: witness.generation + 1},
             ),
             socket.applyHistoryOtUpdate(
-                'doc-id', expectedEnvelope, intent,
+                'doc-id', expectedEnvelope, intent, submissionToken,
                 new HistoryOtSession('doc-id', witness.generation, {
                     level: 'review', userId: 'user-a',
                 }),
                 witness,
+            ),
+            socket.applyHistoryOtUpdate(
+                'doc-id', expectedEnvelope, intent,
+                `${submissionToken}-retired`, session, witness,
             ),
         ];
         for (const rejection of rejected) {
             await assert.rejects(rejection, (error: unknown) => error instanceof SocketRequestError);
         }
         assert.equal(writes().length, acceptedWriteCount, 'every rejected History write must emit zero wire calls');
+
+        const parallelSession = new HistoryOtSession('doc-id', witness.generation, {
+            level: 'review',
+            userId: 'user-a',
+        });
+        parallelSession.acceptJoin(witness.generation, {
+            snapshot: {content: 'a'},
+            version: 4,
+            operations: [],
+            ranges: {},
+            otType: 'history-ot',
+        });
+        const parallelStage = parallelSession.stage(witness.generation, {
+            operation: [{textOperation: [1, {
+                i: 'p',
+                tracking: {
+                    type: 'insert',
+                    userId: 'user-a',
+                    ts: '2026-08-31T00:00:00.000Z',
+                },
+            }]}],
+            meta: {tc: 'parallel-seed'},
+            intent,
+            publicId: witness.publicId,
+        });
+        assert.ok(parallelStage.submissionToken);
+        const beforeParallel = writes().length;
+        const firstParallel = socket.applyHistoryOtUpdate(
+            'doc-id', parallelStage.envelope!, intent,
+            parallelStage.submissionToken, parallelSession, witness,
+        );
+        const secondParallel = socket.applyHistoryOtUpdate(
+            'doc-id', parallelStage.envelope!, intent,
+            parallelStage.submissionToken, parallelSession, witness,
+        );
+        const secondParallelRejected = assert.rejects(
+            secondParallel,
+            (error: unknown) => error instanceof SocketRequestError,
+        );
+        await waitForEmission(transport, 'applyOtUpdate', beforeParallel + 1);
+        await secondParallelRejected;
+        assert.equal(
+            writes().length,
+            beforeParallel + 1,
+            'one submission token must cross the wire boundary at most once',
+        );
+        transport.acknowledge('applyOtUpdate', undefined);
+        await firstParallel;
 
         const raceSession = new HistoryOtSession('doc-id', witness.generation, {
             level: 'review',
@@ -1335,6 +1393,7 @@ describe('SocketIOAPI project protocol', () => {
             'doc-id',
             raceStaged.envelope!,
             intent,
+            raceStaged.submissionToken!,
             raceSession,
             witness,
         );
@@ -1348,6 +1407,7 @@ describe('SocketIOAPI project protocol', () => {
             emittedBeforeInvalidation,
             'permission invalidation before emit must produce zero wire calls',
         );
+        assert.equal(raceSession.getState().pendingWireAttempted, false);
     });
 
     it('forwards raw thread events and clears current and remembered authority on invalidation', async () => {
