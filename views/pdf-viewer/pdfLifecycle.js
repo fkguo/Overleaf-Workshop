@@ -19,16 +19,31 @@
     function createController(application, options = {}) {
         const onError = options.onError || (() => {});
         const onOpened = options.onOpened || (() => {});
+        const onFatal = options.onFatal || (() => {});
         let requestedGeneration = 0;
         let pendingRequest;
         let applicationGeneration = 0;
         let currentSession;
         let runner;
         let disposed = false;
+        let terminal = false;
 
         function report(error, phase, pdfGeneration) {
             try {
                 onError(error, phase, pdfGeneration);
+            } catch {}
+        }
+
+        function failTerminal(error, phase, pdfGeneration) {
+            if (terminal) {
+                return;
+            }
+            terminal = true;
+            pendingRequest = undefined;
+            applicationGeneration = 0;
+            currentSession = undefined;
+            try {
+                onFatal(error, phase, pdfGeneration);
             } catch {}
         }
 
@@ -38,6 +53,7 @@
                 return true;
             } catch (error) {
                 report(error, 'close', pdfGeneration);
+                failTerminal(error, 'close', pdfGeneration);
                 return false;
             }
         }
@@ -45,7 +61,12 @@
         async function drain() {
             while (true) {
                 if (disposed) {
-                    await close(0);
+                    if (!terminal) {
+                        await close(0);
+                    }
+                    return;
+                }
+                if (terminal) {
                     return;
                 }
                 if (!pendingRequest) {
@@ -54,12 +75,10 @@
                 const request = pendingRequest;
                 const closed = await close(request.pdfGeneration);
                 if (!closed) {
-                    applicationGeneration = 0;
-                    currentSession = undefined;
-                    // A failed destroy has unknown residual state. Do not
-                    // retry or open on top of it; a later generation may make
-                    // one fresh close attempt.
-                    pendingRequest = undefined;
+                    // PDF.js clears its public task/document references before
+                    // awaiting destroy. A rejection cannot be safely retried
+                    // in this webview, so failTerminal has permanently closed
+                    // the controller above.
                     return;
                 }
                 if (disposed || pendingRequest !== request) {
@@ -92,7 +111,9 @@
                     currentSession = undefined;
                     // PDF.js retains a failed pdfLoadingTask. Close it before
                     // accepting another document or considering the queue idle.
-                    await close(request.pdfGeneration);
+                    if (!await close(request.pdfGeneration)) {
+                        return;
+                    }
                 } else {
                     currentSession = {
                         pdfGeneration: request.pdfGeneration,
@@ -117,7 +138,7 @@
             }
             runner = drain().finally(() => {
                 runner = undefined;
-                if (!disposed && pendingRequest) {
+                if (!disposed && !terminal && pendingRequest) {
                     ensureRunner();
                 }
             });
@@ -127,6 +148,7 @@
             replace(pdfGeneration, args) {
                 if (
                     disposed ||
+                    terminal ||
                     !isGeneration(pdfGeneration) ||
                     pdfGeneration <= requestedGeneration
                 ) {
@@ -145,6 +167,7 @@
             currentGenerationFor(pdfDocument) {
                 if (
                     disposed ||
+                    terminal ||
                     !pdfDocument ||
                     applicationGeneration !== requestedGeneration ||
                     currentSession?.pdfGeneration !== applicationGeneration ||
@@ -167,10 +190,13 @@
                         session.pdfDocument.getDownloadInfo(),
                         firstPagePromise,
                     ]);
-                } catch {
+                } catch (error) {
+                    if (!disposed && !terminal && currentSession === session) {
+                        report(error, 'ready', session.pdfGeneration);
+                    }
                     return false;
                 }
-                return !disposed &&
+                return !disposed && !terminal &&
                     currentSession === session &&
                     applicationGeneration === requestedGeneration &&
                     applicationGeneration === session.pdfGeneration &&
@@ -193,7 +219,9 @@
                     requestedGeneration = 0;
                     applicationGeneration = 0;
                     currentSession = undefined;
-                    ensureRunner();
+                    if (!terminal) {
+                        ensureRunner();
+                    }
                 }
                 if (runner) {
                     await runner;

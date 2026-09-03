@@ -32,6 +32,7 @@ const {createController} = require('../../views/pdf-viewer/pdfLifecycle.js') as 
         options?: {
             onError?: (error: unknown, phase: string, generation: number) => void,
             onOpened?: (session: FakeSession) => void,
+            onFatal?: (error: unknown, phase: string, generation: number) => void,
         },
     ) => {
         replace: (generation: number, args: {name: string}) => boolean,
@@ -116,10 +117,6 @@ class FakeApplication {
         this.closeCalls += 1;
         const closeError = this.closeError;
         this.closeError = undefined;
-        if (closeError) {
-            this.activeOperations -= 1;
-            throw closeError;
-        }
         const task = this.task;
         const document = this.pdfDocument;
         this.task = undefined;
@@ -140,6 +137,9 @@ class FakeApplication {
         this.closeBarrier = undefined;
         try {
             await barrier?.promise;
+            if (closeError) {
+                throw closeError;
+            }
         } finally {
             this.activeOperations -= 1;
         }
@@ -270,12 +270,16 @@ describe('PDF viewer application lifecycle', () => {
         assert.deepEqual(errors, [{phase: 'open', generation: 1}]);
     });
 
-    it('fails closed after destroy rejects and recovers on a later generation', async () => {
+    it('becomes terminal when destroy rejects with a newer generation pending', async () => {
         const application = new FakeApplication();
         const errors: Array<{phase: string, generation: number}> = [];
+        const fatals: Array<{phase: string, generation: number}> = [];
         const controller = createController(application, {
             onError: (_error, phase, generation) => {
                 errors.push({phase, generation});
+            },
+            onFatal: (_error, phase, generation) => {
+                fatals.push({phase, generation});
             },
         });
 
@@ -284,20 +288,39 @@ describe('PDF viewer application lifecycle', () => {
         const documentA = resolveTask(application.openCalls[0]);
         await controller.whenIdle();
 
+        const releaseClose = application.blockNextClose();
         application.rejectNextClose(new Error('destroy failed'));
         controller.replace(2, {name: 'B'});
+        await waitFor(() => documentA.destroyed);
+        assert.equal(controller.replace(3, {name: 'C'}), true);
+        releaseClose();
         await controller.whenIdle();
         assert.equal(application.openCalls.length, 1);
         assert.equal(controller.currentGenerationFor(documentA), 0);
         assert.deepEqual(errors, [{phase: 'close', generation: 2}]);
-
-        controller.replace(3, {name: 'C'});
-        await waitFor(() => application.openCalls.length === 2);
-        const documentC = resolveTask(application.openCalls[1]);
-        await controller.whenIdle();
-        assert.equal(documentA.destroyed, true);
-        assert.equal(controller.currentGenerationFor(documentC), 3);
+        assert.deepEqual(fatals, [{phase: 'close', generation: 2}]);
+        assert.equal(controller.replace(4, {name: 'D'}), false);
         assert.equal(application.maxActiveOperations, 1);
+    });
+
+    it('becomes terminal when cleanup after a failed open cannot destroy', async () => {
+        const application = new FakeApplication();
+        const fatals: Array<{phase: string, generation: number}> = [];
+        const controller = createController(application, {
+            onFatal: (_error, phase, generation) => {
+                fatals.push({phase, generation});
+            },
+        });
+
+        controller.replace(1, {name: 'broken'});
+        await waitFor(() => application.openCalls.length === 1);
+        application.rejectNextClose(new Error('cleanup destroy failed'));
+        application.openCalls[0].deferred.reject(new Error('invalid PDF'));
+        await controller.whenIdle();
+
+        assert.deepEqual(fatals, [{phase: 'close', generation: 1}]);
+        assert.equal(application.openCalls[0].destroyed, true);
+        assert.equal(controller.replace(2, {name: 'B'}), false);
     });
 
     it('destroys the mounted document on dispose and rejects later updates', async () => {
@@ -343,5 +366,26 @@ describe('PDF viewer application lifecycle', () => {
         documentB.download.resolve();
         taskB.firstPage.resolve();
         assert.equal(await readyB, true);
+    });
+
+    it('reports a current readiness rejection without marking the session ready', async () => {
+        const application = new FakeApplication();
+        const sessions: FakeSession[] = [];
+        const errors: Array<{phase: string, generation: number}> = [];
+        const controller = createController(application, {
+            onOpened: session => sessions.push(session),
+            onError: (_error, phase, generation) => errors.push({phase, generation}),
+        });
+
+        controller.replace(1, {name: 'A'});
+        await waitFor(() => application.openCalls.length === 1);
+        const taskA = application.openCalls[0];
+        const documentA = resolveTask(taskA, false);
+        await controller.whenIdle();
+        const ready = controller.whenReady(sessions[0], application.pdfViewer);
+        documentA.download.reject(new Error('download info failed'));
+
+        assert.equal(await ready, false);
+        assert.deepEqual(errors, [{phase: 'ready', generation: 1}]);
     });
 });

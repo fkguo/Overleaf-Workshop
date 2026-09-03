@@ -122,6 +122,11 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                 case 'saveState':
                     GlobalStateManager.updatePdfViewPersist(this.context, doc.uri.toString(), e.content);
                     break;
+                case 'pdfLifecycleFatal':
+                    void vscode.window.showErrorMessage(
+                        'PDF preview could not be safely reloaded. Close and reopen the PDF preview.',
+                    );
+                    break;
                 case 'ready':
                     const state = GlobalStateManager.getPdfViewPersist(this.context, doc.uri.toString());
                     const config = vscode.workspace.getConfiguration('overleaf-workshop.pdfViewer');

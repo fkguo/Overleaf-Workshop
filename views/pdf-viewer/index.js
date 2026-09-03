@@ -45,6 +45,9 @@
         onError: (error, phase, generation) => {
             console.error(`PDF ${phase} failed for generation ${generation}`, error);
         },
+        onFatal: () => {
+            vscode.postMessage({type: 'pdfLifecycleFatal'});
+        },
         onOpened: session => {
             const pagesPromise = PDFViewerApplication.pdfViewer.pagesPromise;
             pdfLifecycle.whenReady(session, PDFViewerApplication.pdfViewer).then(ready => {

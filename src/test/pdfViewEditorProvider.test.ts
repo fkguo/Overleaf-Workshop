@@ -20,6 +20,7 @@ class EventEmitterStub<T> {
 }
 
 let readFile = async (_uri: unknown): Promise<Uint8Array> => new Uint8Array();
+const shownErrors: string[] = [];
 const vscodeStub = {
     EventEmitter: EventEmitterStub,
     Uri: {
@@ -29,6 +30,12 @@ const vscodeStub = {
         getConfiguration: () => ({get: (_key: string, fallback: unknown) => fallback}),
         fs: {
             readFile: (uri: unknown) => readFile(uri),
+        },
+    },
+    window: {
+        showErrorMessage: (message: string) => {
+            shownErrors.push(message);
+            return Promise.resolve(undefined);
         },
     },
 };
@@ -141,5 +148,37 @@ describe('PdfDocument refresh generations', () => {
         assert.ok(gateIndex >= 0);
         assert.ok(lifecycleIndex > gateIndex);
         assert.ok(controllerIndex > lifecycleIndex);
+    });
+
+    it('tells the user to reopen a terminally failed PDF preview', async () => {
+        readFile = async () => Buffer.from('</head>');
+        shownErrors.length = 0;
+        const provider = new PdfViewEditorProvider({extensionUri: {}} as any);
+        const doc = new PdfDocument({scheme: 'overleaf-workshop'} as any);
+        let receiveMessage!: (message: {type: string}) => void;
+        const webview = {
+            options: {},
+            html: '',
+            asWebviewUri: (uri: {parts: string[]}) => ({
+                toString: () => uri.parts.join('/'),
+            }),
+            postMessage: () => Promise.resolve(true),
+            onDidReceiveMessage: (listener: (message: {type: string}) => void) => {
+                receiveMessage = listener;
+                return {dispose() {}};
+            },
+        };
+        const panel = {
+            webview,
+            onDidDispose: () => ({dispose() {}}),
+            onDidChangeViewState: () => ({dispose() {}}),
+        };
+
+        await provider.resolveCustomEditor(doc, panel as any);
+        receiveMessage({type: 'pdfLifecycleFatal'});
+
+        assert.deepEqual(shownErrors, [
+            'PDF preview could not be safely reloaded. Close and reopen the PDF preview.',
+        ]);
     });
 });
