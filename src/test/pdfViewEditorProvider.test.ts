@@ -136,8 +136,10 @@ describe('PdfDocument refresh generations', () => {
         const html = (provider as any).patchViewerHtml(webview, '</head>') as string;
 
         const gateIndex = html.indexOf('syncGeneration.js');
+        const lifecycleIndex = html.indexOf('pdfLifecycle.js');
         const controllerIndex = html.indexOf('index.js');
         assert.ok(gateIndex >= 0);
-        assert.ok(controllerIndex > gateIndex);
+        assert.ok(lifecycleIndex > gateIndex);
+        assert.ok(controllerIndex > lifecycleIndex);
     });
 });

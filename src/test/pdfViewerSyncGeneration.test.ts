@@ -65,4 +65,21 @@ describe('PDF viewer SyncTeX generation gate', () => {
         assert.equal(isReadyPdfGeneration(0, 2, oldPdf, oldPdf), false);
         assert.equal(isReadyPdfGeneration(2, 2, oldPdf, newPdf), false);
     });
+
+    it('treats old animation and page events as wakeups without advancing generation', () => {
+        const gate = createGate();
+        const oldPdf = {};
+        const newPdf = {};
+        const newSync = [{page: 4}];
+
+        gate.beginPdfLoad(1);
+        gate.beginPdfLoad(2);
+        gate.queueSync(2, newSync);
+
+        // Model a stale RAF/pagesloaded/pagerendered callback: it may attempt
+        // a flush, but neither document readiness nor pending content advances.
+        assert.equal(isReadyPdfGeneration(1, 2, oldPdf, newPdf), false);
+        assert.equal(gate.readyContent(1), undefined);
+        assert.deepEqual(gate.readyContent(2), newSync);
+    });
 });

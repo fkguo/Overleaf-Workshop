@@ -36,12 +36,35 @@
         pdfViewerSpreadMode: SpreadMode.NONE,
         pdfSidebarView: SidebarView.NONE,
     };
-    let firstLoaded = true;
     const syncGenerationGate = OverleafPdfSyncGeneration.createGate();
     let pdfLoadGeneration = 0;
     let loadingPdfGeneration = 0;
     let readyPdfGeneration = 0;
     let loadingPdfDocument;
+    const pdfLifecycle = OverleafPdfLifecycle.createController(PDFViewerApplication, {
+        onError: (error, phase, generation) => {
+            console.error(`PDF ${phase} failed for generation ${generation}`, error);
+        },
+        onOpened: session => {
+            const pagesPromise = PDFViewerApplication.pdfViewer.pagesPromise;
+            pdfLifecycle.whenReady(session, PDFViewerApplication.pdfViewer).then(ready => {
+                if (!ready || session.pdfGeneration !== pdfLoadGeneration) { return; }
+                loadingPdfGeneration = session.pdfGeneration;
+                loadingPdfDocument = session.pdfDocument;
+                readyPdfGeneration = session.pdfGeneration;
+                updatePdfViewerState();
+                window.requestAnimationFrame(flushPendingSyncCode);
+                pagesPromise?.then(() => {
+                    if (
+                        pdfLifecycle.currentGenerationFor(session.pdfDocument) === session.pdfGeneration &&
+                        readyPdfGeneration === session.pdfGeneration
+                    ) {
+                        flushPendingSyncCode();
+                    }
+                }).catch(() => {});
+            });
+        },
+    });
 
     function updatePdfViewerState() {
         const pdfViewerState = vscode.getState() || globalPdfViewerState;
@@ -153,32 +176,26 @@
         container.insertBefore(button, firstChild);
     }
 
-    async function updatePdf(pdf, generation) {
+    function updatePdf(pdf, generation) {
         if (!syncGenerationGate.beginPdfLoad(generation)) {
             return;
         }
+        if (
+            readyPdfGeneration !== 0 &&
+            PDFViewerApplication.pdfDocument === loadingPdfDocument
+        ) {
+            backupPdfViewerState();
+        }
         pdfLoadGeneration = generation;
-        // The old PDF remains mounted while getDocument parses the replacement.
-        // Do not consume a new SyncTeX result against that stale viewport.
         readyPdfGeneration = 0;
-        const doc = await pdfjsLib.getDocument({
+        loadingPdfGeneration = 0;
+        loadingPdfDocument = undefined;
+        PDFViewerApplication.isViewerEmbedded = true;
+        pdfLifecycle.replace(generation, {
             data: pdf,
             cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.10.111/cmaps/',
             cMapPacked: true
-        }).promise;
-        if (generation !== pdfLoadGeneration) {
-            await doc.destroy();
-            return;
-        }
-        if (firstLoaded) {
-            firstLoaded = false;
-        } else {
-            backupPdfViewerState();
-        }
-        PDFViewerApplication.isViewerEmbedded = true;
-        loadingPdfGeneration = generation;
-        loadingPdfDocument = doc;
-        PDFViewerApplication.load(doc);
+        });
     }
 
     function revealSyncCode(pdf) {
@@ -270,15 +287,6 @@
         .then(() => {
             const {eventBus, _boundEvents} = PDFViewerApplication;
             eventBus._off("beforeprint", _boundEvents.beforePrint);
-            eventBus.on('documentloaded', () => {
-                if (
-                    loadingPdfGeneration !== pdfLoadGeneration ||
-                    PDFViewerApplication.pdfDocument !== loadingPdfDocument
-                ) { return; }
-                readyPdfGeneration = loadingPdfGeneration;
-                updatePdfViewerState();
-                window.requestAnimationFrame(flushPendingSyncCode);
-            });
             eventBus._on('pagesloaded', flushPendingSyncCode);
             eventBus._on('pagerendered', flushPendingSyncCode);
             // backup scale
@@ -328,6 +336,10 @@
             }
             syncPdf(pageElem, pageNum, e.clientX, e.clientY, e.target.innerText);
         });
+
+        window.addEventListener('pagehide', () => {
+            pdfLifecycle.dispose();
+        }, {once: true});
 
         // Display Error Message
         window.onerror = () => {

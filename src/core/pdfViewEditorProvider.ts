@@ -162,11 +162,12 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         // patch custom files
         const workerScript = `<script src="${patchPath('vendor','build','pdf.worker.js')}"></script>`;
         const syncGenerationScript = `<script src="${patchPath('syncGeneration.js')}"></script>`;
+        const pdfLifecycleScript = `<script src="${patchPath('pdfLifecycle.js')}"></script>`;
         const customScript = `<script src="${patchPath('index.js')}"></script>`;
         const customStyle = `<link rel="stylesheet" href="${patchPath('index.css')}" />`;
         html = html.replace(
             /\<\/head\>/,
-            `${workerScript}\n${syncGenerationScript}\n${customScript}\n${customStyle}\n</head>`,
+            `${workerScript}\n${syncGenerationScript}\n${pdfLifecycleScript}\n${customScript}\n${customStyle}\n</head>`,
         );
 
         return html;
