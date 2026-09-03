@@ -36,6 +36,7 @@ type PdfViewRecord = {
     doc: PdfDocument,
     webviewPanel: vscode.WebviewPanel,
     ready: boolean,
+    syncableGeneration?: number,
 };
 
 const pdfViewRecord: {
@@ -43,6 +44,7 @@ const pdfViewRecord: {
         [key: string]: PdfViewRecord,
     }
 } = {};
+const unsyncablePdfProjects = new Set<string>();
 
 type PendingPdfSync = {
     result: SyncCodeResponseSchema,
@@ -60,9 +62,20 @@ const pendingSourceSync: {
     } | undefined,
 } = {};
 const sourceSyncRequests = new LatestRequestGate();
+const pdfRefreshRequests = new LatestRequestGate();
+const compiledPdfBuildRequests = new LatestRequestGate();
 
 function pdfRecordKey(identifier: string, filePath: string): string {
     return `${identifier}\n${filePath}`;
+}
+
+function isPdfGenerationSyncable(record: PdfViewRecord, generation: number | undefined): boolean {
+    return Boolean(
+        Number.isSafeInteger(generation) &&
+        (generation as number) > 0 &&
+        record.doc.generation === generation &&
+        record.syncableGeneration === generation
+    );
 }
 
 type PendingSourceSync = SynctexSourceLocation & {
@@ -76,6 +89,25 @@ type CapturedCompileSourceSync = PendingSourceSync & {
     selectionLine: number,
     selectionCharacter: number,
 };
+
+type PdfCompileTransition = {
+    buildGeneration: number,
+    autoSourceGeneration: number,
+    previousRecord?: PdfViewRecord,
+    previousSyncableGeneration?: number,
+    buildMayHaveChanged: boolean,
+};
+
+type PendingCompiledPdfRefresh = {
+    buildGeneration: number,
+    capturedSourcePromise?: Promise<CapturedCompileSourceSync | undefined>,
+    autoSourceGeneration?: number,
+    refreshRecord?: PdfViewRecord,
+};
+
+const pendingCompiledPdfRefresh: {
+    [identifier: string]: PendingCompiledPdfRefresh | undefined,
+} = {};
 
 type SourceSyncDeliveryGuard = {
     requestGeneration?: number,
@@ -215,22 +247,42 @@ export class CompileManager {
             const recordKey = pdfRecordKey(identifier, filePath);
             const previousRecord = pdfViewRecord[identifier]?.[filePath];
             if (previousRecord && previousRecord.webviewPanel !== webviewPanel) {
+                previousRecord.syncableGeneration = undefined;
+                previousRecord.doc.invalidateRefresh();
+                const pendingRefresh = pendingCompiledPdfRefresh[identifier];
+                if (pendingRefresh?.refreshRecord === previousRecord) {
+                    pendingRefresh.capturedSourcePromise = undefined;
+                    pendingRefresh.autoSourceGeneration = undefined;
+                    pendingRefresh.refreshRecord = undefined;
+                }
                 delete pendingPdfSync[recordKey];
                 delete pendingSourceSync[recordKey];
                 sourceSyncRequests.invalidate(recordKey);
+                pdfRefreshRequests.invalidate(recordKey);
             }
+            const initialGeneration = doc.generation;
+            const syncableGeneration = !unsyncablePdfProjects.has(identifier) &&
+                Number.isSafeInteger(initialGeneration) && initialGeneration > 0 ?
+                initialGeneration : undefined;
+            const record = {doc, webviewPanel, ready: false, syncableGeneration};
             if (pdfViewRecord[identifier]) {
-                pdfViewRecord[identifier][filePath] = {doc, webviewPanel, ready: false};
+                pdfViewRecord[identifier][filePath] = record;
             } else {
-                pdfViewRecord[identifier] = {[filePath]:{doc, webviewPanel, ready: false}};
+                pdfViewRecord[identifier] = {[filePath]:record};
+            }
+            const pendingRefresh = pendingCompiledPdfRefresh[identifier];
+            if (
+                filePath === `${OUTPUT_FOLDER_NAME}/output.pdf` &&
+                pendingRefresh &&
+                compiledPdfBuildRequests.isCurrent(identifier, pendingRefresh.buildGeneration)
+            ) {
+                this.startCompiledPdfRefresh(identifier, record, pendingRefresh);
             }
             const pendingSource = pendingSourceSync[recordKey];
-            const record = pdfViewRecord[identifier][filePath];
             if (
                 pendingSource &&
                 sourceSyncRequests.isCurrent(recordKey, pendingSource.requestGeneration) &&
-                Number.isSafeInteger(record.doc.generation) &&
-                record.doc.generation > 0
+                isPdfGenerationSyncable(record, record.doc.generation)
             ) {
                 delete pendingSourceSync[recordKey];
                 void this.requestSourceSync(pendingSource.source, {
@@ -255,7 +307,7 @@ export class CompileManager {
                 if (
                     sourceSyncRequests.isCurrent(pendingKey, pending.requestGeneration) &&
                     pending.expectedRecord === record &&
-                    record.doc.generation === pending.pdfGeneration &&
+                    isPdfGenerationSyncable(record, pending.pdfGeneration) &&
                     (!pending.isStillApplicable || pending.isStillApplicable())
                 ) {
                     void record.webviewPanel.webview.postMessage({
@@ -271,11 +323,20 @@ export class CompileManager {
             const filePath = pathParts.join('/');
             const record = pdfViewRecord[identifier]?.[filePath];
             if (!record || record.webviewPanel !== webviewPanel) { return; }
+            record.syncableGeneration = undefined;
+            record.doc.invalidateRefresh();
+            const pendingRefresh = pendingCompiledPdfRefresh[identifier];
+            if (pendingRefresh?.refreshRecord === record) {
+                pendingRefresh.capturedSourcePromise = undefined;
+                pendingRefresh.autoSourceGeneration = undefined;
+                pendingRefresh.refreshRecord = undefined;
+            }
             delete pdfViewRecord[identifier][filePath];
             const recordKey = pdfRecordKey(identifier, filePath);
             delete pendingPdfSync[recordKey];
             delete pendingSourceSync[recordKey];
             sourceSyncRequests.invalidate(recordKey);
+            pdfRefreshRequests.invalidate(recordKey);
             if (Object.keys(pdfViewRecord[identifier]).length === 0) {
                 delete pdfViewRecord[identifier];
             }
@@ -415,8 +476,15 @@ export class CompileManager {
         outcome: CompileOutcome,
         compileUri: vscode.Uri,
         isCurrent: () => boolean,
+        pdfTransition: PdfCompileTransition,
         capturedSourcePromise?: Promise<CapturedCompileSourceSync | undefined>,
     ) {
+        if (outcome.successful) {
+            // The VFS installs a successful build identity before this commit
+            // path runs. From here on, the pre-compile PDF cannot be restored
+            // as SyncTeX-compatible even if a later diagnostic read fails.
+            pdfTransition.buildMayHaveChanged = true;
+        }
         let hasDiagnosticError = false;
         if (outcome.outputsUpdated && outcome.hasLog) {
             hasDiagnosticError = await vscode.commands.executeCommand<boolean>(
@@ -436,51 +504,127 @@ export class CompileManager {
             console.warn('Overleaf compile validation problems.', outcome.validationProblems);
         }
 
-        // A failed attempt can update logs, but it must not trigger a PDF reload:
-        // the visible PDF remains the last successful build.
+        const { identifier } = parseUri(compileUri);
+        // A failed attempt leaves the VFS SyncTeX identity on the previous
+        // successful build, so the still-visible PDF can safely be re-enabled.
         if (outcome.successful) {
-            const { identifier } = parseUri(compileUri);
-            await this.refreshCompiledPdf(identifier, capturedSourcePromise, isCurrent);
+            this.scheduleCompiledPdfRefresh(
+                identifier,
+                pdfTransition.buildGeneration,
+                pdfTransition.autoSourceGeneration,
+                capturedSourcePromise,
+            );
+        } else {
+            this.restorePdfSyncability(identifier, pdfTransition);
         }
+    }
+
+    private scheduleCompiledPdfRefresh(
+        identifier: string,
+        buildGeneration: number,
+        autoSourceGeneration: number,
+        capturedSourcePromise: Promise<CapturedCompileSourceSync | undefined> | undefined,
+    ) {
+        if (!compiledPdfBuildRequests.isCurrent(identifier, buildGeneration)) { return; }
+        const pdfPath = `${OUTPUT_FOLDER_NAME}/output.pdf`;
+        const record = pdfViewRecord[identifier]?.[pdfPath];
+        const pendingRefresh: PendingCompiledPdfRefresh = {
+            buildGeneration,
+            // Only a viewer which was already registered when the compile
+            // committed receives the automatic cursor jump. A viewer whose
+            // earlier open read is still pending must first reload this build.
+            capturedSourcePromise: record ? capturedSourcePromise : undefined,
+            autoSourceGeneration: record && capturedSourcePromise ? autoSourceGeneration : undefined,
+        };
+        pendingCompiledPdfRefresh[identifier] = pendingRefresh;
+        if (!record) { return; }
+
+        this.startCompiledPdfRefresh(identifier, record, pendingRefresh);
+    }
+
+    private startCompiledPdfRefresh(
+        identifier: string,
+        record: PdfViewRecord,
+        pendingRefresh: PendingCompiledPdfRefresh,
+    ) {
+        if (
+            pendingCompiledPdfRefresh[identifier] !== pendingRefresh ||
+            !compiledPdfBuildRequests.isCurrent(identifier, pendingRefresh.buildGeneration)
+        ) { return; }
+        pendingRefresh.refreshRecord = record;
+        const pdfPath = `${OUTPUT_FOLDER_NAME}/output.pdf`;
+        const recordKey = pdfRecordKey(identifier, pdfPath);
+        const refreshGeneration = pdfRefreshRequests.begin(recordKey);
+        void this.refreshCompiledPdf(
+            identifier,
+            record,
+            refreshGeneration,
+            pendingRefresh,
+        ).catch(error => {
+            // PDF navigation is auxiliary to compilation. Keep the previous
+            // visible PDF unsyncable, but do not turn a successful build into
+            // a compile failure.
+            if (
+                pendingCompiledPdfRefresh[identifier] === pendingRefresh &&
+                compiledPdfBuildRequests.isCurrent(identifier, pendingRefresh.buildGeneration) &&
+                pdfRefreshRequests.isCurrent(recordKey, refreshGeneration) &&
+                pendingRefresh.refreshRecord === record
+            ) {
+                delete pendingSourceSync[recordKey];
+            }
+            console.warn('Unable to refresh the compiled Overleaf PDF.', error);
+        });
     }
 
     private async refreshCompiledPdf(
         identifier: string,
-        capturedSourcePromise: Promise<CapturedCompileSourceSync | undefined> | undefined,
-        isCurrent: () => boolean,
+        record: PdfViewRecord,
+        refreshGeneration: number,
+        pendingRefresh: PendingCompiledPdfRefresh,
     ) {
         const pdfPath = `${OUTPUT_FOLDER_NAME}/output.pdf`;
-        const record = pdfViewRecord[identifier]?.[pdfPath];
-        if (!record) { return; }
-
         const recordKey = pdfRecordKey(identifier, pdfPath);
-        // The refreshed PDF supersedes every request or result associated with
-        // the previously visible build. Reserve its generation before the
-        // asynchronous refresh so an older SyncTeX result cannot land between
-        // the PDF update and the new request.
-        const requestGeneration = sourceSyncRequests.begin(recordKey);
-        delete pendingPdfSync[recordKey];
-
-        let refreshedPdf: Uint8Array;
-        try {
-            refreshedPdf = await record.doc.refresh();
-        } catch (error) {
-            console.warn('Unable to refresh the compiled Overleaf PDF.', error);
-            return;
-        }
+        const refreshedPdf = await record.doc.refresh();
         // PdfDocument deliberately retains the previous visible PDF when the
         // replacement cannot be downloaded. Never apply the new build's
         // SyncTeX coordinates to that older document.
-        if (refreshedPdf.byteLength === 0) { return; }
+        if (refreshedPdf.byteLength === 0) {
+            if (
+                pendingCompiledPdfRefresh[identifier] === pendingRefresh &&
+                compiledPdfBuildRequests.isCurrent(identifier, pendingRefresh.buildGeneration) &&
+                pdfRefreshRequests.isCurrent(recordKey, refreshGeneration) &&
+                pendingRefresh.refreshRecord === record
+            ) {
+                delete pendingSourceSync[recordKey];
+            }
+            return;
+        }
         const pdfGeneration = record.doc.generation;
 
         if (
-            !isCurrent() ||
+            pendingCompiledPdfRefresh[identifier] !== pendingRefresh ||
+            !compiledPdfBuildRequests.isCurrent(identifier, pendingRefresh.buildGeneration) ||
+            !pdfRefreshRequests.isCurrent(recordKey, refreshGeneration) ||
             pdfViewRecord[identifier]?.[pdfPath] !== record ||
             !Number.isSafeInteger(pdfGeneration) ||
-            pdfGeneration <= 0 ||
-            !sourceSyncRequests.isCurrent(recordKey, requestGeneration) ||
-            !capturedSourcePromise
+            pdfGeneration <= 0
+        ) { return; }
+
+        delete pendingCompiledPdfRefresh[identifier];
+        record.syncableGeneration = pdfGeneration;
+        unsyncablePdfProjects.delete(identifier);
+
+        // A manual request made after the compile began is newer than the
+        // captured compile cursor and takes precedence when the PDF becomes
+        // usable.
+        if (this.resumePendingSourceSync(identifier, record, pdfGeneration)) { return; }
+
+        const capturedSourcePromise = pendingRefresh.capturedSourcePromise;
+        const requestGeneration = pendingRefresh.autoSourceGeneration;
+        if (
+            !capturedSourcePromise ||
+            requestGeneration === undefined ||
+            !sourceSyncRequests.isCurrent(recordKey, requestGeneration)
         ) { return; }
 
         // Source resolution is optional navigation work and must not extend the
@@ -491,7 +635,9 @@ export class CompileManager {
                 !capturedSource ||
                 capturedSource.identifier !== identifier ||
                 pdfViewRecord[identifier]?.[pdfPath] !== record ||
-                record.doc.generation !== pdfGeneration ||
+                !isPdfGenerationSyncable(record, pdfGeneration) ||
+                !compiledPdfBuildRequests.isCurrent(identifier, pendingRefresh.buildGeneration) ||
+                !pdfRefreshRequests.isCurrent(recordKey, refreshGeneration) ||
                 !sourceSyncRequests.isCurrent(recordKey, requestGeneration) ||
                 !this.isCapturedCompileSourceStillApplicable(capturedSource)
             ) { return; }
@@ -508,11 +654,79 @@ export class CompileManager {
         });
     }
 
-    private invalidateSourceSync(identifier: string) {
-        const recordKey = pdfRecordKey(identifier, `${OUTPUT_FOLDER_NAME}/output.pdf`);
+    private invalidateCompiledPdf(identifier: string): PdfCompileTransition {
+        const pdfPath = `${OUTPUT_FOLDER_NAME}/output.pdf`;
+        const recordKey = pdfRecordKey(identifier, pdfPath);
+        const record = pdfViewRecord[identifier]?.[pdfPath];
+        const generation = record?.doc.generation;
+        const transition: PdfCompileTransition = {
+            buildGeneration: compiledPdfBuildRequests.begin(identifier),
+            autoSourceGeneration: sourceSyncRequests.begin(recordKey),
+            previousRecord: record,
+            previousSyncableGeneration: record && isPdfGenerationSyncable(record, generation) ?
+                generation : undefined,
+            buildMayHaveChanged: false,
+        };
+        unsyncablePdfProjects.add(identifier);
+        if (record) {
+            record.syncableGeneration = undefined;
+            record.doc.invalidateRefresh();
+        }
         delete pendingPdfSync[recordKey];
         delete pendingSourceSync[recordKey];
-        sourceSyncRequests.invalidate(recordKey);
+        delete pendingCompiledPdfRefresh[identifier];
+        pdfRefreshRequests.invalidate(recordKey);
+        return transition;
+    }
+
+    private restorePdfSyncability(identifier: string, transition: PdfCompileTransition) {
+        if (
+            transition.buildMayHaveChanged ||
+            !compiledPdfBuildRequests.isCurrent(identifier, transition.buildGeneration)
+        ) { return; }
+        const pdfPath = `${OUTPUT_FOLDER_NAME}/output.pdf`;
+        const record = pdfViewRecord[identifier]?.[pdfPath];
+        if (!record) {
+            unsyncablePdfProjects.delete(identifier);
+            return;
+        }
+
+        let generation: number | undefined;
+        if (record === transition.previousRecord) {
+            if (record.doc.generation !== transition.previousSyncableGeneration) { return; }
+            generation = transition.previousSyncableGeneration;
+        } else {
+            // This document completed its initial read during a run which is
+            // now known not to have changed the VFS build identity.
+            generation = record.doc.generation;
+        }
+        if (!Number.isSafeInteger(generation) || (generation as number) <= 0) { return; }
+        record.syncableGeneration = generation;
+        unsyncablePdfProjects.delete(identifier);
+        this.resumePendingSourceSync(identifier, record, generation as number);
+    }
+
+    private resumePendingSourceSync(
+        identifier: string,
+        record: PdfViewRecord,
+        pdfGeneration: number,
+    ): boolean {
+        const recordKey = pdfRecordKey(identifier, `${OUTPUT_FOLDER_NAME}/output.pdf`);
+        const pendingSource = pendingSourceSync[recordKey];
+        if (
+            !pendingSource ||
+            !sourceSyncRequests.isCurrent(recordKey, pendingSource.requestGeneration)
+        ) { return false; }
+
+        delete pendingSourceSync[recordKey];
+        void this.requestSourceSync(pendingSource.source, {
+            requestGeneration: pendingSource.requestGeneration,
+            expectedRecord: record,
+            expectedPdfGeneration: pdfGeneration,
+        }).catch(error => {
+            console.warn('Unable to forward-sync the opened Overleaf PDF.', error);
+        });
+        return true;
     }
 
     private async saveAllForCompile() {
@@ -578,6 +792,7 @@ export class CompileManager {
 
         await this.compileRunGate.run(async (isCurrent) => {
             let uri: vscode.Uri | undefined;
+            let pdfTransition: PdfCompileTransition | undefined;
             try {
                 uri = await CompileManager.check(requestedUri);
                 if (!isCurrent()) { return; }
@@ -591,7 +806,7 @@ export class CompileManager {
                 // refresh is committed. Invalidate requests from the previous
                 // build at run start so a delayed response cannot be resolved
                 // against the new build and delivered to the old PDF.
-                this.invalidateSourceSync(parseUri(compileUri).identifier);
+                pdfTransition = this.invalidateCompiledPdf(parseUri(compileUri).identifier);
 
                 // On project open, probe the last successful server build before
                 // saveAll. Otherwise the save event is suppressed by this active
@@ -635,6 +850,7 @@ export class CompileManager {
                                 cachedOutcome,
                                 compileUri,
                                 isCurrent,
+                                pdfTransition,
                                 capturedSourcePromise,
                             );
                             return;
@@ -666,12 +882,22 @@ export class CompileManager {
                 this.activeServerCompile = false;
                 if (!isCurrent()) { return; }
                 if (result === undefined) {
+                    this.restorePdfSyncability(parseUri(compileUri).identifier, pdfTransition);
                     await this.update('success', compileUri, isCurrent);
                     return;
                 }
-                await this.commitCompileOutcome(result, compileUri, isCurrent, capturedSourcePromise);
+                await this.commitCompileOutcome(
+                    result,
+                    compileUri,
+                    isCurrent,
+                    pdfTransition,
+                    capturedSourcePromise,
+                );
             } catch (error) {
                 if (!isCurrent()) { return; }
+                if (uri && pdfTransition) {
+                    this.restorePdfSyncability(parseUri(uri).identifier, pdfTransition);
+                }
                 console.error('Compile failed unexpectedly.', error);
                 if (uri) {
                     try {
@@ -720,6 +946,9 @@ export class CompileManager {
         const uri = this.activeCompileUri;
         const vfs = this.activeCompileVfs;
         const shouldStopServerCompile = this.activeServerCompile;
+        if (uri) {
+            this.invalidateCompiledPdf(parseUri(uri).identifier);
+        }
         try {
             if (vfs && shouldStopServerCompile) {
                 await vfs.stopCompile();
@@ -826,7 +1055,7 @@ export class CompileManager {
             (pdfGeneration as number) <= 0 ||
             !sourceSyncRequests.isCurrent(recordKey, guard.requestGeneration) ||
             (guard.expectedRecord && guard.expectedRecord !== record) ||
-            record.doc.generation !== pdfGeneration ||
+            !isPdfGenerationSyncable(record, pdfGeneration) ||
             (guard.isStillApplicable && !guard.isStillApplicable())
         ) { return; }
         if (!record.ready) {
@@ -866,8 +1095,7 @@ export class CompileManager {
             expectedPdfGeneration: guard.expectedPdfGeneration ?? record.doc.generation,
         };
         if (
-            !Number.isSafeInteger(deliveryGuard.expectedPdfGeneration) ||
-            (deliveryGuard.expectedPdfGeneration as number) <= 0
+            !isPdfGenerationSyncable(record, deliveryGuard.expectedPdfGeneration)
         ) { return; }
         // A newly requested cursor location supersedes any older result which
         // was waiting for the PDF viewer to become ready.
@@ -876,14 +1104,14 @@ export class CompileManager {
         if (
             !sourceSyncRequests.isCurrent(recordKey, requestGeneration) ||
             pdfViewRecord[source.identifier]?.[pdfPath] !== deliveryGuard.expectedRecord ||
-            record.doc.generation !== deliveryGuard.expectedPdfGeneration ||
+            !isPdfGenerationSyncable(record, deliveryGuard.expectedPdfGeneration) ||
             (deliveryGuard.isStillApplicable && !deliveryGuard.isStillApplicable())
         ) { return; }
         const vfs = await this.vfsm.prefetch(source.projectUri);
         if (
             !sourceSyncRequests.isCurrent(recordKey, requestGeneration) ||
             pdfViewRecord[source.identifier]?.[pdfPath] !== deliveryGuard.expectedRecord ||
-            record.doc.generation !== deliveryGuard.expectedPdfGeneration ||
+            !isPdfGenerationSyncable(record, deliveryGuard.expectedPdfGeneration) ||
             (deliveryGuard.isStillApplicable && !deliveryGuard.isStillApplicable())
         ) { return; }
         const result = await vfs.syncCode(source.file, source.line, source.column);

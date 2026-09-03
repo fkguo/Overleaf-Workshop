@@ -105,6 +105,26 @@ describe('PdfDocument refresh generations', () => {
         assert.equal(changes, 0);
     });
 
+    it('does not publish a refresh invalidated while its download is pending', async () => {
+        let finishRead!: (content: Uint8Array) => void;
+        readFile = async () => new Promise<Uint8Array>(resolve => {
+            finishRead = resolve;
+        });
+        const doc = new PdfDocument({scheme: 'overleaf-workshop'} as any);
+        let changes = 0;
+        doc.onDidChange(() => { changes += 1; });
+
+        const refreshing = doc.refresh();
+        doc.invalidateRefresh();
+        finishRead(new Uint8Array([7, 8, 9]));
+        const stale = await refreshing;
+
+        assert.equal(stale.byteLength, 0);
+        assert.equal(doc.cache.byteLength, 0);
+        assert.equal(doc.generation, 0);
+        assert.equal(changes, 0);
+    });
+
     it('loads the generation gate before the PDF viewer controller', () => {
         const provider = new PdfViewEditorProvider({extensionUri: {}} as any);
         const webview = {

@@ -183,10 +183,18 @@ function registerPdfViewer(
         actions.push('refresh');
         return new Uint8Array([1]);
     });
+    let refreshRequestGeneration = 0;
     const doc = {
         generation: options.initialGeneration ?? 1,
+        invalidateRefresh: () => {
+            refreshRequestGeneration += 1;
+        },
         refresh: async () => {
+            const requestGeneration = ++refreshRequestGeneration;
             const content = await refresh();
+            if (requestGeneration !== refreshRequestGeneration) {
+                return new Uint8Array();
+            }
             if (content.byteLength > 0) {
                 doc.generation += 1;
             }
@@ -346,7 +354,43 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
         assert.equal(executedCommands.includes('vscode.openWith'), false);
     });
 
-    it('does not refresh or sync after a failed compile', async () => {
+    it('does not let an in-flight PDF refresh block compile or enable manual sync early', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        let finishRefresh!: (content: Uint8Array) => void;
+        const refreshResult = new Promise<Uint8Array>(resolve => {
+            finishRefresh = resolve;
+        });
+        setActiveEditor(fixture.sourceUri);
+        const manager = createManager(createVfs(successfulOutcome(), actions));
+        const viewer = registerPdfViewer(fixture, actions, {
+            refresh: async () => {
+                actions.push('refresh');
+                return refreshResult;
+            },
+        });
+
+        // This must resolve while the PDF download is still pending; otherwise
+        // the refresh occupies CompileRunGate and blocks compile/stop requests.
+        await manager.compile(true, 'command', fixture.compileUri);
+        assert.equal(manager.inCompiling, false);
+        assert.deepEqual(actions, ['refresh']);
+
+        await manager.syncCode();
+        assert.deepEqual(actions, ['refresh']);
+        assert.deepEqual(viewer.messages, []);
+
+        finishRefresh(new Uint8Array([1]));
+        await flushAsync();
+        assert.deepEqual(actions, ['refresh']);
+
+        await manager.syncCode();
+
+        assert.deepEqual(actions, ['refresh', 'sync-request', 'syncCode']);
+        assert.equal((viewer.messages as any[]).at(-1)?.pdfGeneration, 2);
+    });
+
+    it('does not refresh or auto-sync after a failed compile but preserves manual sync', async () => {
         const fixture = projectFixture();
         const actions: string[] = [];
         setActiveEditor(fixture.sourceUri);
@@ -357,6 +401,8 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
         await flushAsync();
 
         assert.deepEqual(actions, []);
+        await manager.syncCode();
+        assert.deepEqual(actions, ['sync-request', 'syncCode']);
     });
 
     it('does not open a viewer when the output PDF is not already open', async () => {
@@ -446,9 +492,73 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
 
         await manager.compile(true, 'command', fixture.compileUri);
         await flushAsync();
+        await manager.syncCode();
 
         assert.deepEqual(actions, ['refresh-failed']);
         assert.deepEqual(viewer.messages, []);
+    });
+
+    it('refreshes a viewer which registers after the successful build before enabling sync', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        let finishOpen!: () => void;
+        const openResult = new Promise<void>(resolve => {
+            finishOpen = resolve;
+        });
+        let finishCurrentBuildRefresh!: (content: Uint8Array) => void;
+        const currentBuildRefresh = new Promise<Uint8Array>(resolve => {
+            finishCurrentBuildRefresh = resolve;
+        });
+        const manager = createManager(createVfs(successfulOutcome(), actions));
+        setActiveEditor(fixture.sourceUri);
+        executeCommand = async command => command === 'vscode.openWith' ? openResult : undefined;
+
+        // Model openCustomDocument having started to load PDF A but not yet
+        // firing pdfWillOpenEvent when compile B commits with no record.
+        const opening = manager.openPdf();
+        await flushAsync();
+        await manager.compile(true, 'command', fixture.compileUri);
+        finishOpen();
+        await opening;
+        const viewer = registerPdfViewer(fixture, actions, {
+            initialGeneration: 1,
+            refresh: async () => {
+                actions.push('refresh-current-build');
+                return currentBuildRefresh;
+            },
+        });
+
+        assert.deepEqual(actions, ['refresh-current-build']);
+        assert.deepEqual(viewer.messages, []);
+
+        finishCurrentBuildRefresh(new Uint8Array([2]));
+        await flushAsync();
+
+        assert.deepEqual(actions, ['refresh-current-build', 'sync-request', 'syncCode']);
+        assert.equal((viewer.messages as any[]).at(-1)?.pdfGeneration, 2);
+    });
+
+    it('does not carry a pending first-open cursor across a failed refresh and viewer reopen', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        const manager = createManager(createVfs(successfulOutcome(), actions));
+
+        await manager.compile(true, 'command', fixture.compileUri);
+        setActiveEditor(fixture.sourceUri, 9, 4);
+        await manager.openPdf();
+        registerPdfViewer(fixture, actions, {
+            refresh: async () => {
+                actions.push('refresh-failed');
+                return new Uint8Array();
+            },
+        });
+        await flushAsync();
+
+        const replacement = registerPdfViewer(fixture, actions);
+        await flushAsync();
+
+        assert.deepEqual(actions, ['refresh-failed', 'refresh']);
+        assert.deepEqual(replacement.messages, []);
     });
 
     it('refreshes the PDF but skips sync for a TeX editor from another project', async () => {
@@ -552,7 +662,9 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
         await compiling;
         await flushAsync();
 
-        assert.deepEqual(actions, ['refresh']);
+        // The replacement performs its own current-build refresh, but the
+        // cursor captured for the disposed viewer is never delivered to it.
+        assert.deepEqual(actions, ['refresh', 'refresh']);
     });
 
     it('does not commit refresh or sync from a cancelled compile run', async () => {
@@ -618,6 +730,42 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
         await newerCompile;
         await flushAsync();
         assert.deepEqual(actions, ['refresh', 'sync-request']);
+    });
+
+    it('starts a newer compile while an older PDF download is pending and keeps the old PDF blocked', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        let finishOldRefresh!: (content: Uint8Array) => void;
+        const oldRefresh = new Promise<Uint8Array>(resolve => {
+            finishOldRefresh = resolve;
+        });
+        let compileCount = 0;
+        const vfs = createVfs(successfulOutcome(), actions);
+        vfs.compile = async () => {
+            compileCount += 1;
+            return compileCount === 1 ? successfulOutcome() : failedOutcome();
+        };
+        const manager = createManager(vfs);
+        const viewer = registerPdfViewer(fixture, actions, {
+            refresh: async () => {
+                actions.push('old-refresh');
+                return oldRefresh;
+            },
+        });
+
+        await manager.compile(true, 'command', fixture.compileUri);
+        assert.equal(manager.inCompiling, false);
+        await manager.compile(true, 'command', fixture.compileUri);
+        assert.equal(compileCount, 2);
+
+        finishOldRefresh(new Uint8Array([1]));
+        await flushAsync();
+        setActiveEditor(fixture.sourceUri);
+        await manager.syncCode();
+
+        assert.deepEqual(actions, ['old-refresh']);
+        assert.deepEqual(viewer.messages, []);
+        assert.equal(viewer.doc.generation, 1);
     });
 
     it('keeps a successful compile successful when SyncTeX is unavailable', async () => {

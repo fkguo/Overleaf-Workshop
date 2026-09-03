@@ -6,6 +6,7 @@ import { GlobalStateManager } from '../utils/globalStateManager';
 export class PdfDocument implements vscode.CustomDocument {
     cache: Uint8Array = new Uint8Array(0);
     private _generation = 0;
+    private refreshRequestGeneration = 0;
 
     private readonly _onDidChange = new vscode.EventEmitter<{content: Uint8Array, generation: number}>();
     readonly onDidChange = this._onDidChange.event;
@@ -17,15 +18,25 @@ export class PdfDocument implements vscode.CustomDocument {
         this.uri = uri;
     }
 
-    dispose() { }
+    dispose() {
+        this.invalidateRefresh();
+    }
 
     get generation() {
         return this._generation;
     }
 
+    invalidateRefresh() {
+        this.refreshRequestGeneration += 1;
+    }
+
     async refresh(): Promise<Uint8Array> {
+        const requestGeneration = ++this.refreshRequestGeneration;
         try {
             const content = new Uint8Array(await vscode.workspace.fs.readFile(this.uri));
+            if (requestGeneration !== this.refreshRequestGeneration) {
+                return new Uint8Array();
+            }
             if (content.byteLength === 0) {
                 return content;
             }
