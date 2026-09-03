@@ -1,5 +1,9 @@
 import { strict as assert } from 'assert';
-import { parseProjectUri, projectConnectionKey } from '../core/projectUri';
+import {
+    parseProjectUri,
+    projectConnectionKey,
+    resolveAuthenticatedProjectUserId,
+} from '../core/projectUri';
 
 describe('Overleaf project URI normalization', () => {
     const userId = '5b0bdb5c20985d217909e663';
@@ -40,6 +44,18 @@ describe('Overleaf project URI normalization', () => {
         assert.throws(
             () => parseProjectUri('www.overleaf.com', '/Xb', 'user=only-user'),
             /missing user or project/,
+        );
+    });
+
+    it('accepts only the current authenticated user for a restored workspace URI', () => {
+        assert.equal(resolveAuthenticatedProjectUserId(userId, userId), userId);
+        assert.throws(
+            () => resolveAuthenticatedProjectUserId(userId, 'different-user'),
+            /does not match the current authenticated account/,
+        );
+        assert.throws(
+            () => resolveAuthenticatedProjectUserId(userId, undefined),
+            /does not match the current authenticated account/,
         );
     });
 });

@@ -7,6 +7,17 @@ export interface ProjectUriComponents {
     pathParts: string[];
 }
 
+export function resolveAuthenticatedProjectUserId(
+    workspaceUserId: string,
+    authenticatedUserId: unknown,
+): string {
+    if (typeof authenticatedUserId !== 'string' || authenticatedUserId.length === 0
+        || authenticatedUserId !== workspaceUserId) {
+        throw new Error('The Overleaf workspace identity does not match the current authenticated account');
+    }
+    return authenticatedUserId;
+}
+
 function parseProjectQuery(rawQuery: string): URLSearchParams {
     let candidate = rawQuery;
     // VS Code normally exposes a decoded Uri.query, while some Cursor history

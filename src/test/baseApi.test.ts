@@ -1,5 +1,5 @@
 import { strict as assert } from 'assert';
-import { BaseAPI } from '../api/base';
+import { BaseAPI, parseChangesUsersResponse } from '../api/base';
 
 class CapturingAPI extends BaseAPI {
     route = '';
@@ -109,4 +109,33 @@ describe('BaseAPI route construction', () => {
             );
         });
     }
+
+    it('uses the official project comment-thread endpoint', async () => {
+        const api = new CapturingAPI('https://www.overleaf.com/');
+        await api.getCommentThreads(identity, 'project');
+
+        assert.equal(api.route, 'project/project/threads');
+    });
+
+    it('uses the official Track Changes author-directory endpoint', async () => {
+        const api = new CapturingAPI('https://www.overleaf.com/');
+        await api.getChangesUsers(identity, 'project');
+
+        assert.equal(api.route, 'project/project/changes/users');
+    });
+
+    it('validates Track Changes users without dropping future fields', () => {
+        const raw = [{
+            id: 'former-member',
+            email: 'former@example.test',
+            ['first_name']: 'Former',
+            future: {role: 'opaque'},
+        }];
+        assert.strictEqual(parseChangesUsersResponse(raw), raw);
+        assert.throws(() => parseChangesUsersResponse({}), /must be an array/);
+        assert.throws(
+            () => parseChangesUsersResponse([{id: 'user', email: 4}]),
+            /email must be a string/,
+        );
+    });
 });

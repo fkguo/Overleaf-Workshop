@@ -163,6 +163,11 @@ export class GlobalStateManager {
                 Promise.reject();
     }
 
+    static getAuthenticatedUserId(context:vscode.ExtensionContext, name:string): string | undefined {
+        const persists = context.globalState.get<ServerPersistMap>(keyServerPersists, {});
+        return persists[name]?.login?.userId;
+    }
+
     static initSocketIOAPI(context:vscode.ExtensionContext, name:string, projectId:string) {
         const persists = context.globalState.get<ServerPersistMap>(keyServerPersists, {});
         const server   = persists[name];

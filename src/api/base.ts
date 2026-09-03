@@ -129,6 +129,39 @@ export interface MemberEntity {
     signUpDate?: string,
 }
 
+/** Official Review Panel author-directory entry. Unknown JSON fields are kept. */
+export interface ChangesUserSchema {
+    id: string,
+    email: string,
+    first_name?: string,
+    last_name?: string,
+    [key: string]: unknown,
+}
+
+export function parseChangesUsersResponse(input: unknown): ChangesUserSchema[] {
+    if (!Array.isArray(input)) {
+        throw new Error('Track Changes users response must be an array');
+    }
+    for (const [index, item] of input.entries()) {
+        if (typeof item !== 'object' || item === null || Array.isArray(item)) {
+            throw new Error(`Track Changes user ${index} must be an object`);
+        }
+        const user = item as Record<string, unknown>;
+        if (typeof user.id !== 'string' || user.id.length === 0) {
+            throw new Error(`Track Changes user ${index}.id must be a non-empty string`);
+        }
+        if (typeof user.email !== 'string') {
+            throw new Error(`Track Changes user ${index}.email must be a string`);
+        }
+        for (const name of ['first_name', 'last_name'] as const) {
+            if (user[name] !== undefined && typeof user[name] !== 'string') {
+                throw new Error(`Track Changes user ${index}.${name} must be a string`);
+            }
+        }
+    }
+    return input as ChangesUserSchema[];
+}
+
 export interface MetadataResponseScheme {
     projectId: string,
     projectMeta: {
@@ -256,6 +289,8 @@ export interface ResponseSchema {
     diff?: ProjectFileDiffResponseSchema;
     treeDiff?: ProjectFileTreeDiffResponseSchema;
     messages?: ProjectMessageResponseSchema[];
+    commentThreads?: unknown;
+    changesUsers?: ChangesUserSchema[];
     settings?: ProjectSettingsSchema;
 }
 
@@ -982,6 +1017,20 @@ export class BaseAPI {
             const messages = JSON.parse(res!) as ProjectMessageResponseSchema[];
             return {messages};
         }, {'X-Csrf-Token': identity.csrfToken});
+    }
+
+    async getCommentThreads(identity:Identity, projectId:string): Promise<ResponseSchema> {
+        this.setIdentity(identity);
+        return this.request('GET', `project/${projectId}/threads`, undefined, (res) => ({
+            commentThreads: JSON.parse(res!),
+        }));
+    }
+
+    async getChangesUsers(identity:Identity, projectId:string): Promise<ResponseSchema> {
+        this.setIdentity(identity);
+        return this.request('GET', `project/${projectId}/changes/users`, undefined, (res) => ({
+            changesUsers: parseChangesUsersResponse(JSON.parse(res!)),
+        }));
     }
 
     async sendMessage(identity:Identity, projectId:string, client_id:string, content:string) {

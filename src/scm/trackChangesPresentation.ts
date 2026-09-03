@@ -141,6 +141,11 @@ export type HistoryOtCommentThreadDirectory =
 export interface HistoryOtPresentationOptions {
     readonly members?: HistoryOtMemberDirectory,
     readonly commentThreads?: HistoryOtCommentThreadDirectory,
+    /**
+     * Raw `joinDoc.ranges` compatibility projection. Official clients retain
+     * this beside, rather than merge it into, the History OT snapshot.
+     */
+    readonly compatibilityRanges?: JsonObject,
 }
 
 /**
@@ -153,6 +158,8 @@ export interface RealtimeHistoryOtPresentationModel {
     readonly visibleText: string,
     readonly trackedChanges: readonly HistoryOtTrackedChangeDescriptor[],
     readonly comments: readonly HistoryOtCommentAnchorDescriptor[],
+    /** Lossless, distinct copy of the raw `joinDoc.ranges` projection. */
+    readonly compatibilityRanges?: JsonObject,
 }
 
 interface Utf16Line {
@@ -354,7 +361,19 @@ function resolveAuthor(
 }
 
 function stableComponent(value: string): string {
-    return encodeURIComponent(value);
+    try {
+        return encodeURIComponent(value);
+    } catch {
+        // encodeURIComponent throws on lone surrogate code units, although the
+        // protocol deliberately preserves opaque string ids. Encode fixed-width
+        // UTF-16 units behind a prefix that a literal percent sign cannot collide
+        // with after normal URI encoding.
+        let encoded = '%u';
+        for (let index = 0; index < value.length; index += 1) {
+            encoded += value.charCodeAt(index).toString(16).padStart(4, '0');
+        }
+        return encoded;
+    }
 }
 
 function trackedChangeStableId(
@@ -512,5 +531,8 @@ export function buildRealtimeHistoryOtPresentation(
         comments: describeComments(
             snapshot, snapshotIndex, visibleIndex, options.commentThreads,
         ),
+        ...(options.compatibilityRanges !== undefined ? {
+            compatibilityRanges: deepCloneJson(options.compatibilityRanges) as JsonObject,
+        } : {}),
     };
 }

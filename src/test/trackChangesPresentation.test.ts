@@ -396,6 +396,38 @@ describe('realtime History OT presentation', () => {
         assert.equal(threads['c-hidden'], opaqueThread);
     });
 
+    it('keeps joinDoc ranges as a distinct lossless compatibility projection', () => {
+        const compatibilityRanges = {
+            changes: [{id: 'legacy-change', future: {side: 'left'}}],
+            comments: [{id: 'legacy-comment', ranges: [{from: 1, to: 2}]}],
+            futureTopLevel: {keep: [true, null, 7]},
+        };
+        const expected = JSON.parse(JSON.stringify(compatibilityRanges));
+        const model = buildRealtimeHistoryOtPresentation(
+            {content: 'abc'},
+            {compatibilityRanges},
+        );
+
+        assert.deepEqual(model.compatibilityRanges, expected);
+        assert.notEqual(model.compatibilityRanges, compatibilityRanges);
+        compatibilityRanges.changes[0].future.side = 'right';
+        compatibilityRanges.comments[0].ranges[0].from = 99;
+        assert.deepEqual(model.compatibilityRanges, expected);
+        assert.equal(model.trackedChanges.length, 0);
+        assert.equal(model.comments.length, 0);
+    });
+
+    it('builds stable descriptors for opaque ids containing lone surrogates', () => {
+        const model = buildRealtimeHistoryOtPresentation(
+            parseHistoryOtSnapshot({
+                content: 'a',
+                comments: [{id: '\uD800', ranges: [{pos: 0, length: 1}]}],
+            }),
+            {},
+        );
+        assert.equal(model.comments[0].stableId, 'history-ot-comment:%ud800');
+    });
+
     it('fails closed for malformed or unsafe snapshots', () => {
         const malformed = {
             content: 'abc',

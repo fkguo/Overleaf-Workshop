@@ -494,6 +494,10 @@ describe('History-OT tracked edits and visible offsets', () => {
             () => buildHistoryOtTextUpdate(existing, [{pos: 1, insertText: '😀'}]),
             /does not support inserted non-BMP/,
         );
+        assert.throws(
+            () => buildHistoryOtTextUpdate(existing, [{pos: 1, insertText: '\uDE00'}]),
+            /does not support inserted non-BMP/,
+        );
     });
 
     it('builds accept and reject operations for exact selected tracked ranges', () => {

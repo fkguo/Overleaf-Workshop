@@ -35,6 +35,8 @@ export interface ParsedHistoryOtRealtimeEnvelope {
     readonly operation?: ParsedHistoryOtWireOperation,
     readonly meta?: JsonObject,
     readonly source?: JsonValue,
+    readonly origin?: JsonObject,
+    readonly updateType?: 'external',
     readonly user?: JsonValue,
     readonly time?: JsonValue,
     readonly trackChangesSeed?: JsonValue,
@@ -51,6 +53,7 @@ export interface ParsedHistoryOtJoinState {
     readonly unsafeReasons: readonly string[],
     readonly version?: number,
     readonly snapshot?: ParsedHistoryOtSnapshot,
+    readonly ranges?: JsonObject,
 }
 
 export class HistoryOtSessionError extends Error {
@@ -61,6 +64,42 @@ export class HistoryOtSessionError extends Error {
     ) {
         super(message);
         this.name = 'HistoryOtSessionError';
+    }
+}
+
+/**
+ * Reconcile the enqueue RPC with the authoritative realtime commit witness.
+ * The RPC only proves that the update reached the queue; a matching
+ * otUpdateApplied event proves that it committed. An outcome-unknown enqueue
+ * failure therefore remains recoverable when the commit witness arrives,
+ * while a deterministic rejection always wins.
+ */
+export async function awaitHistoryOtSubmissionCommit(
+    enqueue: Promise<void>,
+    commit: Promise<void>,
+    markQueueAccepted: () => void,
+    isOutcomeUnknown: (error: unknown) => boolean,
+): Promise<void> {
+    const commitWitness = commit.then(
+        () => ({committed: true as const}),
+        error => ({committed: false as const, error}),
+    );
+    try {
+        await enqueue;
+    } catch (error) {
+        if (!isOutcomeUnknown(error)) {
+            throw error;
+        }
+        const result = await commitWitness;
+        if (result.committed) {
+            return;
+        }
+        throw error;
+    }
+    markQueueAccepted();
+    const result = await commitWitness;
+    if (!result.committed) {
+        throw result.error;
     }
 }
 
@@ -87,6 +126,8 @@ export function parseHistoryOtRealtimeEnvelope(input: unknown): ParsedHistoryOtR
     let operation: ParsedHistoryOtWireOperation | undefined;
     let meta: JsonObject | undefined;
     let source: JsonValue | undefined;
+    let origin: JsonObject | undefined;
+    let updateType: 'external' | undefined;
     let user: JsonValue | undefined;
     let time: JsonValue | undefined;
     let trackChangesSeed: JsonValue | undefined;
@@ -125,18 +166,45 @@ export function parseHistoryOtRealtimeEnvelope(input: unknown): ParsedHistoryOtR
                 reasons.push('$.meta must be an object when present');
             } else {
                 meta = cloneObject(raw.meta);
-                for (const key of unknownKeys(raw.meta, ['source', 'user_id', 'ts', 'tc'])) {
+                for (const key of unknownKeys(
+                    raw.meta,
+                    ['source', 'origin', 'type', 'user_id', 'ts', 'tc'],
+                )) {
                     reasons.push(`$.meta.${key} is unknown metadata`);
                 }
                 source = raw.meta.source;
+                if (hasOwn(raw.meta, 'source')
+                    && (typeof source !== 'string' || source.length === 0)) {
+                    reasons.push('$.meta.source must be a non-empty string when present');
+                }
+                if (hasOwn(raw.meta, 'origin')) {
+                    if (!isJsonObject(raw.meta.origin)) {
+                        reasons.push('$.meta.origin must be a JSON object when present');
+                    } else {
+                        origin = cloneObject(raw.meta.origin);
+                    }
+                }
+                if (hasOwn(raw.meta, 'type')) {
+                    if (raw.meta.type !== 'external') {
+                        reasons.push('$.meta.type must be external when present');
+                    } else {
+                        updateType = 'external';
+                    }
+                }
                 user = raw.meta.user_id;
                 time = raw.meta.ts;
                 trackChangesSeed = raw.meta.tc;
             }
         }
-        if (classification === 'collaborator-update'
-            && (typeof source !== 'string' || source.length === 0)) {
-            reasons.push('$.meta.source must be a non-empty string on a full update');
+        if (classification === 'collaborator-update') {
+            const hasValidSource = typeof source === 'string' && source.length > 0;
+            const hasValidOrigin = origin !== undefined;
+            if (!hasValidSource && !hasValidOrigin) {
+                reasons.push('$.meta must carry a non-empty source or JSON-object origin on a full update');
+            }
+            if (hasValidSource && hasValidOrigin) {
+                reasons.push('$.meta.source and $.meta.origin are mutually exclusive');
+            }
         }
         if (hasOwn(raw, 'dupIfSource')) {
             if (!Array.isArray(raw.dupIfSource)) {
@@ -192,6 +260,8 @@ export function parseHistoryOtRealtimeEnvelope(input: unknown): ParsedHistoryOtR
         operation,
         meta,
         source,
+        origin,
+        updateType,
         user,
         time,
         trackChangesSeed,
@@ -228,6 +298,7 @@ export function parseHistoryOtJoinState(input: unknown): ParsedHistoryOtJoinStat
     const reasons: string[] = [];
     let version: number | undefined;
     let snapshot: ParsedHistoryOtSnapshot | undefined;
+    let ranges: JsonObject | undefined;
     if (!isJsonObject(raw)) {
         reasons.push('$ must be a History OT join object');
     } else {
@@ -251,8 +322,10 @@ export function parseHistoryOtJoinState(input: unknown): ParsedHistoryOtJoinStat
         if (!Array.isArray(raw.operations) || raw.operations.length !== 0) {
             reasons.push('$.operations must be an empty array for an authoritative full join');
         }
-        if (!isJsonObject(raw.ranges) || Object.keys(raw.ranges).length !== 0) {
-            reasons.push('$.ranges must be an empty object for History OT snapshot authority');
+        if (!isJsonObject(raw.ranges)) {
+            reasons.push('$.ranges must be a JSON object');
+        } else {
+            ranges = cloneObject(raw.ranges);
         }
     }
     return {
@@ -262,6 +335,7 @@ export function parseHistoryOtJoinState(input: unknown): ParsedHistoryOtJoinStat
         unsafeReasons: reasons,
         version,
         snapshot,
+        ranges,
     };
 }
 
@@ -286,6 +360,10 @@ export type HistoryOtWriteIntent =
         readonly decision: 'accept' | 'reject',
         readonly selectedRanges: readonly HistoryOtRange[],
     }
+    /**
+     * Reserved fail-closed marker. A future adapter must split comment add,
+     * state, and delete capabilities and prove authoritative thread ownership.
+     */
     | {readonly kind: 'comment-write'};
 
 export interface HistoryOtStageRequest {
@@ -310,9 +388,11 @@ export interface HistoryOtSessionView {
     readonly userId?: string,
     readonly version?: number,
     readonly snapshot?: JsonValue,
+    readonly ranges?: JsonObject,
     readonly hasPendingOperation: boolean,
     readonly pendingBaseVersion?: number,
     readonly pendingQueued: boolean,
+    readonly pendingRecoveryBlockedReason?: string,
     readonly rejoinReason?: string,
 }
 
@@ -343,11 +423,13 @@ export interface HistoryOtSessionResult {
 interface PendingUpdate {
     originalEnvelope: JsonObject,
     originalOperation: JsonValue,
+    authorizedEnvelope: JsonValue,
     baseVersion: number,
     intent: HistoryOtWriteIntent,
     publicIds: string[],
     queued: boolean,
     recoveryJoinVersion?: number,
+    recoveryBlockedReason?: string,
 }
 
 function normalizePermission(context: HistoryOtPermissionContext): {
@@ -455,6 +537,7 @@ export class HistoryOtSession {
     private userId?: string;
     private version?: number;
     private snapshot?: ParsedHistoryOtSnapshot;
+    private ranges?: JsonObject;
     private pending?: PendingUpdate;
     private rejoinReason?: string;
     private lastCommittedBaseVersion?: number;
@@ -468,7 +551,8 @@ export class HistoryOtSession {
             throw new HistoryOtSessionError('INVALID_SESSION', 'Document id and generation must be valid');
         }
         const normalized = normalizePermission(permission);
-        this.permission = normalized.level;
+        this.permission = normalized.level === 'readOnly' || normalized.userId !== undefined
+            ? normalized.level : undefined;
         this.userId = normalized.userId;
     }
 
@@ -485,9 +569,13 @@ export class HistoryOtSession {
             snapshot: authoritative && this.snapshot !== undefined
                 ? serializeHistoryOtSnapshot(this.snapshot)
                 : undefined,
+            ranges: authoritative && this.ranges !== undefined
+                ? cloneObject(this.ranges)
+                : undefined,
             hasPendingOperation: this.pending !== undefined,
             pendingBaseVersion: this.pending?.baseVersion,
             pendingQueued: this.pending?.queued ?? false,
+            pendingRecoveryBlockedReason: this.pending?.recoveryBlockedReason,
             rejoinReason: this.rejoinReason,
         };
     }
@@ -539,18 +627,32 @@ export class HistoryOtSession {
             return generationResult;
         }
         const normalized = normalizePermission(context);
-        if (normalized.level === undefined) {
+        const writableIdentityMissing = normalized.level !== undefined
+            && normalized.level !== 'readOnly'
+            && normalized.userId === undefined;
+        if (normalized.level === undefined || writableIdentityMissing) {
             this.permission = undefined;
             this.userId = undefined;
-            return this.requireRejoin('permission-uncertain');
+            if (this.pending !== undefined) {
+                this.pending.recoveryBlockedReason = writableIdentityMissing
+                    ? 'identity-changed-with-pending-operation'
+                    : 'permission-uncertain-with-pending-operation';
+            }
+            return this.requireRejoin(writableIdentityMissing
+                ? (this.pending === undefined
+                    ? 'identity-uncertain'
+                    : 'identity-changed-with-pending-operation')
+                : 'permission-uncertain');
         }
         const identityChanged = this.userId !== normalized.userId;
         this.permission = normalized.level;
         this.userId = normalized.userId;
         if (this.pending !== undefined && identityChanged) {
+            this.pending.recoveryBlockedReason = 'identity-changed-with-pending-operation';
             return this.requireRejoin('identity-changed-with-pending-operation');
         }
         if (this.pending !== undefined && !this.permissionAllows(this.pending.intent)) {
+            this.pending.recoveryBlockedReason = 'permission-changed-with-pending-operation';
             return this.requireRejoin('permission-changed-with-pending-operation');
         }
         return this.result('permission-updated');
@@ -570,17 +672,26 @@ export class HistoryOtSession {
         }
         this.version = join.version;
         this.snapshot = join.snapshot;
-        this.rejoinReason = undefined;
+        this.ranges = join.ranges;
         if (this.pending === undefined) {
             this.phase = 'ready';
+            this.rejoinReason = undefined;
+        } else if (this.pending.recoveryBlockedReason !== undefined) {
+            this.pending.recoveryJoinVersion = join.version;
+            this.phase = 'rejoin-required';
+            this.rejoinReason = this.pending.recoveryBlockedReason;
         } else {
             this.pending.recoveryJoinVersion = join.version;
             this.phase = 'recovery-ready';
+            this.rejoinReason = undefined;
         }
         return this.result('joined');
     }
 
     private permissionAllows(intent: HistoryOtWriteIntent): boolean {
+        if (intent.kind === 'comment-write' || this.userId === undefined) {
+            return false;
+        }
         if (this.permission === 'owner' || this.permission === 'readAndWrite') {
             return true;
         }
@@ -595,18 +706,19 @@ export class HistoryOtSession {
         meta: JsonObject,
         intent: HistoryOtWriteIntent,
     ): void {
+        if (intent.kind === 'comment-write' || isCommentOperation(operation)) {
+            throw new HistoryOtSessionError(
+                'UNSUPPORTED_COMMENT_WRITE',
+                'Comment mutation is disabled until add/state/delete capabilities and '
+                    + 'authoritative thread ownership are separately proven',
+            );
+        }
         if (!this.permissionAllows(intent)) {
             throw new HistoryOtSessionError('PERMISSION_DENIED', 'Permission does not allow this write intent');
         }
         if (intent.kind === 'plain-write') {
             if (hasTrackingDirective(operation) || hasOwn(meta, 'tc')) {
                 throw new HistoryOtSessionError('INTENT_MISMATCH', 'Plain writes cannot carry tracking data');
-            }
-            return;
-        }
-        if (intent.kind === 'comment-write') {
-            if (!isCommentOperation(operation) || hasOwn(meta, 'tc')) {
-                throw new HistoryOtSessionError('INTENT_MISMATCH', 'Comment intent requires one comment operation');
             }
             return;
         }
@@ -660,6 +772,13 @@ export class HistoryOtSession {
             this.requireRejoin('permission-uncertain');
             throw new HistoryOtSessionError('PERMISSION_UNCERTAIN', 'Permission is unknown');
         }
+        if (this.userId === undefined) {
+            this.requireRejoin('identity-uncertain');
+            throw new HistoryOtSessionError(
+                'IDENTITY_UNCERTAIN',
+                'A proven authenticated user identity is required for History OT writes',
+            );
+        }
         if (typeof request.publicId !== 'string' || request.publicId.length === 0) {
             throw new HistoryOtSessionError('INVALID_SOURCE', 'publicId must be a non-empty string');
         }
@@ -681,7 +800,8 @@ export class HistoryOtSession {
             throw new HistoryOtSessionError('SOURCE_MISMATCH', 'meta.source does not match publicId');
         }
         metaRaw.source = request.publicId;
-        this.assertIntent(operation, operationRaw, metaRaw, request.intent);
+        const intent = deepCloneJson(request.intent) as HistoryOtWriteIntent;
+        this.assertIntent(operation, operationRaw, metaRaw, intent);
         try {
             applyHistoryOtOperations(this.snapshot, parseHistoryOtOperations(operationRaw));
         } catch (error) {
@@ -704,8 +824,9 @@ export class HistoryOtSession {
         this.pending = {
             originalEnvelope: cloneObject(raw),
             originalOperation: deepCloneJson(operationRaw),
+            authorizedEnvelope: deepCloneJson(raw),
             baseVersion: this.version,
-            intent: request.intent,
+            intent,
             publicIds: [request.publicId],
             queued: false,
         };
@@ -733,6 +854,7 @@ export class HistoryOtSession {
         this.phase = 'joining';
         this.version = undefined;
         this.snapshot = undefined;
+        this.ranges = undefined;
         this.rejoinReason = undefined;
         if (this.pending !== undefined) {
             this.pending.queued = false;
@@ -745,6 +867,13 @@ export class HistoryOtSession {
         const generationResult = this.checkGeneration(eventGeneration);
         if (generationResult !== undefined) {
             return generationResult;
+        }
+        if (this.pending?.recoveryBlockedReason !== undefined) {
+            throw new HistoryOtSessionError(
+                'RECOVERY_BLOCKED',
+                `Pending History OT recovery is blocked: ${this.pending.recoveryBlockedReason}`,
+                [this.pending.recoveryBlockedReason],
+            );
         }
         if (this.phase !== 'recovery-ready' || this.pending === undefined) {
             throw new HistoryOtSessionError('RECOVERY_NOT_READY', 'Recovery requires an authoritative rejoin');
@@ -765,10 +894,49 @@ export class HistoryOtSession {
         recovery.meta = meta;
         const parsed = parseHistoryOtRealtimeEnvelope(recovery);
         assertHistoryOtRealtimeEnvelopeSafe(parsed);
+        this.pending.authorizedEnvelope = deepCloneJson(recovery);
         this.pending.publicIds.push(publicId);
         this.pending.queued = false;
         this.phase = 'pending';
         return this.result('recovery-staged', false, recovery);
+    }
+
+    /**
+     * Bind the transport submission to the exact envelope and intent that passed
+     * this session's permission, author, snapshot, and applicability gates.
+     */
+    assertPendingSubmission(
+        eventGeneration: number,
+        envelope: unknown,
+        intent: HistoryOtWriteIntent,
+    ): JsonValue {
+        const generationResult = this.checkGeneration(eventGeneration);
+        if (generationResult !== undefined) {
+            throw new HistoryOtSessionError(
+                'STALE_SUBMISSION',
+                generationResult.reason ?? 'History OT submission belongs to a stale generation',
+            );
+        }
+        if (this.phase !== 'pending' || this.pending === undefined) {
+            throw new HistoryOtSessionError(
+                'NO_AUTHORIZED_SUBMISSION',
+                'History OT transport submission requires one staged pending operation',
+            );
+        }
+        const rawEnvelope = deepCloneJson(envelope);
+        const rawIntent = deepCloneJson(intent);
+        const authorizedIntent = deepCloneJson(this.pending.intent);
+        if (!jsonEqual(rawEnvelope, this.pending.authorizedEnvelope)
+            || !jsonEqual(rawIntent, authorizedIntent)) {
+            throw new HistoryOtSessionError(
+                'UNAUTHORIZED_SUBMISSION',
+                'History OT transport submission does not match the staged envelope and intent',
+            );
+        }
+        // Transport must emit this private snapshot, never the caller-owned
+        // object which was compared above. This closes the validation-to-emit
+        // mutation window without exposing the session's stored recovery copy.
+        return deepCloneJson(this.pending.authorizedEnvelope);
     }
 
     receiveApplied(eventGeneration: number, input: unknown): HistoryOtSessionResult {
@@ -800,6 +968,9 @@ export class HistoryOtSession {
             && typeof update.source === 'string'
             && this.pending.publicIds.includes(update.source)
             && jsonEqual(operationRaw, this.pending.originalOperation)) {
+            if (update.version !== this.pending.baseVersion) {
+                return this.requireRejoin('sender-full-update-version-mismatch');
+            }
             this.lastCommittedBaseVersion = update.version;
             this.pending = undefined;
             return this.senderCommitted('sender-full-update-committed');
@@ -838,6 +1009,9 @@ export class HistoryOtSession {
                 return this.result('duplicate-ignored');
             }
             return this.requireRejoin('unmatched-duplicate-acknowledgement');
+        }
+        if (update.version !== this.pending.baseVersion) {
+            return this.requireRejoin('duplicate-acknowledgement-version-mismatch');
         }
         const sourceMatches = typeof update.source === 'string'
             && this.pending.publicIds.includes(update.source);

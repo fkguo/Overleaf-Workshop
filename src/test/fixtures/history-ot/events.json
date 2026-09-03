@@ -31,7 +31,10 @@
         "snapshot": {"content": "alpha\r\nβ"},
         "version": 42,
         "operations": [],
-        "ranges": {},
+        "ranges": {
+          "mock": "ranges",
+          "comments": [{"id": "comment-fixture", "opaque": {"author": "user-fixture"}}]
+        },
         "otType": "history-ot"
       }
     },
@@ -112,6 +115,70 @@
         "meta": {"source": "source-fixture"}
       },
       "expectedCollaboratorDeliveryCount": 0
+    },
+    {
+      "id": "external-source-update",
+      "coverage": ["external-metadata", "source-provenance"],
+      "provenance": [
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "services/document-updater/app/js/DocumentManager.js",
+          "lineStart": 215,
+          "lineEnd": 231,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/document-updater/app/js/DocumentManager.js#L215-L231"
+        }
+      ],
+      "event": "otUpdateApplied",
+      "payload": {
+        "doc": "doc-fixture",
+        "v": 42,
+        "op": [{"textOperation": [4, " external", 9]}],
+        "meta": {
+          "type": "external",
+          "source": "system-source-fixture",
+          "user_id": null,
+          "ts": 1770000000000
+        }
+      },
+      "expectedClassification": "collaborator-update"
+    },
+    {
+      "id": "system-origin-update-without-source",
+      "coverage": ["origin-metadata", "source-less-system-update"],
+      "provenance": [
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "services/document-updater/app/js/Utils.js",
+          "lineStart": 104,
+          "lineEnd": 118,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/document-updater/app/js/Utils.js#L104-L118"
+        },
+        {
+          "repository": "https://github.com/overleaf/overleaf",
+          "commit": "28ad3b03b71cb4311decdcb55c36b33ec10d72db",
+          "path": "services/document-updater/app/js/DocumentManager.js",
+          "lineStart": 215,
+          "lineEnd": 231,
+          "url": "https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/document-updater/app/js/DocumentManager.js#L215-L231"
+        }
+      ],
+      "event": "otUpdateApplied",
+      "payload": {
+        "doc": "doc-fixture",
+        "v": 42,
+        "op": [{"textOperation": [4, " system", 9]}],
+        "meta": {
+          "origin": {
+            "kind": "history-resync",
+            "provider": {"name": "system", "opaqueToken": 42}
+          },
+          "user_id": null,
+          "ts": 1770000000000
+        }
+      },
+      "expectedClassification": "collaborator-update"
     }
   ]
 }

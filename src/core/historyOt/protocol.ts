@@ -333,7 +333,11 @@ function validateCommentIds(value: JsonValue | undefined, path: string, reasons:
 }
 
 export function containsUnsupportedHistoryOtInsertion(value: string): boolean {
-    return /[\uD800-\uDBFF]/.test(value);
+    // History OT cannot safely accept newly inserted surrogate code units.
+    // A valid non-BMP character contains a high surrogate, while a lone low
+    // surrogate can be produced when a diff splits two code points that share
+    // the same high surrogate. Reject both halves on generated/wire inserts.
+    return /[\uD800-\uDFFF]/.test(value);
 }
 
 function validateScanOperation(value: JsonValue, path: string, reasons: string[]): void {
