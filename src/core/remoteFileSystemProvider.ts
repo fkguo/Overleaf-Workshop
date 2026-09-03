@@ -26,6 +26,7 @@ import {
     TextOperation,
 } from './documentUpdate';
 import {
+    applyUtf16TextOperations,
     beginLocalEditorSubmission,
     commitRemoteEditorTransaction,
     confirmLocalEditorSubmission,
@@ -200,6 +201,16 @@ type PreparedLiveRemoteEditorUpdate = {
     document: vscode.TextDocument,
     active: EditorDocumentBase,
     transaction: RemoteEditorTransaction,
+    delivery: 'workspace-edit' | 'provider-refresh',
+    cleanRefresh?: PendingCleanEditorRefresh,
+};
+
+type PendingCleanEditorRefresh = {
+    document: vscode.TextDocument,
+    active: EditorDocumentBase,
+    transaction: RemoteEditorTransaction,
+    nextRemoteVersion: number,
+    nextRemoteContent: string,
 };
 
 type RemoteDocumentCausality = {
@@ -315,6 +326,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     private unboundEditorIncarnations = new WeakSet<vscode.TextDocument>();
     private editorSaveReceipts = new Map<string, EditorSaveReceipt>();
     private pendingRemoteEditorTransactions?: Map<string, PendingRemoteEditorTransaction>;
+    private pendingCleanEditorRefreshes?: Map<string, PendingCleanEditorRefresh>;
     private recoveryNotifications = new Set<string>();
     private freshConnectionRequested = false;
     private sourceRevision = 0;
@@ -614,6 +626,10 @@ export class VirtualFileSystem extends vscode.Disposable {
         return this.pendingRemoteEditorTransactions ??= new Map();
     }
 
+    private cleanEditorRefreshMap(): Map<string, PendingCleanEditorRefresh> {
+        return this.pendingCleanEditorRefreshes ??= new Map();
+    }
+
     private canonicalEditorUri(docId: string): string {
         return JSON.stringify([
             ROOT_NAME,
@@ -834,6 +850,13 @@ export class VirtualFileSystem extends vscode.Disposable {
             && this.resourceKey(document.uri) === resourceKey
             && this.wasDocumentOpenBeforeProviderRead(document)
         );
+        const provenCleanRefresh = alreadyObservedDocuments.length === 1
+            && this.matchesPendingCleanRefresh(
+                alreadyObservedDocuments[0],
+                doc._id,
+                doc.version,
+                content,
+            );
         this.pendingReadTickets.set(resourceKey, {
             token: randomUUID(),
             resourceKey,
@@ -843,7 +866,8 @@ export class VirtualFileSystem extends vscode.Disposable {
             content,
             publicId: sender.publicId,
             socketGeneration: sender.generation,
-            requiresExplicitConfirmation: alreadyObservedDocuments.length > 0,
+            requiresExplicitConfirmation: alreadyObservedDocuments.length > 0
+                && !provenCleanRefresh,
         });
         // A restored editor can be published to workspace.textDocuments before
         // the file-system read which activates/constructs this VFS. In that
@@ -856,6 +880,33 @@ export class VirtualFileSystem extends vscode.Disposable {
                 this.observeOpenedTextDocument(document);
             }
         });
+    }
+
+    private matchesPendingCleanRefresh(
+        document: vscode.TextDocument,
+        docId: string,
+        version: number,
+        content: string,
+    ): boolean {
+        const bufferId = this.editorBufferIds.get(document);
+        const pending = bufferId ? this.cleanEditorRefreshMap().get(bufferId) : undefined;
+        const buffer = bufferId ? this.editorBuffers.get(bufferId) : undefined;
+        const sender = this.currentSenderWitness();
+        return Boolean(
+            bufferId
+            && pending
+            && buffer
+            && pending.document === document
+            && pending.active === this.activeEditorBases.get(bufferId)
+            && buffer.docId === docId
+            && this.bufferMatchesIncarnation(buffer)
+            && !document.isDirty
+            && document.version === pending.transaction.beforeDocumentVersion
+            && document.getText() === pending.transaction.beforeEditorContent
+            && pending.nextRemoteVersion === version
+            && pending.nextRemoteContent === content
+            && sender?.generation === pending.transaction.socketGeneration,
+        );
     }
 
     private cachedDocumentIdForUri(uri: vscode.Uri): string | undefined {
@@ -1118,6 +1169,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 ticket.content,
             ),
         });
+        this.cleanEditorRefreshMap().delete(bufferId);
         authoritative.doc.localCache = ticket.content;
         discardCandidate();
         return true;
@@ -1148,6 +1200,8 @@ export class VirtualFileSystem extends vscode.Disposable {
             }));
             const pendingRemote = buffer ?
                 this.remoteEditorTransactionMap().get(buffer.bufferId) : undefined;
+            const pendingCleanRefresh = buffer ?
+                this.cleanEditorRefreshMap().get(buffer.bufferId) : undefined;
             if (pendingRemote) {
                 let next = commitRemoteEditorTransaction(
                     active.causality,
@@ -1169,6 +1223,66 @@ export class VirtualFileSystem extends vscode.Disposable {
                     active.content = next.remoteContent;
                     active.recordName = undefined;
                     active.persistence = undefined;
+                }
+            } else if (pendingCleanRefresh) {
+                const state = active.causality;
+                const transaction = pendingCleanRefresh.transaction;
+                const cleanRefreshMatches = state.valid
+                    && pendingCleanRefresh.document === document
+                    && pendingCleanRefresh.active === active
+                    && transaction.socketGeneration === state.socketGeneration
+                    && transaction.remoteEpoch === state.remoteEpoch
+                    && transaction.baseRemoteVersion === state.remoteVersion
+                    && transaction.beforeDocumentVersion === state.documentVersion
+                    && transaction.beforeEditorContent === state.editorContent
+                    && document.version === state.documentVersion + 1
+                    && document.getText() === pendingCleanRefresh.nextRemoteContent
+                    && !document.isDirty
+                    && state.inflightWire === undefined
+                    && state.inflightToken === undefined
+                    && state.inflightView === undefined
+                    && state.pendingOperations.length === 0
+                    && state.localOperations.length === 0;
+                let next: RealtimeEditorBridgeState = cleanRefreshMatches ? {
+                    ...state,
+                    remoteVersion: pendingCleanRefresh.nextRemoteVersion,
+                    remoteContent: pendingCleanRefresh.nextRemoteContent,
+                    documentVersion: document.version,
+                    editorContent: pendingCleanRefresh.nextRemoteContent,
+                } : {
+                    ...state,
+                    documentVersion: document.version,
+                    editorContent: document.getText(),
+                    valid: false,
+                };
+                let current: DocumentEntity | undefined;
+                try {
+                    current = this.currentDocument(active.identity.docId);
+                } catch {
+                    current = undefined;
+                }
+                if (pendingCleanRefresh.document !== document
+                    || pendingCleanRefresh.active !== active
+                    || document.isDirty
+                    || sender?.generation !== next.socketGeneration
+                    || !current
+                    || !this.documentMatchesAuthority(
+                        current,
+                        pendingCleanRefresh.nextRemoteVersion,
+                        pendingCleanRefresh.nextRemoteContent,
+                    )) {
+                    next = {...next, valid: false};
+                }
+                active.causality = next;
+                this.cleanEditorRefreshMap().delete(buffer!.bufferId);
+                this.pendingReadTickets.delete(buffer!.resourceKey);
+                this.boundReadCandidates.delete(buffer!.bufferId);
+                if (next.valid && current) {
+                    active.version = next.remoteVersion;
+                    active.content = next.remoteContent;
+                    active.recordName = undefined;
+                    active.persistence = undefined;
+                    this.stageEditorBase(document.uri, current, next.remoteContent);
                 }
             } else if (changes.length === 0) {
                 // onDidChangeTextDocument also reports dirty-state and encoding
@@ -1219,6 +1333,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                         receipt.content,
                     ),
                 });
+                this.cleanEditorRefreshMap().delete(buffer.bufferId);
                 this.editorSaveReceipts.delete(buffer.bufferId);
             }
             return;
@@ -1310,6 +1425,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         this.editorSaveReceipts.delete(bufferId);
         this.boundReadCandidates.delete(bufferId);
         this.remoteEditorTransactionMap().delete(bufferId);
+        this.cleanEditorRefreshMap().delete(bufferId);
         this.pendingReadTickets.delete(this.resourceKey(document.uri));
         this.editorBufferIds.delete(document);
     }
@@ -1353,6 +1469,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         });
         this.pendingReadTickets.delete(buffer.resourceKey);
         this.boundReadCandidates.delete(buffer.bufferId);
+        this.cleanEditorRefreshMap().delete(buffer.bufferId);
         current.localCache = staged.content;
         return true;
     }
@@ -1603,6 +1720,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 authoritativeContent,
             ),
         });
+        this.cleanEditorRefreshMap().delete(witness.bufferId);
         this.editorSaveReceipts.set(witness.bufferId, {
             document: witness.document,
             identity,
@@ -1791,6 +1909,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         this.pendingReadTickets.clear();
         this.boundReadCandidates.clear();
         this.remoteEditorTransactionMap().clear();
+        this.cleanEditorRefreshMap().clear();
         const documentIds = new Set(this.documentMap(project).keys());
         this.activeEditorBases.forEach(active => {
             if (documentIds.has(active.identity.docId)) {
@@ -1812,6 +1931,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             if (active.identity.docId === docId) {
                 active.causality.valid = false;
                 this.remoteEditorTransactionMap().delete(bufferId);
+                this.cleanEditorRefreshMap().delete(bufferId);
             }
         });
         for (const [resourceKey, ticket] of this.pendingReadTickets) {
@@ -2446,6 +2566,55 @@ export class VirtualFileSystem extends vscode.Disposable {
         const buffer = this.editorBuffers.get(bufferId)!;
         const sender = this.currentSenderWitness();
         const pendingSubmission = this.pendingDocumentUpdates.get(bufferId);
+        const pendingCleanRefresh = this.cleanEditorRefreshMap().get(bufferId);
+        if (pendingCleanRefresh) {
+            let nextRemoteContent: string | undefined;
+            try {
+                nextRemoteContent = applyUtf16TextOperations(remoteContent, operations);
+            } catch {
+                nextRemoteContent = undefined;
+            }
+            const state = active.causality;
+            const transaction = pendingCleanRefresh.transaction;
+            if (pendingCleanRefresh.document !== buffer.document
+                || pendingCleanRefresh.active !== active
+                || pendingSubmission !== undefined
+                || this.remoteEditorTransactionMap().has(bufferId)
+                || !this.bufferMatchesIncarnation(buffer)
+                || buffer.document.isDirty
+                || buffer.document.version !== transaction.beforeDocumentVersion
+                || buffer.document.getText() !== transaction.beforeEditorContent
+                || !state.valid
+                || state.socketGeneration !== sender?.generation
+                || transaction.socketGeneration !== state.socketGeneration
+                || transaction.remoteEpoch !== state.remoteEpoch
+                || transaction.baseRemoteVersion !== state.remoteVersion
+                || transaction.beforeDocumentVersion !== state.documentVersion
+                || transaction.beforeEditorContent !== state.editorContent
+                || state.inflightWire !== undefined
+                || state.inflightToken !== undefined
+                || state.inflightView !== undefined
+                || state.pendingOperations.length !== 0
+                || state.localOperations.length !== 0
+                || pendingCleanRefresh.nextRemoteVersion !== remoteVersion
+                || pendingCleanRefresh.nextRemoteContent !== remoteContent
+                || !isNonnegativeSafeInteger(remoteVersion + 1)
+                || nextRemoteContent === undefined) {
+                this.cleanEditorRefreshMap().delete(bufferId);
+                active.causality.valid = false;
+                return undefined;
+            }
+            pendingCleanRefresh.nextRemoteVersion = remoteVersion + 1;
+            pendingCleanRefresh.nextRemoteContent = nextRemoteContent;
+            return {
+                bufferId,
+                document: buffer.document,
+                active,
+                transaction,
+                delivery: 'provider-refresh',
+                cleanRefresh: pendingCleanRefresh,
+            };
+        }
         const submissionMatches = pendingSubmission ?
             active.causality.inflightToken === pendingSubmission.submissionToken
                 && active.causality.inflightWire !== undefined
@@ -2473,24 +2642,56 @@ export class VirtualFileSystem extends vscode.Disposable {
                 remoteVersion,
                 operations,
             );
-            if (!buffer.document.isDirty && transaction.expectedChange !== undefined) {
-                // A provider change notification lets VS Code refresh a clean
-                // document without manufacturing a local dirty edit. Until the
-                // host adopts that refresh, the old editor base is no longer a
-                // causal authority for saving.
-                active.causality.valid = false;
-                return undefined;
-            }
+            const delivery: PreparedLiveRemoteEditorUpdate['delivery'] = !buffer.document.isDirty
+                && active.causality.inflightWire === undefined
+                && active.causality.inflightToken === undefined
+                && active.causality.inflightView === undefined
+                && active.causality.pendingOperations.length === 0
+                && active.causality.localOperations.length === 0
+                && transaction.nextEditorContent === transaction.nextRemoteContent
+                ? 'provider-refresh' : 'workspace-edit';
+            const cleanRefresh = delivery === 'provider-refresh' ? {
+                document: buffer.document,
+                active,
+                transaction,
+                nextRemoteVersion: remoteVersion + 1,
+                nextRemoteContent: transaction.nextRemoteContent,
+            } : undefined;
             return {
                 bufferId,
                 document: buffer.document,
                 active,
                 transaction,
+                delivery,
+                cleanRefresh,
             };
         } catch {
             active.causality.valid = false;
             return undefined;
         }
+    }
+
+    private stageCleanRemoteEditorRefresh(prepared: PreparedLiveRemoteEditorUpdate): boolean {
+        const {active, bufferId, cleanRefresh, document, transaction} = prepared;
+        const buffer = this.editorBuffers.get(bufferId);
+        const sender = this.currentSenderWitness();
+        if (prepared.delivery !== 'provider-refresh'
+            || !cleanRefresh
+            || transaction.expectedChange === undefined
+            || buffer?.document !== document
+            || !this.bufferMatchesIncarnation(buffer)
+            || this.activeEditorBases.get(bufferId) !== active
+            || document.isDirty
+            || document.version !== transaction.beforeDocumentVersion
+            || document.getText() !== transaction.beforeEditorContent
+            || sender?.generation !== transaction.socketGeneration
+            || (this.cleanEditorRefreshMap().has(bufferId)
+                && this.cleanEditorRefreshMap().get(bufferId) !== cleanRefresh)) {
+            active.causality.valid = false;
+            return false;
+        }
+        this.cleanEditorRefreshMap().set(bufferId, cleanRefresh);
+        return true;
     }
 
     private commitMetadataOnlyRemoteEditorUpdate(
@@ -2803,10 +3004,17 @@ export class VirtualFileSystem extends vscode.Disposable {
             const _uri = this.pathToUri(res.path).toString();
             const _doc = vscode.workspace.textDocuments.find((doc) => doc.uri.toString()===_uri);
             doc.remoteCache = content;
-            const appliedToLiveEditor = preparedLiveUpdate ?
+            const stagedCleanRefresh = preparedLiveUpdate?.delivery === 'provider-refresh'
+                && preparedLiveUpdate.transaction.expectedChange !== undefined
+                ? this.stageCleanRemoteEditorRefresh(preparedLiveUpdate) : false;
+            const appliedToLiveEditor = preparedLiveUpdate && !stagedCleanRefresh ?
                 await this.applyPreparedRemoteEditorUpdate(preparedLiveUpdate) : false;
             if (appliedToLiveEditor
                 && preparedLiveUpdate?.active.causality.localOperations.length === 0) {
+                doc.localCache = content;
+            } else if (stagedCleanRefresh) {
+                // This cache is now the provider authority which VS Code will
+                // adopt through the ordinary file-change refresh path.
                 doc.localCache = content;
             } else if (!preparedLiveUpdate && _doc && !_doc.isDirty) {
                 // A clean unbound document may be refreshed by the provider
@@ -3566,6 +3774,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 causality,
             };
             this.activeEditorBases.set(pending.bufferId, active);
+            this.cleanEditorRefreshMap().delete(pending.bufferId);
 
             // Close the small window in which the editor could advance while
             // the atomic reconciliation write was in flight.

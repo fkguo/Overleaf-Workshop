@@ -555,6 +555,165 @@ describe('stale-buffer rollback safety', () => {
         harness.dispose();
     });
 
+    it('witnesses a whole-document provider refresh before the next clean edit and save', async () => {
+        const base = 'alpha omega';
+        const remote = 'REMOTE alpha omega';
+        const desired = 'REMOTE alpha LOCAL omega';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Witnessed Clean Refresh', 4);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'witnessed-clean-refresh',
+            projectId: PROJECT_A,
+        });
+
+        assert.equal(new TextDecoder().decode(await harness.provider.readFile(harness.uri)), base);
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.openClean(harness.events);
+        await settleAsyncWork();
+        await settleAsyncWork();
+        assert.equal(harness.events.warningMessages.length, 0);
+
+        server.collaboratorUpdate(PROJECT_A, [{p: 0, i: 'REMOTE '}]);
+        await settleAsyncWork();
+        assert.equal(editor.dirty, false);
+        assert.equal(editor.document.getText(), base);
+        assert.equal(new TextDecoder().decode(await harness.provider.readFile(harness.uri)), remote);
+
+        // FileSystemProvider refreshes are allowed to report a whole-document
+        // replacement instead of the bridge's minimal replacement shape.
+        editor.refreshThroughEvents(remote, harness.events, true);
+        await settleAsyncWork();
+        assert.equal(editor.dirty, false);
+        assert.equal(editor.document.getText(), remote);
+        assert.equal(harness.events.warningMessages.length, 0);
+
+        editor.editThroughEvents(desired, harness.events);
+        const result = await editor.saveThroughProvider(harness.provider, harness.events);
+        assert.equal(result.saved, true);
+        assert.equal(editor.dirty, false);
+        assert.equal(server.capturedUpdates.length, 1);
+        assert.equal(server.capturedUpdates[0].update.v, 5);
+        assert.equal(server.text(PROJECT_A), desired);
+        assert.equal(server.version(PROJECT_A), 6);
+        harness.dispose();
+    });
+
+    it('coalesces consecutive clean collaborator revisions into one witnessed provider refresh', async () => {
+        const base = 'alpha omega';
+        const remote = 'REMOTE alpha OMEGA';
+        const desired = `${remote}!`;
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Coalesced Clean Refresh', 4);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'coalesced-clean-refresh',
+            projectId: PROJECT_A,
+        });
+
+        assert.equal(new TextDecoder().decode(await harness.provider.readFile(harness.uri)), base);
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.openClean(harness.events);
+        await settleAsyncWork();
+        await settleAsyncWork();
+
+        server.collaboratorUpdate(PROJECT_A, [{p: 0, i: 'REMOTE '}]);
+        server.collaboratorUpdate(PROJECT_A, replaceAt('REMOTE alpha omega', 'omega', 'OMEGA'));
+        await settleAsyncWork();
+        await settleAsyncWork();
+        assert.equal(editor.dirty, false);
+        assert.equal(editor.document.getText(), base);
+        assert.equal(new TextDecoder().decode(await harness.provider.readFile(harness.uri)), remote);
+
+        editor.refreshThroughEvents(remote, harness.events, true);
+        await settleAsyncWork();
+        assert.equal(editor.dirty, false);
+        assert.equal(harness.events.warningMessages.length, 0);
+
+        editor.editThroughEvents(desired, harness.events);
+        const result = await editor.saveThroughProvider(harness.provider, harness.events);
+        assert.equal(result.saved, true);
+        assert.equal(editor.dirty, false);
+        assert.equal(server.capturedUpdates.length, 1);
+        assert.equal(server.capturedUpdates[0].update.v, 6);
+        assert.equal(server.text(PROJECT_A), desired);
+        assert.equal(server.version(PROJECT_A), 7);
+        harness.dispose();
+    });
+
+    it('reanchors coalesced clean revisions whose final provider text is unchanged', async () => {
+        const base = 'alpha omega';
+        const desired = 'alpha LOCAL omega';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Collapsed Clean Refresh', 4);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'collapsed-clean-refresh',
+            projectId: PROJECT_A,
+        });
+
+        assert.equal(new TextDecoder().decode(await harness.provider.readFile(harness.uri)), base);
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.openClean(harness.events);
+        await settleAsyncWork();
+        await settleAsyncWork();
+
+        server.collaboratorUpdate(PROJECT_A, [{p: 0, i: 'REMOTE '}]);
+        server.collaboratorUpdate(PROJECT_A, [{p: 0, d: 'REMOTE '}]);
+        await settleAsyncWork();
+        await settleAsyncWork();
+        assert.equal(new TextDecoder().decode(await harness.provider.readFile(harness.uri)), base);
+        await settleAsyncWork();
+        await settleAsyncWork();
+        assert.equal(editor.dirty, false);
+        assert.equal(editor.document.getText(), base);
+        assert.equal(harness.events.warningMessages.length, 0);
+
+        editor.editThroughEvents(desired, harness.events);
+        const result = await editor.saveThroughProvider(harness.provider, harness.events);
+        assert.equal(result.saved, true);
+        assert.equal(server.capturedUpdates.length, 1);
+        assert.equal(server.capturedUpdates[0].update.v, 6);
+        assert.equal(server.text(PROJECT_A), desired);
+        harness.dispose();
+    });
+
+    it('fails closed when a user edits the old clean base before provider refresh adoption', async () => {
+        const base = 'alpha omega';
+        const remote = 'REMOTE alpha omega';
+        const local = 'alpha LOCAL omega';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Raced Clean Refresh', 4);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'raced-clean-refresh',
+            projectId: PROJECT_A,
+        });
+
+        assert.equal(new TextDecoder().decode(await harness.provider.readFile(harness.uri)), base);
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.openClean(harness.events);
+        await settleAsyncWork();
+        await settleAsyncWork();
+
+        server.collaboratorUpdate(PROJECT_A, [{p: 0, i: 'REMOTE '}]);
+        await settleAsyncWork();
+        editor.editThroughEvents(local, harness.events);
+        const result = await editor.saveThroughProvider(harness.provider, harness.events);
+
+        assert.equal(result.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), local);
+        assert.equal(server.capturedUpdates.length, 0);
+        assert.equal(server.text(PROJECT_A), remote);
+        assert.equal(server.version(PROJECT_A), 5);
+        harness.dispose();
+    });
+
     it('advances an empty causal revision without dirtying the editor or losing the next edit', async () => {
         const base = 'alpha omega';
         const desired = 'alpha LOCAL omega';

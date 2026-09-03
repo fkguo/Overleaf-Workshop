@@ -1733,12 +1733,20 @@ export class SimulatedDirtyEditor {
         this.pendingChange = undefined;
     }
 
-    refreshThroughEvents(text: string, events: ProductionWorkspaceEventHarness): void {
+    refreshThroughEvents(
+        text: string,
+        events: ProductionWorkspaceEventHarness,
+        wholeDocumentReplacement = false,
+    ): void {
         const before = this.currentText;
         this.currentText = text;
         this.dirty = false;
         this.version += 1;
-        events.fireDidChange(this.document, [oneTextChange(before, text)]);
+        events.fireDidChange(this.document, [wholeDocumentReplacement ? {
+            rangeOffset: 0,
+            rangeLength: before.length,
+            text,
+        } : oneTextChange(before, text)]);
         this.pendingChange = undefined;
     }
 
