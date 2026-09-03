@@ -16,6 +16,8 @@ class MarkdownStringStub {
 
 const statusItems: any[] = [];
 const executedCommands: string[] = [];
+const documentChangeListeners = new Set<(event: any) => void>();
+const documentCloseListeners = new Set<(document: any) => void>();
 let executeCommand = async (_command: string, ..._args: unknown[]): Promise<unknown> => undefined;
 const vscodeStub = {
     DiagnosticSeverity: {Error: 0, Warning: 1, Information: 2},
@@ -55,6 +57,14 @@ const vscodeStub = {
         saveAll: async () => true,
         getConfiguration: () => ({get: (_key: string, fallback: unknown) => fallback}),
         getWorkspaceFolder: () => undefined,
+        onDidChangeTextDocument: (listener: (event: any) => void) => {
+            documentChangeListeners.add(listener);
+            return {dispose: () => documentChangeListeners.delete(listener)};
+        },
+        onDidCloseTextDocument: (listener: (document: any) => void) => {
+            documentCloseListeners.add(listener);
+            return {dispose: () => documentCloseListeners.delete(listener)};
+        },
     },
     commands: {
         executeCommand: (command: string, ...args: unknown[]) => {
@@ -82,6 +92,18 @@ const eventBusStub = {
 function fireEvent(eventName: string, arg: any) {
     for (const listener of eventListeners.get(eventName) ?? []) {
         listener(arg);
+    }
+}
+
+function fireDocumentChange(document: any) {
+    for (const listener of documentChangeListeners) {
+        listener({document});
+    }
+}
+
+function fireDocumentClose(document: any) {
+    for (const listener of documentCloseListeners) {
+        listener(document);
     }
 }
 
@@ -272,6 +294,8 @@ describe('CompileManager cached startup', () => {
             manager.pdfWillOpenTrigger.dispose();
             manager.pdfViewerReadyTrigger.dispose();
             manager.pdfViewDisposedTrigger.dispose();
+            manager.sourceDocumentChangedTrigger.dispose();
+            manager.sourceDocumentClosedTrigger.dispose();
         }
     });
 
@@ -325,6 +349,8 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
             manager.pdfWillOpenTrigger.dispose();
             manager.pdfViewerReadyTrigger.dispose();
             manager.pdfViewDisposedTrigger.dispose();
+            manager.sourceDocumentChangedTrigger.dispose();
+            manager.sourceDocumentClosedTrigger.dispose();
         }
     });
 
@@ -354,7 +380,7 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
         assert.equal(executedCommands.includes('vscode.openWith'), false);
     });
 
-    it('does not let an in-flight PDF refresh block compile or enable manual sync early', async () => {
+    it('delivers one manual sync requested during an in-flight PDF refresh', async () => {
         const fixture = projectFixture();
         const actions: string[] = [];
         let finishRefresh!: (content: Uint8Array) => void;
@@ -382,12 +408,93 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
 
         finishRefresh(new Uint8Array([1]));
         await flushAsync();
-        assert.deepEqual(actions, ['refresh']);
-
-        await manager.syncCode();
 
         assert.deepEqual(actions, ['refresh', 'sync-request', 'syncCode']);
+        assert.equal(actions.filter(action => action === 'sync-request').length, 1);
+        assert.equal(viewer.messages.length, 1);
         assert.equal((viewer.messages as any[]).at(-1)?.pdfGeneration, 2);
+    });
+
+    it('drops a refresh-time manual sync when the source version changes', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        let finishRefresh!: (content: Uint8Array) => void;
+        const refreshResult = new Promise<Uint8Array>(resolve => {
+            finishRefresh = resolve;
+        });
+        const editor = setActiveEditor(fixture.sourceUri);
+        const manager = createManager(createVfs(successfulOutcome(), actions));
+        const viewer = registerPdfViewer(fixture, actions, {
+            refresh: async () => {
+                actions.push('refresh');
+                return refreshResult;
+            },
+        });
+
+        await manager.compile(true, 'command', fixture.compileUri);
+        await manager.syncCode();
+        editor.document.version += 1;
+        fireDocumentChange(editor.document);
+        finishRefresh(new Uint8Array([1]));
+        await flushAsync();
+
+        assert.deepEqual(actions, ['refresh']);
+        assert.deepEqual(viewer.messages, []);
+    });
+
+    it('drops a refresh-time manual sync when the source document closes', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        let finishRefresh!: (content: Uint8Array) => void;
+        const refreshResult = new Promise<Uint8Array>(resolve => {
+            finishRefresh = resolve;
+        });
+        const editor = setActiveEditor(fixture.sourceUri);
+        const manager = createManager(createVfs(successfulOutcome(), actions));
+        const viewer = registerPdfViewer(fixture, actions, {
+            refresh: async () => {
+                actions.push('refresh');
+                return refreshResult;
+            },
+        });
+
+        await manager.compile(true, 'command', fixture.compileUri);
+        await manager.syncCode();
+        vscodeStub.workspace.textDocuments = [];
+        fireDocumentClose(editor.document);
+        finishRefresh(new Uint8Array([1]));
+        await flushAsync();
+
+        assert.deepEqual(actions, ['refresh']);
+        assert.deepEqual(viewer.messages, []);
+    });
+
+    it('does not carry a refresh-time manual cursor across failure and viewer reopen', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        let finishRefresh!: (content: Uint8Array) => void;
+        const refreshResult = new Promise<Uint8Array>(resolve => {
+            finishRefresh = resolve;
+        });
+        setActiveEditor(fixture.sourceUri);
+        const manager = createManager(createVfs(successfulOutcome(), actions));
+        registerPdfViewer(fixture, actions, {
+            refresh: async () => {
+                actions.push('refresh-failed');
+                return refreshResult;
+            },
+        });
+
+        await manager.compile(true, 'command', fixture.compileUri);
+        await manager.syncCode();
+        finishRefresh(new Uint8Array());
+        await flushAsync();
+
+        const replacement = registerPdfViewer(fixture, actions);
+        await flushAsync();
+
+        assert.deepEqual(actions, ['refresh-failed', 'refresh']);
+        assert.deepEqual(replacement.messages, []);
     });
 
     it('does not refresh or auto-sync after a failed compile but preserves manual sync', async () => {
