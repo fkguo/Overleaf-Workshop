@@ -462,6 +462,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     private clsiServerId?: string;
     private readonly editorId = randomUUID();
     private outputEditorId?: string;
+    private synctexOutputIdentityGeneration = 0;
     private pdfDownloadDomain?: string;
     private notify: (events:vscode.FileChangeEvent[])=>void;
     private clientManagerItem?: {manager: ClientManager, triggers: vscode.Disposable[]};
@@ -472,6 +473,10 @@ export class VirtualFileSystem extends vscode.Disposable {
     public readonly serverName: string;
     public readonly serverUrl: string;
     public readonly projectId: string;
+
+    get outputIdentityGeneration(): number {
+        return this.synctexOutputIdentityGeneration;
+    }
 
     constructor(
         context: vscode.ExtensionContext,
@@ -6396,6 +6401,10 @@ export class VirtualFileSystem extends vscode.Disposable {
 
             if (successful) {
                 const outputIdentity = resolveSynctexOutputIdentity(committedOutputs, this.editorId);
+                // Commit the causal witness before publishing the new identity.
+                // A later output-tree failure must still prevent the manager
+                // from re-enabling a PDF from the preceding build.
+                this.synctexOutputIdentityGeneration += 1;
                 this.outputBuildId = outputIdentity.buildId;
                 this.outputEditorId = outputIdentity.editorId;
                 this.compileGroup = routing.compileGroup;

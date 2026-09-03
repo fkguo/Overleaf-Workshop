@@ -389,6 +389,8 @@ function makeHarness(options: HarnessOptions = {}): Harness {
         publicId: 'public-1',
         sourceRevision: 0,
         isDirty: false,
+        editorId: 'editor-session',
+        synctexOutputIdentityGeneration: 0,
         root: project,
         previousRoot: project,
         joiningProject: undefined,
@@ -688,6 +690,25 @@ function closeHarnessDocument(harness: Harness): void {
     const index = openTextDocuments.indexOf(harness.document);
     if (index >= 0) { openTextDocuments.splice(index, 1); }
 }
+
+describe('SyncTeX output identity generation', () => {
+    it('advances before a later output-tree publication failure', () => {
+        const harness = makeHarness();
+        const before = harness.vfs.outputIdentityGeneration;
+        harness.vfs.notify = () => { throw new Error('output publication failed'); };
+
+        assert.throws(() => harness.vfs.updateOutputs([{
+            path: 'output.pdf',
+            url: '/build/editor-build/output/output.pdf',
+            build: 'build',
+            editorId: 'editor',
+        }], true), /output publication failed/);
+
+        assert.equal(harness.vfs.outputIdentityGeneration, before + 1);
+        assert.equal(harness.vfs.outputBuildId, 'build');
+        assert.equal(harness.vfs.outputEditorId, 'editor');
+    });
+});
 
 async function seedColdRecord(
     storage: MemoryStorage,

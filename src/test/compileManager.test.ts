@@ -16,6 +16,7 @@ class MarkdownStringStub {
 
 const statusItems: any[] = [];
 const executedCommands: string[] = [];
+const shownTextDocuments: any[][] = [];
 const documentChangeListeners = new Set<(event: any) => void>();
 const documentCloseListeners = new Set<(document: any) => void>();
 let executeCommand = async (_command: string, ..._args: unknown[]): Promise<unknown> => undefined;
@@ -37,6 +38,10 @@ const vscodeStub = {
     window: {
         activeTextEditor: undefined as any,
         visibleTextEditors: [] as any[],
+        showTextDocument: async (...args: any[]) => {
+            shownTextDocuments.push(args);
+            return undefined;
+        },
         createStatusBarItem: () => {
             const item = {
                 text: '',
@@ -207,6 +212,7 @@ function registerPdfViewer(
     });
     let refreshRequestGeneration = 0;
     const doc = {
+        uri: fixture.pdfUri,
         generation: options.initialGeneration ?? 1,
         invalidateRefresh: () => {
             refreshRequestGeneration += 1;
@@ -239,6 +245,22 @@ function registerPdfViewer(
     return {doc, webviewPanel, messages};
 }
 
+function reverseSyncRequest(
+    fixture: ReturnType<typeof projectFixture>,
+    viewer: ReturnType<typeof registerPdfViewer>,
+    pdfGeneration = viewer.doc.generation,
+): any {
+    return {
+        page: 2,
+        h: 3,
+        v: 4,
+        identifier: 'source token',
+        pdfGeneration,
+        uri: fixture.pdfUri,
+        webviewPanel: viewer.webviewPanel,
+    };
+}
+
 function successfulOutcome(): CompileOutcome {
     return {
         status: 'success',
@@ -263,6 +285,7 @@ function createVfs(
     syncCode: (...args: any[]) => Promise<any> = async () => [{page: 1, h: 2, v: 3}],
 ) {
     return {
+        outputIdentityGeneration: 0,
         getRootDocName: () => '/main.tex',
         getCompiler: () => ({name: 'pdfLaTex'}),
         adoptCachedCompile: async () => undefined,
@@ -272,6 +295,7 @@ function createVfs(
             actions.push('sync-request');
             return syncCode(...args);
         },
+        syncPdf: async () => undefined,
     };
 }
 
@@ -284,6 +308,7 @@ describe('CompileManager cached startup', () => {
     beforeEach(() => {
         statusItems.length = 0;
         executedCommands.length = 0;
+        shownTextDocuments.length = 0;
         executeCommand = async () => undefined;
         vscodeStub.window.activeTextEditor = undefined;
         vscodeStub.workspace.textDocuments = [];
@@ -317,6 +342,7 @@ describe('CompileManager cached startup', () => {
             return undefined;
         };
         const vfs = {
+            outputIdentityGeneration: 0,
             getRootDocName: () => '/main.tex',
             getCompiler: () => ({name: 'pdfLaTex'}),
             adoptCachedCompile: async () => cachedOutcome,
@@ -339,6 +365,7 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
     beforeEach(() => {
         statusItems.length = 0;
         executedCommands.length = 0;
+        shownTextDocuments.length = 0;
         executeCommand = async () => undefined;
         vscodeStub.window.activeTextEditor = undefined;
         vscodeStub.workspace.textDocuments = [];
@@ -839,7 +866,7 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
         assert.deepEqual(actions, ['refresh', 'sync-request']);
     });
 
-    it('starts a newer compile while an older PDF download is pending and keeps the old PDF blocked', async () => {
+    it('starts a newer compile while an older PDF download is pending and reloads the current build', async () => {
         const fixture = projectFixture();
         const actions: string[] = [];
         let finishOldRefresh!: (content: Uint8Array) => void;
@@ -870,21 +897,25 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
         setActiveEditor(fixture.sourceUri);
         await manager.syncCode();
 
-        assert.deepEqual(actions, ['old-refresh']);
-        assert.deepEqual(viewer.messages, []);
-        assert.equal(viewer.doc.generation, 1);
+        assert.deepEqual(actions, ['old-refresh', 'old-refresh', 'sync-request', 'syncCode']);
+        assert.equal(viewer.doc.generation, 2);
     });
 
-    it('does not let a later failed or no-op compile verify an earlier unresolved build', async () => {
-        for (const laterOutcome of [failedOutcome(), undefined]) {
+    for (const [label, laterOutcome] of [
+        ['failed', failedOutcome()],
+        ['no-op', undefined],
+    ] as const) {
+        it(`reloads an unresolved build after a later ${label} compile`, async () => {
             const fixture = projectFixture();
             const actions: string[] = [];
             let compileCount = 0;
+            let reverseCalls = 0;
             const vfs = createVfs(successfulOutcome(), actions);
             (vfs as any).compile = async () => {
                 compileCount += 1;
                 return compileCount === 1 ? successfulOutcome() : laterOutcome;
             };
+            vfs.syncPdf = async () => { reverseCalls += 1; return undefined; };
             const manager = createManager(vfs);
 
             // PDF A began opening without a record. Build B commits, then C
@@ -892,15 +923,18 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
             await manager.compile(true, 'command', fixture.compileUri);
             await manager.compile(true, 'command', fixture.compileUri);
             const viewer = registerPdfViewer(fixture, actions, {initialGeneration: 1});
+            await flushAsync();
             setActiveEditor(fixture.sourceUri);
             await manager.syncCode();
+            await manager.syncPdf(reverseSyncRequest(fixture, viewer, 2));
 
-            assert.deepEqual(actions, []);
-            assert.deepEqual(viewer.messages, []);
-        }
-    });
+            assert.deepEqual(actions, ['refresh', 'sync-request', 'syncCode']);
+            assert.equal(viewer.doc.generation, 2);
+            assert.equal(reverseCalls, 1);
+        });
+    }
 
-    it('keeps the old PDF blocked when it registers before the later compile fails', async () => {
+    it('reloads the current build when the old PDF registers before a later compile fails', async () => {
         const fixture = projectFixture();
         const actions: string[] = [];
         let finishLaterCompile!: (outcome: CompileOutcome) => void;
@@ -927,9 +961,73 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
 
         finishLaterCompile(failedOutcome());
         await compiling;
+        await flushAsync();
         await manager.syncCode();
 
-        assert.deepEqual(actions, []);
+        assert.deepEqual(actions, ['refresh', 'sync-request', 'syncCode']);
+        assert.equal(viewer.doc.generation, 2);
+    });
+
+    it('does not restore an old PDF when a server compile changes output identity before throwing', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        let reverseCalls = 0;
+        const vfs = createVfs(successfulOutcome(), actions);
+        vfs.compile = async () => {
+            vfs.outputIdentityGeneration += 1;
+            throw new Error('output publication failed');
+        };
+        vfs.syncPdf = async () => { reverseCalls += 1; return undefined; };
+        const manager = createManager(vfs);
+        const viewer = registerPdfViewer(fixture, actions, {
+            refresh: async () => {
+                actions.push('recovery-refresh-failed');
+                return new Uint8Array();
+            },
+        });
+
+        await manager.compile(true, 'command', fixture.compileUri);
+        await flushAsync();
+        setActiveEditor(fixture.sourceUri);
+        await manager.syncCode();
+        await manager.syncPdf(reverseSyncRequest(fixture, viewer, 1));
+
+        assert.deepEqual(actions, ['recovery-refresh-failed']);
+        assert.equal(reverseCalls, 0);
+        assert.deepEqual(viewer.messages, []);
+    });
+
+    it('does not restore an old PDF after cached adoption mutates output identity then falls back', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        let reverseCalls = 0;
+        const vfs = createVfs(successfulOutcome(), actions);
+        vfs.adoptCachedCompile = async () => {
+            try {
+                vfs.outputIdentityGeneration += 1;
+                throw new Error('cached output publication failed');
+            } catch {
+                return undefined;
+            }
+        };
+        (vfs as any).compile = async () => undefined;
+        vfs.syncPdf = async () => { reverseCalls += 1; return undefined; };
+        const manager = createManager(vfs);
+        const viewer = registerPdfViewer(fixture, actions, {
+            refresh: async () => {
+                actions.push('recovery-refresh-failed');
+                return new Uint8Array();
+            },
+        });
+
+        await manager.compile(true, 'initial-project', fixture.compileUri);
+        await flushAsync();
+        setActiveEditor(fixture.sourceUri);
+        await manager.syncCode();
+        await manager.syncPdf(reverseSyncRequest(fixture, viewer, 1));
+
+        assert.deepEqual(actions, ['recovery-refresh-failed']);
+        assert.equal(reverseCalls, 0);
         assert.deepEqual(viewer.messages, []);
     });
 
@@ -946,5 +1044,125 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
         assert.deepEqual(actions, ['refresh', 'sync-request']);
         assert.deepEqual(viewer.messages, []);
         assert.equal(statusItems.at(-1)?.text, 'pdfLaTex');
+    });
+
+    it('reverse-syncs only from the exact ready PDF generation', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        const reverseCalls: any[][] = [];
+        const vfs = createVfs(successfulOutcome(), actions);
+        (vfs as any).syncPdf = async (...args: any[]) => {
+            reverseCalls.push(args);
+            return {file: 'main.tex', line: 1, column: 0};
+        };
+        const manager = createManager(vfs);
+        const viewer = registerPdfViewer(fixture, actions);
+
+        await manager.syncPdf(reverseSyncRequest(fixture, viewer));
+
+        assert.deepEqual(reverseCalls, [[2, 3, 4]]);
+        assert.equal(shownTextDocuments.length, 1);
+    });
+
+    it('blocks reverse SyncTeX while the current-build PDF refresh is in flight', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        let finishRefresh!: (content: Uint8Array) => void;
+        const refreshResult = new Promise<Uint8Array>(resolve => {
+            finishRefresh = resolve;
+        });
+        let reverseCalls = 0;
+        const vfs = createVfs(successfulOutcome(), actions);
+        vfs.syncPdf = async () => { reverseCalls += 1; return undefined; };
+        const manager = createManager(vfs);
+        const viewer = registerPdfViewer(fixture, actions, {
+            refresh: async () => {
+                actions.push('refresh');
+                return refreshResult;
+            },
+        });
+
+        await manager.compile(true, 'command', fixture.compileUri);
+        await manager.syncPdf(reverseSyncRequest(fixture, viewer, 1));
+
+        assert.equal(reverseCalls, 0);
+        finishRefresh(new Uint8Array([1]));
+        await flushAsync();
+    });
+
+    it('blocks reverse SyncTeX after a failed PDF refresh', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        let reverseCalls = 0;
+        const vfs = createVfs(successfulOutcome(), actions);
+        vfs.syncPdf = async () => { reverseCalls += 1; return undefined; };
+        const manager = createManager(vfs);
+        const viewer = registerPdfViewer(fixture, actions, {
+            refresh: async () => new Uint8Array(),
+        });
+
+        await manager.compile(true, 'command', fixture.compileUri);
+        await flushAsync();
+        await manager.syncPdf(reverseSyncRequest(fixture, viewer, 1));
+
+        assert.equal(reverseCalls, 0);
+    });
+
+    it('rejects an old PDF generation after a newer PDF is loaded', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        let reverseCalls = 0;
+        const vfs = createVfs(successfulOutcome(), actions);
+        vfs.syncPdf = async () => { reverseCalls += 1; return undefined; };
+        const manager = createManager(vfs);
+        const viewer = registerPdfViewer(fixture, actions);
+
+        await manager.compile(true, 'command', fixture.compileUri);
+        await flushAsync();
+        await manager.syncPdf(reverseSyncRequest(fixture, viewer, 1));
+
+        assert.equal(viewer.doc.generation, 2);
+        assert.equal(reverseCalls, 0);
+    });
+
+    it('rejects reverse SyncTeX from a replaced or disposed viewer', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        let reverseCalls = 0;
+        const vfs = createVfs(successfulOutcome(), actions);
+        vfs.syncPdf = async () => { reverseCalls += 1; return undefined; };
+        const manager = createManager(vfs);
+        const oldViewer = registerPdfViewer(fixture, actions);
+        const replacement = registerPdfViewer(fixture, actions);
+
+        await manager.syncPdf(reverseSyncRequest(fixture, oldViewer));
+        fireEvent('pdfViewDisposedEvent', {
+            uri: fixture.pdfUri,
+            webviewPanel: replacement.webviewPanel,
+        });
+        await manager.syncPdf(reverseSyncRequest(fixture, replacement));
+
+        assert.equal(reverseCalls, 0);
+    });
+
+    it('rechecks the PDF generation after the reverse SyncTeX response', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        let finishReverse!: (result: any) => void;
+        const reverseResult = new Promise<any>(resolve => {
+            finishReverse = resolve;
+        });
+        const vfs = createVfs(successfulOutcome(), actions);
+        vfs.syncPdf = async () => reverseResult;
+        const manager = createManager(vfs);
+        const viewer = registerPdfViewer(fixture, actions);
+
+        const syncing = manager.syncPdf(reverseSyncRequest(fixture, viewer));
+        await flushAsync();
+        registerPdfViewer(fixture, actions);
+        finishReverse({file: 'main.tex', line: 1, column: 0});
+        await syncing;
+
+        assert.deepEqual(shownTextDocuments, []);
     });
 });

@@ -103,6 +103,9 @@ type PdfCompileTransition = {
     previousRecord?: PdfViewRecord,
     previousSyncableGeneration?: number,
     buildMayHaveChanged: boolean,
+    outputIdentityMutationMayHaveStarted: boolean,
+    outputIdentityVfs?: VirtualFileSystem,
+    outputIdentityGeneration?: number,
 };
 
 type PendingCompiledPdfRefresh = {
@@ -677,6 +680,7 @@ export class CompileManager {
             previousSyncableGeneration: record && isPdfGenerationSyncable(record, generation) ?
                 generation : undefined,
             buildMayHaveChanged: false,
+            outputIdentityMutationMayHaveStarted: false,
         };
         unsyncablePdfProjects.add(identifier);
         if (record) {
@@ -690,12 +694,44 @@ export class CompileManager {
         return transition;
     }
 
+    private captureOutputIdentityWitness(
+        transition: PdfCompileTransition,
+        vfs: VirtualFileSystem,
+    ) {
+        transition.outputIdentityMutationMayHaveStarted = true;
+        const generation = vfs.outputIdentityGeneration;
+        if (!Number.isSafeInteger(generation) || generation < 0) { return; }
+        transition.outputIdentityVfs = vfs;
+        transition.outputIdentityGeneration = generation;
+    }
+
+    private isOutputIdentityUnchanged(transition: PdfCompileTransition): boolean {
+        if (!transition.outputIdentityMutationMayHaveStarted) { return true; }
+        return Boolean(
+            transition.outputIdentityVfs &&
+            transition.outputIdentityGeneration !== undefined &&
+            transition.outputIdentityVfs.outputIdentityGeneration === transition.outputIdentityGeneration
+        );
+    }
+
     private restorePdfSyncability(identifier: string, transition: PdfCompileTransition) {
+        if (!compiledPdfBuildRequests.isCurrent(identifier, transition.buildGeneration)) { return; }
         if (
             transition.priorBuildUnverified ||
             transition.buildMayHaveChanged ||
-            !compiledPdfBuildRequests.isCurrent(identifier, transition.buildGeneration)
-        ) { return; }
+            !this.isOutputIdentityUnchanged(transition)
+        ) {
+            // Never certify the visible PDF from a build whose identity is not
+            // causally proven current. Re-read the current output instead; no
+            // captured cursor survives this recovery path.
+            this.scheduleCompiledPdfRefresh(
+                identifier,
+                transition.buildGeneration,
+                transition.autoSourceGeneration,
+                undefined,
+            );
+            return;
+        }
         const pdfPath = `${OUTPUT_FOLDER_NAME}/output.pdf`;
         const record = pdfViewRecord[identifier]?.[pdfPath];
         if (!record) {
@@ -839,6 +875,7 @@ export class CompileManager {
                 const vfs = await this.vfsm.prefetch(compileUri);
                 if (!isCurrent()) { return; }
                 this.activeCompileVfs = vfs;
+                this.captureOutputIdentityWitness(pdfTransition, vfs);
                 const rootDocId = await resolveCompileRootDocId(
                     compileUri.path,
                     () => vfs._resolveUri(compileUri),
@@ -1273,51 +1310,58 @@ export class CompileManager {
         h: number,
         v: number,
         identifier: string,
-        uri?: vscode.Uri,
+        pdfGeneration: number,
+        uri: vscode.Uri,
+        webviewPanel: vscode.WebviewPanel,
     }) {
-        const uri = r.uri?.scheme === ROOT_NAME ? r.uri : await CompileManager.check();
-        if (uri) {
-            this.vfsm.prefetch(uri)
-                .then((vfs) => vfs.syncPdf(r.page, r.h, r.v))
-                .then((res) => {
-                    if (res) {
-                        const { projectName } = parseUri(uri);
-                        const { file, line, column } = res;
-                        const normalizedFile = normalizeSynctexResultPath(file);
-                        if (!normalizedFile) {
-                            console.warn(`${ELEGANT_NAME}: Ignored unsafe SyncTeX path: ${file}`);
-                            return;
-                        }
-                        const _file = normalizedFile.match(/output\.[^\.]+$/) ? `${OUTPUT_FOLDER_NAME}/${normalizedFile}` : normalizedFile;
-                        const fileUri = uri.with({ path: `/${projectName}/${_file}` });
+        if (!r || r.uri?.scheme !== ROOT_NAME || !Number.isSafeInteger(r.pdfGeneration) || r.pdfGeneration <= 0) {
+            return;
+        }
+        try {
+            const {identifier, pathParts, projectName} = parseUri(r.uri);
+            const filePath = pathParts.join('/');
+            if (filePath !== `${OUTPUT_FOLDER_NAME}/output.pdf`) { return; }
+            const record = pdfViewRecord[identifier]?.[filePath];
+            const isCurrentPdf = () => Boolean(
+                record &&
+                record.ready &&
+                record.webviewPanel === r.webviewPanel &&
+                record.doc.uri.toString() === r.uri.toString() &&
+                pdfViewRecord[identifier]?.[filePath] === record &&
+                isPdfGenerationSyncable(record, r.pdfGeneration)
+            );
+            if (!isCurrentPdf()) { return; }
 
-                        let viewColumnToUse: vscode.ViewColumn | undefined;
-                        const existingEditor = vscode.window.visibleTextEditors.find(
-                            e => e.document.uri.toString() === fileUri.toString()
-                        );
+            const vfs = await this.vfsm.prefetch(r.uri);
+            if (!isCurrentPdf()) { return; }
+            const res = await vfs.syncPdf(r.page, r.h, r.v);
+            if (!res || !isCurrentPdf()) { return; }
 
-                        if (existingEditor) {
-                            viewColumnToUse = existingEditor.viewColumn;
-                        } else {
-                            viewColumnToUse = vscode.window.visibleTextEditors.at(-1)?.viewColumn || vscode.ViewColumn.Beside;
-                        }
+            const { file, line } = res;
+            const normalizedFile = normalizeSynctexResultPath(file);
+            if (!normalizedFile) {
+                console.warn(`${ELEGANT_NAME}: Ignored unsafe SyncTeX path: ${file}`);
+                return;
+            }
+            const outputFile = normalizedFile.match(/output\.[^\.]+$/) ?
+                `${OUTPUT_FOLDER_NAME}/${normalizedFile}` : normalizedFile;
+            const fileUri = r.uri.with({ path: `/${projectName}/${outputFile}` });
+            const existingEditor = vscode.window.visibleTextEditors.find(
+                editor => editor.document.uri.toString() === fileUri.toString()
+            );
+            const viewColumnToUse = existingEditor?.viewColumn ??
+                vscode.window.visibleTextEditors.at(-1)?.viewColumn ?? vscode.ViewColumn.Beside;
 
-                        vscode.window.showTextDocument(fileUri, { viewColumn: viewColumnToUse, preserveFocus: false })
-                            .then(
-                                (openedEditor) => {
-                                    if (openedEditor) {
-                                        this._revealSelectionInEditor(openedEditor, line, r.identifier);
-                                    }
-                                },
-                                (error) => {
-                                    console.error(`${ELEGANT_NAME}: Failed to open document ${fileUri.fsPath} for syncPdf:`, error);
-                                }
-                            );
-                    }
-                })
-                .catch(error => {
-                    console.error(`${ELEGANT_NAME}: Error in syncPdf promise chain:`, error);
-                });
+            if (!isCurrentPdf()) { return; }
+            const openedEditor = await vscode.window.showTextDocument(
+                fileUri,
+                {viewColumn: viewColumnToUse, preserveFocus: false},
+            );
+            if (openedEditor && isCurrentPdf()) {
+                this._revealSelectionInEditor(openedEditor, line, r.identifier);
+            }
+        } catch (error) {
+            console.error(`${ELEGANT_NAME}: Error in syncPdf:`, error);
         }
     }
 

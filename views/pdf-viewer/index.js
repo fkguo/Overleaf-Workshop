@@ -235,6 +235,15 @@
 
     //Reference: https://github.com/overleaf/overleaf/blob/main/services/web/frontend/js/features/pdf-preview/util/pdf-js-wrapper.js#L163
     function syncPdf(pageElem, pageNum, clientX, clientY, innerText) {
+        if (!OverleafPdfSyncGeneration.isReadyPdfGeneration(
+            readyPdfGeneration,
+            pdfLoadGeneration,
+            PDFViewerApplication.pdfDocument,
+            loadingPdfDocument
+        )) {
+            return;
+        }
+        const pdfGeneration = readyPdfGeneration;
         const pageCanvas = pageElem.querySelector('canvas');
         const pageRect = pageCanvas.getBoundingClientRect();
         const {viewport} = PDFViewerApplication.pdfViewer.getPageView(pageNum - 1);
@@ -244,7 +253,13 @@
         top = viewport.viewBox[3] - top;
         vscode.postMessage({
             type: 'syncPdf',
-            content: { page: Number(pageNum), h: left, v: top, identifier: innerText},
+            content: {
+                page: Number(pageNum),
+                h: left,
+                v: top,
+                identifier: innerText,
+                pdfGeneration,
+            },
         });
         backupPdfViewerState();
     }

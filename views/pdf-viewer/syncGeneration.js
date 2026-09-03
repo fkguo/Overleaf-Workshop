@@ -12,6 +12,18 @@
         return Number.isSafeInteger(value) && value > 0;
     }
 
+    function isReadyPdfGeneration(
+        readyPdfGeneration,
+        loadingPdfGeneration,
+        mountedPdfDocument,
+        loadingPdfDocument
+    ) {
+        return isGeneration(readyPdfGeneration) &&
+            readyPdfGeneration === loadingPdfGeneration &&
+            loadingPdfDocument !== undefined &&
+            mountedPdfDocument === loadingPdfDocument;
+    }
+
     function createGate() {
         let currentPdfGeneration = 0;
         let pendingSync;
@@ -58,5 +70,5 @@
         };
     }
 
-    return {createGate};
+    return {createGate, isReadyPdfGeneration};
 }));

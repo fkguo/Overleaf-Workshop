@@ -1,12 +1,18 @@
 import { strict as assert } from 'assert';
 
-const {createGate} = require('../../views/pdf-viewer/syncGeneration.js') as {
+const {createGate, isReadyPdfGeneration} = require('../../views/pdf-viewer/syncGeneration.js') as {
     createGate: () => {
         beginPdfLoad: (pdfGeneration: number) => boolean,
         queueSync: (pdfGeneration: number, content: unknown) => boolean,
         readyContent: (pdfGeneration: number) => unknown,
         consume: (pdfGeneration: number) => void,
     },
+    isReadyPdfGeneration: (
+        readyPdfGeneration: number,
+        loadingPdfGeneration: number,
+        mountedPdfDocument: unknown,
+        loadingPdfDocument: unknown,
+    ) => boolean,
 };
 
 describe('PDF viewer SyncTeX generation gate', () => {
@@ -48,5 +54,15 @@ describe('PDF viewer SyncTeX generation gate', () => {
         assert.equal(gate.beginPdfLoad(3), false);
         assert.equal(gate.beginPdfLoad(Number.NaN), false);
         assert.equal(gate.queueSync(0, []), false);
+    });
+
+    it('permits reverse sync only from the exact mounted ready generation', () => {
+        const oldPdf = {};
+        const newPdf = {};
+
+        assert.equal(isReadyPdfGeneration(2, 2, newPdf, newPdf), true);
+        assert.equal(isReadyPdfGeneration(1, 2, oldPdf, newPdf), false);
+        assert.equal(isReadyPdfGeneration(0, 2, oldPdf, oldPdf), false);
+        assert.equal(isReadyPdfGeneration(2, 2, oldPdf, newPdf), false);
     });
 });
