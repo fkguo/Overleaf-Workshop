@@ -217,6 +217,24 @@ describe('stale-buffer rollback safety', () => {
         }, [], /invalid snapshot/);
     });
 
+    it('does not stage or publish a document with an empty remote id', () => {
+        const server = new DeterministicRealtimeServer();
+        addProject(server, 'abc', PROJECT_A, 'Empty Remote Id', 9);
+        const harness = createHarness(server);
+
+        harness.vfs.documentIdsByPath.set(harness.uri.toString(), 'stale-doc-id');
+        harness.vfs.stagedEditorBases.set(harness.uri.toString(), {
+            docId: 'stale-doc-id',
+            version: 8,
+            content: 'stale',
+        });
+        harness.vfs.stageEditorBase(harness.uri, {_id: '', version: 9}, 'abc');
+
+        assert.equal(harness.vfs.documentIdsByPath.has(harness.uri.toString()), false);
+        assert.equal(harness.vfs.stagedEditorBases.has(harness.uri.toString()), false);
+        harness.vfs.dispose();
+    });
+
     it('rejects a join-time live revision above Number.MAX_SAFE_INTEGER', async () => {
         await assertJoinCatchUpFailsClosed('unsafe-live-version', {
             docLines: ['abc'],
@@ -332,6 +350,513 @@ describe('stale-buffer rollback safety', () => {
         harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
         const editor = new SimulatedDirtyEditor(harness.uri, base);
         editor.openClean(harness.events);
+        await settleAsyncWork();
+        await settleAsyncWork();
+
+        editor.editThroughEvents(desired, harness.events);
+        const result = await editor.saveThroughProvider(harness.provider, harness.events);
+
+        assert.equal(result.saved, true);
+        assert.equal(editor.dirty, false);
+        assert.equal(server.capturedUpdates.length, 1);
+        assert.equal(server.text(PROJECT_A), desired);
+        harness.dispose();
+    });
+
+    it('saves a confirmed dirty editor when the host omits onWillSaveTextDocument', async () => {
+        const base = 'alpha omega';
+        const desired = 'alpha LOCAL omega';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Public Save Without Will Event', 4);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'public-save-without-will-event',
+            projectId: PROJECT_A,
+        });
+
+        assert.equal(
+            new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
+            base,
+        );
+        harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.openClean(harness.events);
+        await settleAsyncWork();
+        await settleAsyncWork();
+        editor.editThroughEvents(desired, harness.events);
+
+        let saveError: unknown;
+        try {
+            await harness.provider.writeFile(
+                harness.uri,
+                new TextEncoder().encode(desired),
+                {create: false, overwrite: true},
+            );
+        } catch (error) {
+            saveError = error;
+        }
+
+        assert.equal(saveError, undefined);
+        assert.equal(server.capturedUpdates.length, 1);
+        assert.equal(server.text(PROJECT_A), desired);
+        harness.dispose();
+    });
+
+    it('uses the live confirmed buffer after a format-on-save edit', async () => {
+        const base = 'alpha omega';
+        const beforeFormat = 'alpha local omega';
+        const afterFormat = 'alpha LOCAL omega';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Public Format On Save', 4);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'public-format-on-save',
+            projectId: PROJECT_A,
+        });
+
+        assert.equal(
+            new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
+            base,
+        );
+        harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.openClean(harness.events);
+        await settleAsyncWork();
+        await settleAsyncWork();
+        editor.editThroughEvents(beforeFormat, harness.events);
+
+        const result = await editor.saveThroughProvider(
+            harness.provider,
+            harness.events,
+            {create: false, overwrite: true},
+            () => editor.editThroughEvents(afterFormat, harness.events),
+        );
+
+        assert.equal(result.saved, true);
+        assert.equal(editor.dirty, false);
+        assert.equal(server.capturedUpdates.length, 1);
+        assert.equal(server.text(PROJECT_A), afterFormat);
+        harness.dispose();
+    });
+
+    it('does not authorize an unconfirmed dirty editor when onWillSaveTextDocument is omitted', async () => {
+        const remote = `base\n${COLLABORATOR}\n`;
+        const restored = 'base\nLOCAL_DRAFT\n';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, remote, PROJECT_A, 'Unconfirmed Save Without Will Event', 9);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'unconfirmed-save-without-will-event',
+            projectId: PROJECT_A,
+        });
+
+        assert.equal(
+            new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
+            remote,
+        );
+        const editor = new SimulatedDirtyEditor(harness.uri, restored);
+        editor.attach();
+
+        await assert.rejects(
+            harness.provider.writeFile(
+                harness.uri,
+                new TextEncoder().encode(restored),
+                {create: false, overwrite: true},
+            ),
+            (error: any) => error?.code === 'Unavailable',
+        );
+
+        assert.equal(editor.dirty, true);
+        assert.equal(server.capturedUpdates.length, 0);
+        assert.equal(server.text(PROJECT_A), remote);
+        harness.dispose();
+    });
+
+    it('accepts an explicit unchanged save from the confirmed clean editor', async () => {
+        const base = 'alpha omega';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Confirmed Clean Save', 4);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'confirmed-clean-save',
+            projectId: PROJECT_A,
+        });
+
+        assert.equal(
+            new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
+            base,
+        );
+        harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.openClean(harness.events);
+        await settleAsyncWork();
+        await settleAsyncWork();
+        assert.equal(editor.dirty, false);
+
+        await harness.provider.writeFile(
+            harness.uri,
+            new TextEncoder().encode(base),
+            {create: false, overwrite: true},
+        );
+
+        assert.equal(server.capturedUpdates.length, 0);
+        assert.equal(server.text(PROJECT_A), base);
+        harness.dispose();
+    });
+
+    it('does not accept a confirmed clean buffer after the remote document advances', async () => {
+        const base = 'alpha omega';
+        const remote = 'REMOTE alpha omega';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Stale Confirmed Clean Save', 4);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'stale-confirmed-clean-save',
+            projectId: PROJECT_A,
+        });
+
+        assert.equal(
+            new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
+            base,
+        );
+        harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.openClean(harness.events);
+        await settleAsyncWork();
+        await settleAsyncWork();
+        server.collaboratorUpdate(PROJECT_A, [{p: 0, i: 'REMOTE '}]);
+
+        await assert.rejects(
+            harness.provider.writeFile(
+                harness.uri,
+                new TextEncoder().encode(base),
+                {create: false, overwrite: true},
+            ),
+            (error: any) => error?.code === 'Unavailable',
+        );
+
+        assert.equal(editor.dirty, false);
+        assert.equal(editor.document.getText(), base);
+        assert.equal(server.capturedUpdates.length, 0);
+        assert.equal(server.text(PROJECT_A), remote);
+        harness.dispose();
+    });
+
+    it('ignores a non-content document change before a later proven edit', async () => {
+        const base = 'alpha omega';
+        const desired = 'alpha LOCAL omega';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Non-content Change', 4);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'non-content-change',
+            projectId: PROJECT_A,
+        });
+
+        assert.equal(
+            new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
+            base,
+        );
+        harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.openClean(harness.events);
+        await settleAsyncWork();
+        await settleAsyncWork();
+
+        harness.events.fireDidChange(editor.document, []);
+        editor.editThroughEvents(desired, harness.events);
+        const result = await editor.saveThroughProvider(harness.provider, harness.events);
+
+        assert.equal(result.saved, true);
+        assert.equal(server.capturedUpdates.length, 1);
+        assert.equal(server.text(PROJECT_A), desired);
+        harness.dispose();
+    });
+
+    it('reanchors an unchanged non-content event that increments the document version', async () => {
+        const base = 'alpha omega';
+        const desired = 'alpha LOCAL omega';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Versioned Non-content Change', 4);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'versioned-non-content-change',
+            projectId: PROJECT_A,
+        });
+
+        assert.equal(
+            new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
+            base,
+        );
+        harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.openClean(harness.events);
+        await settleAsyncWork();
+        await settleAsyncWork();
+
+        editor.version += 1;
+        harness.events.fireDidChange(editor.document, []);
+        editor.editThroughEvents(desired, harness.events);
+        const result = await editor.saveThroughProvider(harness.provider, harness.events);
+
+        assert.equal(result.saved, true);
+        assert.equal(server.capturedUpdates.length, 1);
+        assert.equal(server.text(PROJECT_A), desired);
+        harness.dispose();
+    });
+
+    it('keeps a clean confirmation pending across a versioned non-content event', async () => {
+        const base = 'alpha omega';
+        const desired = 'alpha LOCAL omega';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Pending Versioned Non-content Change', 4);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'pending-versioned-non-content-change',
+            projectId: PROJECT_A,
+        });
+
+        assert.equal(
+            new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
+            base,
+        );
+        const confirmation = harness.events.deferWarningResponse();
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.openClean(harness.events);
+        assert.equal(harness.events.warningMessages.length, 1);
+
+        editor.version += 1;
+        harness.events.fireDidChange(editor.document, []);
+        confirmation.resolve(ENABLE_CLEAN_EDITOR);
+        await settleAsyncWork();
+        await settleAsyncWork();
+
+        editor.editThroughEvents(desired, harness.events);
+        const result = await editor.saveThroughProvider(harness.provider, harness.events);
+
+        assert.equal(result.saved, true);
+        assert.equal(editor.dirty, false);
+        assert.equal(server.capturedUpdates.length, 1);
+        assert.equal(server.text(PROJECT_A), desired);
+        harness.dispose();
+    });
+
+    it('invalidates a pending clean confirmation when the text changes', async () => {
+        const base = 'alpha omega';
+        const desired = 'alpha LOCAL omega';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Pending Content Change', 4);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'pending-content-change',
+            projectId: PROJECT_A,
+        });
+
+        assert.equal(
+            new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
+            base,
+        );
+        const confirmation = harness.events.deferWarningResponse();
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.openClean(harness.events);
+        assert.equal(harness.events.warningMessages.length, 1);
+
+        editor.editThroughEvents(desired, harness.events);
+        confirmation.resolve(ENABLE_CLEAN_EDITOR);
+        await settleAsyncWork();
+        await settleAsyncWork();
+        const result = await editor.saveThroughProvider(harness.provider, harness.events);
+
+        assert.equal(result.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), desired);
+        assert.equal(server.capturedUpdates.length, 0);
+        assert.equal(server.text(PROJECT_A), base);
+        harness.dispose();
+    });
+
+    it('binds an exact clean editor that opened before its provider read', async () => {
+        const base = 'alpha omega';
+        const desired = 'alpha LOCAL omega';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Public Early Clean Open', 4);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'public-early-clean-open',
+            projectId: PROJECT_A,
+        });
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.dirty = false;
+        editor.attach();
+        harness.events.queueWarningResponse(ENABLE_CLEAN_EDITOR);
+
+        assert.equal(
+            new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
+            base,
+        );
+        await settleAsyncWork();
+        await settleAsyncWork();
+        assert.equal(harness.events.warningMessages.length, 1);
+
+        editor.editThroughEvents(desired, harness.events);
+        const result = await editor.saveThroughProvider(harness.provider, harness.events);
+
+        assert.equal(result.saved, true);
+        assert.equal(editor.dirty, false);
+        assert.equal(server.capturedUpdates.length, 1);
+        assert.equal(server.text(PROJECT_A), desired);
+        harness.dispose();
+    });
+
+    it('does not bind a dirty hot-exit editor that opened before its provider read', async () => {
+        const advanced = `base\n${OWN_CONFIRMED}\n${COLLABORATOR}\n`;
+        const restored = 'base\nLOCAL_DRAFT\n';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, advanced, PROJECT_A, 'Public Early Hot Exit', 12);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'public-early-hot-exit',
+            projectId: PROJECT_A,
+        });
+        const editor = new SimulatedDirtyEditor(harness.uri, restored);
+        editor.attach();
+
+        assert.equal(
+            new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
+            advanced,
+        );
+        await settleAsyncWork();
+        assert.equal(harness.events.warningMessages.length, 0);
+
+        const result = await editor.saveThroughProvider(harness.provider, harness.events);
+
+        assert.equal(result.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), restored);
+        assert.equal(server.capturedUpdates.length, 0);
+        assert.equal(server.text(PROJECT_A), advanced);
+        assert.match(server.text(PROJECT_A), new RegExp(OWN_CONFIRMED));
+        assert.match(server.text(PROJECT_A), new RegExp(COLLABORATOR));
+        harness.dispose();
+    });
+
+    it('rejects a missed-open hot-exit overlay before read confirmation', async () => {
+        const advanced = `base\n${OWN_CONFIRMED}\n${COLLABORATOR}\n`;
+        const restored = 'base\nLOCAL_DRAFT\n';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, advanced, PROJECT_A, 'Public Missed Open Overlay', 12);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'public-missed-open-overlay',
+            projectId: PROJECT_A,
+        });
+        const editor = new SimulatedDirtyEditor(harness.uri, advanced);
+        editor.dirty = false;
+        editor.attach();
+        const confirmation = harness.events.deferWarningResponse();
+
+        assert.equal(
+            new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
+            advanced,
+        );
+        editor.editThroughEvents(restored, harness.events);
+        confirmation.resolve(ENABLE_CLEAN_EDITOR);
+        await settleAsyncWork();
+        await settleAsyncWork();
+
+        const result = await editor.saveThroughProvider(harness.provider, harness.events);
+
+        assert.equal(result.saved, false);
+        assert.equal(editor.dirty, true);
+        assert.equal(editor.document.getText(), restored);
+        assert.equal(server.capturedUpdates.length, 0);
+        assert.equal(server.text(PROJECT_A), advanced);
+        assert.match(server.text(PROJECT_A), new RegExp(OWN_CONFIRMED));
+        assert.match(server.text(PROJECT_A), new RegExp(COLLABORATOR));
+        harness.dispose();
+    });
+
+    it('does not let an obsolete read confirmation delete a refreshed candidate', async () => {
+        const base = 'alpha omega';
+        const refreshed = 'alpha REMOTE omega';
+        const desired = 'alpha REMOTE LOCAL omega';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Public Confirmation Refresh', 4);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'public-confirmation-refresh',
+            projectId: PROJECT_A,
+        });
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.dirty = false;
+        editor.attach();
+        const firstConfirmation = harness.events.deferWarningResponse();
+        assert.equal(new TextDecoder().decode(await harness.provider.readFile(harness.uri)), base);
+
+        server.collaboratorUpdate(PROJECT_A, [{p: 6, i: 'REMOTE '}]);
+        editor.refreshThroughEvents(refreshed, harness.events);
+        const secondConfirmation = harness.events.deferWarningResponse();
+        assert.equal(
+            new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
+            refreshed,
+        );
+        assert.equal(harness.events.warningMessages.length, 2);
+
+        firstConfirmation.resolve(ENABLE_CLEAN_EDITOR);
+        await settleAsyncWork();
+        secondConfirmation.resolve(ENABLE_CLEAN_EDITOR);
+        await settleAsyncWork();
+        await settleAsyncWork();
+
+        editor.editThroughEvents(desired, harness.events);
+        const result = await editor.saveThroughProvider(harness.provider, harness.events);
+
+        assert.equal(result.saved, true);
+        assert.equal(editor.dirty, false);
+        assert.equal(server.capturedUpdates.length, 1);
+        assert.equal(server.text(PROJECT_A), desired);
+        harness.dispose();
+    });
+
+    it('does not let a pre-reconnect confirmation delete the new-session candidate', async () => {
+        const base = 'alpha omega';
+        const desired = 'alpha LOCAL omega';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Public Confirmation Reconnect', 4);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'public-confirmation-reconnect',
+            projectId: PROJECT_A,
+        });
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.dirty = false;
+        editor.attach();
+        const firstConfirmation = harness.events.deferWarningResponse();
+        assert.equal(new TextDecoder().decode(await harness.provider.readFile(harness.uri)), base);
+
+        harness.socket.disconnect();
+        await harness.vfs.init();
+        const secondConfirmation = harness.events.deferWarningResponse();
+        assert.equal(new TextDecoder().decode(await harness.provider.readFile(harness.uri)), base);
+        assert.equal(harness.events.warningMessages.length, 2);
+
+        firstConfirmation.resolve(ENABLE_CLEAN_EDITOR);
+        await settleAsyncWork();
+        secondConfirmation.resolve(ENABLE_CLEAN_EDITOR);
         await settleAsyncWork();
         await settleAsyncWork();
 

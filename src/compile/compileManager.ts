@@ -484,8 +484,16 @@ export class CompileManager {
                         );
                     if (!isCurrent()) { return; }
                     if (cachedOutcome) {
-                        await this.commitCompileOutcome(cachedOutcome, compileUri, isCurrent);
-                        return;
+                        try {
+                            await this.commitCompileOutcome(cachedOutcome, compileUri, isCurrent);
+                            return;
+                        } catch (error) {
+                            if (!isCurrent()) { return; }
+                            console.warn(
+                                'Cached Overleaf compile output is unavailable; running a fresh compile.',
+                                error,
+                            );
+                        }
                     }
                     await this.saveAllForCompile();
                     if (!isCurrent()) { return; }

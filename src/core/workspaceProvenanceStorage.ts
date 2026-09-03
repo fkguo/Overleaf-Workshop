@@ -1,8 +1,13 @@
 import * as vscode from 'vscode';
-import { randomUUID } from 'crypto';
 import { ProvenanceStorage } from './documentProvenance';
 
 const PROVENANCE_FOLDER = 'document-provenance-v2';
+let temporarySequence = 0;
+
+function nextTemporaryName(): string {
+    temporarySequence += 1;
+    return `.tmp-${process.pid.toString(36)}-${temporarySequence.toString(36)}`;
+}
 
 function isFileNotFound(error: unknown): boolean {
     return error instanceof vscode.FileSystemError && error.code === 'FileNotFound';
@@ -58,7 +63,7 @@ export class WorkspaceProvenanceStorage implements ProvenanceStorage {
     async write(name: string, data: Uint8Array): Promise<void> {
         const root = this.assertAvailable();
         const target = this.recordUri(name);
-        const temporary = vscode.Uri.joinPath(root, `.${name}.${randomUUID()}.tmp`);
+        const temporary = vscode.Uri.joinPath(root, nextTemporaryName());
         await vscode.workspace.fs.createDirectory(root);
         try {
             await vscode.workspace.fs.writeFile(temporary, data);

@@ -771,11 +771,14 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     private stageEditorBase(uri: vscode.Uri, doc: DocumentEntity, content: string) {
         const resourceKey = this.resourceKey(uri);
-        this.documentIdsByPath.set(resourceKey, doc._id);
-        if (!isNonnegativeSafeInteger(doc.version)) {
+        if (!isNonnegativeSafeInteger(doc.version)
+            || typeof doc._id !== 'string'
+            || doc._id.length === 0) {
             this.stagedEditorBases.delete(resourceKey);
+            this.documentIdsByPath.delete(resourceKey);
             return;
         }
+        this.documentIdsByPath.set(resourceKey, doc._id);
         this.stagedEditorBases.set(resourceKey, {
             docId: doc._id,
             canonicalEditorUri: this.canonicalEditorUri(doc._id),
@@ -801,6 +804,17 @@ export class VirtualFileSystem extends vscode.Disposable {
             content,
             publicId: sender.publicId,
             socketGeneration: sender.generation,
+        });
+        // A restored editor can be published to workspace.textDocuments before
+        // the file-system read which activates/constructs this VFS. In that
+        // ordering its onDidOpen notification cannot consume the read ticket.
+        // Revisit only the exact already-open URI now that the authoritative
+        // read exists. Dirty hot-exit buffers are still rejected by
+        // observeOpenedTextDocument and never become active editor bases.
+        vscode.workspace.textDocuments.forEach(document => {
+            if (!document.isClosed && this.resourceKey(document.uri) === resourceKey) {
+                this.observeOpenedTextDocument(document);
+            }
         });
     }
 
@@ -839,10 +853,10 @@ export class VirtualFileSystem extends vscode.Disposable {
                     || existingBuffer.document !== document
                     || existingBuffer.resourceKey !== resourceKey)
                 && !staged)) {
-            // A dirty editor incarnation which was not bound while clean cannot
-            // acquire a remote identity later from a mutable path cache. A
-            // collaborator may create or rename a different document onto that
-            // path between onWillSave and writeFile.
+            // A dirty editor incarnation without even a staged provider read
+            // cannot acquire a remote identity from a mutable path cache. A
+            // staged read may identify the path, but only a confirmed clean
+            // document can acquire an active base and authorize an operation.
             this.unboundEditorIncarnations.add(document);
             return undefined;
         }
@@ -850,7 +864,9 @@ export class VirtualFileSystem extends vscode.Disposable {
             ?? this.documentIdsByPath.get(resourceKey)
             ?? this.cachedDocumentIdForUri(document.uri);
         if (!docId) { return undefined; }
-        this.documentIdsByPath.set(resourceKey, docId);
+        if (staged?.docId === docId) {
+            this.documentIdsByPath.set(resourceKey, docId);
+        }
         let bufferId = this.editorBufferIds.get(document);
         if (!bufferId) {
             bufferId = randomUUID();
@@ -885,9 +901,8 @@ export class VirtualFileSystem extends vscode.Disposable {
      * quarantined until the user explicitly requests a fresh remote recheck.
      */
     observeOpenedTextDocument(document: vscode.TextDocument) {
-        const alreadyObserved = this.editorBufferIds.has(document);
         const buffer = this.observeEditorBuffer(document);
-        if (!buffer || alreadyObserved || document.isClosed || document.isDirty) { return; }
+        if (!buffer || document.isClosed || document.isDirty) { return; }
         const ticket = this.pendingReadTickets.get(buffer.resourceKey);
         const sender = this.currentSenderWitness();
         if (!ticket
@@ -897,6 +912,26 @@ export class VirtualFileSystem extends vscode.Disposable {
             || ticket.content !== document.getText()
             || sender?.publicId !== ticket.publicId
             || sender.generation !== ticket.socketGeneration) {
+            return;
+        }
+        const active = this.activeEditorBases.get(buffer.bufferId);
+        if (active
+            && active.identity.docId === ticket.docId
+            && active.version === ticket.version
+            && active.content === ticket.content
+            && active.causality.valid
+            && active.causality.socketGeneration === ticket.socketGeneration) {
+            this.pendingReadTickets.delete(buffer.resourceKey);
+            return;
+        }
+        const existingCandidate = this.boundReadCandidates.get(buffer.bufferId);
+        if (existingCandidate?.document === document
+            && existingCandidate.ticket.docId === ticket.docId
+            && existingCandidate.ticket.version === ticket.version
+            && existingCandidate.ticket.content === ticket.content
+            && existingCandidate.ticket.publicId === ticket.publicId
+            && existingCandidate.ticket.socketGeneration === ticket.socketGeneration) {
+            this.pendingReadTickets.delete(buffer.resourceKey);
             return;
         }
         this.pendingReadTickets.delete(buffer.resourceKey);
@@ -937,7 +972,12 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     private async confirmBoundReadCandidate(candidate: BoundProviderReadCandidate): Promise<boolean> {
-        const {document, ticket, bufferId, documentVersion} = candidate;
+        const {document, ticket, bufferId} = candidate;
+        const discardCandidate = () => {
+            if (this.boundReadCandidates.get(bufferId) === candidate) {
+                this.boundReadCandidates.delete(bufferId);
+            }
+        };
         vscode.workspace.textDocuments.forEach(openDocument => {
             this.observeEditorBuffer(openDocument);
         });
@@ -958,12 +998,12 @@ export class VirtualFileSystem extends vscode.Disposable {
             || this.exactOpenDocument(document.uri) !== document
             || document.isClosed
             || document.isDirty
-            || document.version !== documentVersion
+            || document.version < candidate.documentVersion
             || document.getText() !== ticket.content
             || sender?.publicId !== ticket.publicId
             || sender.generation !== ticket.socketGeneration
             || hasOtherDirtyAlias) {
-            this.boundReadCandidates.delete(bufferId);
+            discardCandidate();
             return false;
         }
 
@@ -971,11 +1011,16 @@ export class VirtualFileSystem extends vscode.Disposable {
         try {
             authoritative = await this.joinFreshDocumentSession(ticket.docId);
         } catch {
-            this.boundReadCandidates.delete(bufferId);
+            discardCandidate();
             return false;
         }
+        vscode.workspace.textDocuments.forEach(openDocument => {
+            this.observeEditorBuffer(openDocument);
+        });
         const senderAfter = this.currentSenderWitness();
-        const identity = this.documentProvenanceIdentity(ticket.docId, buffer);
+        const bufferAfter = this.editorBuffers.get(bufferId);
+        const identity = bufferAfter ?
+            this.documentProvenanceIdentity(ticket.docId, bufferAfter) : undefined;
         const hasOtherDirtyAliasAfter = [...this.editorBuffers.values()].some(other =>
             other.bufferId !== bufferId
             && other.canonicalEditorUri === ticket.canonicalEditorUri
@@ -984,11 +1029,14 @@ export class VirtualFileSystem extends vscode.Disposable {
             && other.document.isDirty
         );
         if (this.boundReadCandidates.get(bufferId) !== candidate
-            || this.editorBuffers.get(bufferId)?.document !== document
+            || bufferAfter?.document !== document
+            || bufferAfter.resourceKey !== ticket.resourceKey
+            || bufferAfter.docId !== ticket.docId
+            || bufferAfter.canonicalEditorUri !== ticket.canonicalEditorUri
             || this.exactOpenDocument(document.uri) !== document
             || document.isClosed
             || document.isDirty
-            || document.version !== documentVersion
+            || document.version < candidate.documentVersion
             || document.getText() !== ticket.content
             || authoritative.doc.version !== ticket.version
             || authoritative.content !== ticket.content
@@ -1001,7 +1049,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             || senderAfter.generation !== ticket.socketGeneration
             || hasOtherDirtyAliasAfter
             || !identity) {
-            this.boundReadCandidates.delete(bufferId);
+            discardCandidate();
             return false;
         }
 
@@ -1018,7 +1066,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             ),
         });
         authoritative.doc.localCache = ticket.content;
-        this.boundReadCandidates.delete(bufferId);
+        discardCandidate();
         return true;
     }
 
@@ -1027,7 +1075,14 @@ export class VirtualFileSystem extends vscode.Disposable {
         const bufferId = this.editorBufferIds.get(document);
         const candidate = bufferId ? this.boundReadCandidates.get(bufferId) : undefined;
         if (candidate?.document === document) {
-            this.boundReadCandidates.delete(bufferId!);
+            if (event.contentChanges.length > 0
+                || document.isDirty
+                || document.version < candidate.documentVersion
+                || document.getText() !== candidate.ticket.content) {
+                this.boundReadCandidates.delete(bufferId!);
+            } else {
+                candidate.documentVersion = document.version;
+            }
         }
         const buffer = this.observeEditorBuffer(document);
         const active = buffer ? this.activeEditorBases.get(buffer.bufferId) : undefined;
@@ -1039,18 +1094,28 @@ export class VirtualFileSystem extends vscode.Disposable {
                 rangeLength: change.rangeLength,
                 text: change.text,
             }));
-            const operations = causality.valid
-                && sender?.generation === causality.socketGeneration
-                && document.version === causality.documentVersion + 1 ?
-                operationsFromObservedTextChanges(
-                    causality.content,
-                    changes,
-                    document.getText(),
-                ) : undefined;
-            if (!operations) {
-                causality.valid = false;
+            if (changes.length === 0) {
+                // onDidChangeTextDocument also reports dirty-state and encoding
+                // changes. They are not missing text operations when the text
+                // itself is unchanged.
+                causality.valid = causality.valid
+                    && sender?.generation === causality.socketGeneration
+                    && document.version >= causality.documentVersion
+                    && document.getText() === causality.content;
             } else {
-                causality.operations.push(...operations);
+                const operations = causality.valid
+                    && sender?.generation === causality.socketGeneration
+                    && document.version === causality.documentVersion + 1 ?
+                    operationsFromObservedTextChanges(
+                        causality.content,
+                        changes,
+                        document.getText(),
+                    ) : undefined;
+                if (!operations) {
+                    causality.valid = false;
+                } else {
+                    causality.operations.push(...operations);
+                }
             }
             causality.documentVersion = document.version;
             causality.content = document.getText();
@@ -1227,21 +1292,55 @@ export class VirtualFileSystem extends vscode.Disposable {
             };
         }
         const resourceKey = this.resourceKey(uri);
-        const exact = [...this.editorSaveIntents.values()].filter(intent =>
+        const matchingIntents = [...this.editorSaveIntents.values()].filter(intent =>
             intent.canonicalEditorUri === canonicalEditorUri
             && intent.resourceKey === resourceKey
             && openDocuments.has(intent.document)
         );
-        if (exact.length !== 1) {
+        const exactIntents = matchingIntents.filter(intent =>
+            intent.docId === docId
+            && intent.documentVersion === intent.document.version
+            && intent.content === desiredContent
+            && this.bufferMatchesWitness(intent)
+        );
+        matchingIntents.forEach(intent => {
+            if (!exactIntents.includes(intent)) {
+                this.editorSaveIntents.delete(intent.bufferId);
+            }
+        });
+        if (exactIntents.length > 1) {
             return {
                 kind: 'blocked',
-                reason: exact.length === 0 ?
-                    'no unique observed dirty editor buffer matches this save' :
-                    'the editor URI resolves to multiple dirty buffer incarnations',
+                reason: 'the editor URI resolves to multiple dirty buffer incarnations',
             };
         }
-        const witness = exact[0];
-        this.editorSaveIntents.delete(witness.bufferId);
+        let witness = exactIntents[0];
+        if (witness) {
+            this.editorSaveIntents.delete(witness.bufferId);
+        } else {
+            // VS Code explicitly permits saves which omit onWillSaveTextDocument.
+            // It can also apply format-on-save edits after onWillSave. In both
+            // paths, writeFile's exact URI and bytes can identify an
+            // already-confirmed live buffer without granting a new identity.
+            const live = [...this.editorBuffers.values()].filter(buffer =>
+                buffer.canonicalEditorUri === canonicalEditorUri
+                && buffer.resourceKey === resourceKey
+                && openDocuments.has(buffer.document)
+                && buffer.document.getText() === desiredContent
+                && this.activeEditorBases.has(buffer.bufferId)
+            );
+            if (live.length !== 1) {
+                return {
+                    kind: 'blocked',
+                    reason: 'no unique confirmed editor buffer matches this save',
+                };
+            }
+            witness = {
+                ...live[0],
+                documentVersion: live[0].document.version,
+                content: desiredContent,
+            };
+        }
         if (witness.docId !== docId
             || witness.content !== desiredContent
             || !this.bufferMatchesWitness(witness)) {

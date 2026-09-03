@@ -234,7 +234,7 @@ describe('prepareProvenDocumentUpdate', () => {
         );
     });
 
-    it('never replays a pending write, but permits an authoritative no-wire completion', () => {
+    it('never clears or replays a pending write from snapshot coincidence', () => {
         assert.deepEqual(
             prepareProvenDocumentUpdate(
                 base(12, 'base', true),
@@ -245,16 +245,15 @@ describe('prepareProvenDocumentUpdate', () => {
             ),
             {status: 'blocked', reason: 'pending-write'},
         );
-        const confirmed = prepareProvenDocumentUpdate(
-            base(12, 'base', true),
-            13,
-            'desired',
-            'desired',
+        assert.deepEqual(
+            prepareProvenDocumentUpdate(
+                base(12, 'base', true),
+                13,
+                'desired',
+                'desired',
+            ),
+            {status: 'blocked', reason: 'pending-write'},
         );
-        assert.equal(confirmed.status, 'noop');
-        if (confirmed.status === 'noop') {
-            assert.deepEqual(confirmed.prepared.operations, []);
-        }
     });
 });
 

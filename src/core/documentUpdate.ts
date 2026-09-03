@@ -421,11 +421,11 @@ export function prepareProvenDocumentUpdate(
     if (base && remoteVersion === base.version && base.content !== remoteContent) {
         return {status: 'blocked', reason: 'content-version-mismatch'};
     }
+    if (base?.pendingWrite) { return {status: 'blocked', reason: 'pending-write'}; }
     if (remoteContent === desiredContent) {
         return {status: 'noop', prepared: noWire(remoteContent)};
     }
     if (!base) { return {status: 'blocked', reason: 'missing-base'}; }
-    if (base.pendingWrite) { return {status: 'blocked', reason: 'pending-write'}; }
     if (!evidence) { return {status: 'blocked', reason: 'missing-local-causality'}; }
 
     let localOperations: TextOperation[];
