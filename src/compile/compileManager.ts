@@ -32,17 +32,26 @@ const severityMap: Record<string, vscode.DiagnosticSeverity> = {
     information: vscode.DiagnosticSeverity.Information,
 };
 
+type PdfViewRecord = {
+    doc: PdfDocument,
+    webviewPanel: vscode.WebviewPanel,
+    ready: boolean,
+};
+
 const pdfViewRecord: {
     [key: string]: {
-        [key: string]: {
-            doc: PdfDocument,
-            webviewPanel: vscode.WebviewPanel,
-            ready: boolean,
-        }
+        [key: string]: PdfViewRecord,
     }
 } = {};
 
-const pendingPdfSync: {[key: string]: SyncCodeResponseSchema} = {};
+type PendingPdfSync = {
+    result: SyncCodeResponseSchema,
+    requestGeneration: number,
+    expectedRecord?: PdfViewRecord,
+    isStillApplicable?: () => boolean,
+};
+
+const pendingPdfSync: {[key: string]: PendingPdfSync} = {};
 const sourceSyncRequests = new LatestRequestGate();
 
 function pdfRecordKey(identifier: string, filePath: string): string {
@@ -52,6 +61,19 @@ function pdfRecordKey(identifier: string, filePath: string): string {
 type PendingSourceSync = SynctexSourceLocation & {
     projectUri: vscode.Uri,
     identifier: string,
+};
+
+type CapturedCompileSourceSync = PendingSourceSync & {
+    sourceUri: vscode.Uri,
+    sourceDocumentVersion: number,
+    selectionLine: number,
+    selectionCharacter: number,
+};
+
+type SourceSyncDeliveryGuard = {
+    requestGeneration?: number,
+    expectedRecord?: PdfViewRecord,
+    isStillApplicable?: () => boolean,
 };
 
 class CompileDiagnosticProvider {
@@ -182,6 +204,12 @@ export class CompileManager {
         this.pdfWillOpenTrigger = EventBus.on('pdfWillOpenEvent', ({uri, doc, webviewPanel}) => {
             const {identifier,pathParts} = parseUri(uri);
             const filePath = pathParts.join('/');
+            const recordKey = pdfRecordKey(identifier, filePath);
+            const previousRecord = pdfViewRecord[identifier]?.[filePath];
+            if (previousRecord && previousRecord.webviewPanel !== webviewPanel) {
+                delete pendingPdfSync[recordKey];
+                sourceSyncRequests.invalidate(recordKey);
+            }
             if (pdfViewRecord[identifier]) {
                 pdfViewRecord[identifier][filePath] = {doc, webviewPanel, ready: false};
             } else {
@@ -198,7 +226,13 @@ export class CompileManager {
             const pending = pendingPdfSync[pendingKey];
             if (pending) {
                 delete pendingPdfSync[pendingKey];
-                void record.webviewPanel.webview.postMessage({type: 'syncCode', content: pending});
+                if (
+                    sourceSyncRequests.isCurrent(pendingKey, pending.requestGeneration) &&
+                    (!pending.expectedRecord || pending.expectedRecord === record) &&
+                    (!pending.isStillApplicable || pending.isStillApplicable())
+                ) {
+                    void record.webviewPanel.webview.postMessage({type: 'syncCode', content: pending.result});
+                }
             }
         });
         this.pdfViewDisposedTrigger = EventBus.on('pdfViewDisposedEvent', ({uri, webviewPanel}) => {
@@ -349,6 +383,7 @@ export class CompileManager {
         outcome: CompileOutcome,
         compileUri: vscode.Uri,
         isCurrent: () => boolean,
+        capturedSourcePromise?: Promise<CapturedCompileSourceSync | undefined>,
     ) {
         let hasDiagnosticError = false;
         if (outcome.outputsUpdated && outcome.hasLog) {
@@ -373,10 +408,68 @@ export class CompileManager {
         // the visible PDF remains the last successful build.
         if (outcome.successful) {
             const { identifier } = parseUri(compileUri);
-            pdfViewRecord[identifier] && Object.values(pdfViewRecord[identifier]).forEach(
-                (record) => record.doc.refresh()
-            );
+            await this.refreshCompiledPdf(identifier, capturedSourcePromise, isCurrent);
         }
+    }
+
+    private async refreshCompiledPdf(
+        identifier: string,
+        capturedSourcePromise: Promise<CapturedCompileSourceSync | undefined> | undefined,
+        isCurrent: () => boolean,
+    ) {
+        const pdfPath = `${OUTPUT_FOLDER_NAME}/output.pdf`;
+        const record = pdfViewRecord[identifier]?.[pdfPath];
+        if (!record) { return; }
+
+        const recordKey = pdfRecordKey(identifier, pdfPath);
+        // The refreshed PDF supersedes every request or result associated with
+        // the previously visible build. Reserve its generation before the
+        // asynchronous refresh so an older SyncTeX result cannot land between
+        // the PDF update and the new request.
+        const requestGeneration = sourceSyncRequests.begin(recordKey);
+        delete pendingPdfSync[recordKey];
+
+        try {
+            await record.doc.refresh();
+        } catch (error) {
+            console.warn('Unable to refresh the compiled Overleaf PDF.', error);
+            return;
+        }
+
+        if (
+            !isCurrent() ||
+            pdfViewRecord[identifier]?.[pdfPath] !== record ||
+            !sourceSyncRequests.isCurrent(recordKey, requestGeneration) ||
+            !capturedSourcePromise
+        ) { return; }
+
+        // Source resolution is optional navigation work and must not extend the
+        // compile run. The generation, record and editor witnesses below keep
+        // the detached request bound to this exact PDF refresh.
+        void capturedSourcePromise.then(capturedSource => {
+            if (
+                !capturedSource ||
+                capturedSource.identifier !== identifier ||
+                pdfViewRecord[identifier]?.[pdfPath] !== record ||
+                !sourceSyncRequests.isCurrent(recordKey, requestGeneration) ||
+                !this.isCapturedCompileSourceStillApplicable(capturedSource)
+            ) { return; }
+            return this.requestSourceSync(capturedSource, {
+                requestGeneration,
+                expectedRecord: record,
+                isStillApplicable: () => this.isCapturedCompileSourceStillApplicable(capturedSource),
+            });
+        }).catch(error => {
+            // SyncTeX is an optional navigation aid. A missing map or transient
+            // proxy failure must not turn a successful compile into a failure.
+            console.warn('Unable to forward-sync the compiled Overleaf PDF.', error);
+        });
+    }
+
+    private invalidateSourceSync(identifier: string) {
+        const recordKey = pdfRecordKey(identifier, `${OUTPUT_FOLDER_NAME}/output.pdf`);
+        delete pendingPdfSync[recordKey];
+        sourceSyncRequests.invalidate(recordKey);
     }
 
     private async saveAllForCompile() {
@@ -435,6 +528,11 @@ export class CompileManager {
             return;
         }
 
+        // Start the snapshot before the first awaited compile lookup. This is
+        // the TeX cursor which triggered the build, not whichever editor is
+        // active after the PDF has refreshed.
+        const capturedSourcePromise = this.captureCompileSourceSync().catch(() => undefined);
+
         await this.compileRunGate.run(async (isCurrent) => {
             let uri: vscode.Uri | undefined;
             try {
@@ -446,6 +544,11 @@ export class CompileManager {
                     return;
                 }
                 const compileUri = uri;
+                // A compile can replace the VFS build identity before its PDF
+                // refresh is committed. Invalidate requests from the previous
+                // build at run start so a delayed response cannot be resolved
+                // against the new build and delivered to the old PDF.
+                this.invalidateSourceSync(parseUri(compileUri).identifier);
 
                 // On project open, probe the last successful server build before
                 // saveAll. Otherwise the save event is suppressed by this active
@@ -485,7 +588,12 @@ export class CompileManager {
                     if (!isCurrent()) { return; }
                     if (cachedOutcome) {
                         try {
-                            await this.commitCompileOutcome(cachedOutcome, compileUri, isCurrent);
+                            await this.commitCompileOutcome(
+                                cachedOutcome,
+                                compileUri,
+                                isCurrent,
+                                capturedSourcePromise,
+                            );
                             return;
                         } catch (error) {
                             if (!isCurrent()) { return; }
@@ -518,7 +626,7 @@ export class CompileManager {
                     await this.update('success', compileUri, isCurrent);
                     return;
                 }
-                await this.commitCompileOutcome(result, compileUri, isCurrent);
+                await this.commitCompileOutcome(result, compileUri, isCurrent, capturedSourcePromise);
             } catch (error) {
                 if (!isCurrent()) { return; }
                 console.error('Compile failed unexpectedly.', error);
@@ -587,16 +695,10 @@ export class CompileManager {
         }
     }
 
-    private async captureSourceSync(): Promise<PendingSourceSync | undefined> {
-        const editor = vscode.window.activeTextEditor;
-        if (!editor) { return undefined; }
-        // Snapshot everything which can change before the first asynchronous
-        // settings/VFS lookup.
-        const sourceUri = editor.document.uri;
-        const position = {
-            line: editor.selection.active.line,
-            character: editor.selection.active.character,
-        };
+    private async resolveSourceSync(
+        sourceUri: vscode.Uri,
+        position: {line: number, character: number},
+    ): Promise<PendingSourceSync | undefined> {
         const projectUri = await CompileManager.check(sourceUri);
         if (!projectUri) { return undefined; }
 
@@ -621,27 +723,103 @@ export class CompileManager {
         };
     }
 
-    private deliverSourceSync(identifier: string, result: SyncCodeResponseSchema) {
+    private async captureSourceSync(): Promise<PendingSourceSync | undefined> {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) { return undefined; }
+        // Snapshot everything which can change before the first asynchronous
+        // settings/VFS lookup.
+        return this.resolveSourceSync(editor.document.uri, {
+            line: editor.selection.active.line,
+            character: editor.selection.active.character,
+        });
+    }
+
+    private async captureCompileSourceSync(): Promise<CapturedCompileSourceSync | undefined> {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) { return undefined; }
+        const sourceUri = editor.document.uri;
+        if (sourceUri.scheme !== ROOT_NAME || !sourceUri.path.toLowerCase().endsWith('.tex')) {
+            return undefined;
+        }
+        const selectionLine = editor.selection.active.line;
+        const selectionCharacter = editor.selection.active.character;
+        const sourceDocumentVersion = editor.document.version;
+        const source = await this.resolveSourceSync(sourceUri, {
+            line: selectionLine,
+            character: selectionCharacter,
+        });
+        return source && {
+            ...source,
+            sourceUri,
+            sourceDocumentVersion,
+            selectionLine,
+            selectionCharacter,
+        };
+    }
+
+    private isCapturedCompileSourceStillApplicable(source: CapturedCompileSourceSync): boolean {
+        const editor = vscode.window.activeTextEditor;
+        return Boolean(
+            editor &&
+            editor.document.uri.toString() === source.sourceUri.toString() &&
+            editor.document.version === source.sourceDocumentVersion &&
+            editor.selection.active.line === source.selectionLine &&
+            editor.selection.active.character === source.selectionCharacter
+        );
+    }
+
+    private deliverSourceSync(
+        identifier: string,
+        result: SyncCodeResponseSchema,
+        guard: Required<Pick<SourceSyncDeliveryGuard, 'requestGeneration'>> & SourceSyncDeliveryGuard,
+    ) {
         const pdfPath = `${OUTPUT_FOLDER_NAME}/output.pdf`;
         const record = pdfViewRecord[identifier]?.[pdfPath];
+        const recordKey = pdfRecordKey(identifier, pdfPath);
+        if (
+            !sourceSyncRequests.isCurrent(recordKey, guard.requestGeneration) ||
+            (guard.expectedRecord && guard.expectedRecord !== record) ||
+            (guard.isStillApplicable && !guard.isStillApplicable())
+        ) { return; }
         if (!record?.ready) {
-            pendingPdfSync[pdfRecordKey(identifier, pdfPath)] = result;
+            pendingPdfSync[recordKey] = {
+                result,
+                requestGeneration: guard.requestGeneration,
+                expectedRecord: guard.expectedRecord,
+                isStillApplicable: guard.isStillApplicable,
+            };
             return;
         }
         void record.webviewPanel.webview.postMessage({type: 'syncCode', content: result});
     }
 
-    private async requestSourceSync(source: PendingSourceSync) {
+    private async requestSourceSync(
+        source: PendingSourceSync,
+        guard: SourceSyncDeliveryGuard = {},
+    ) {
         const pdfPath = `${OUTPUT_FOLDER_NAME}/output.pdf`;
         const recordKey = pdfRecordKey(source.identifier, pdfPath);
-        const requestGeneration = sourceSyncRequests.begin(recordKey);
+        const requestGeneration = guard.requestGeneration ?? sourceSyncRequests.begin(recordKey);
         // A newly requested cursor location supersedes any older result which
         // was waiting for the PDF viewer to become ready.
         delete pendingPdfSync[recordKey];
+        if (
+            !sourceSyncRequests.isCurrent(recordKey, requestGeneration) ||
+            (guard.expectedRecord && pdfViewRecord[source.identifier]?.[pdfPath] !== guard.expectedRecord) ||
+            (guard.isStillApplicable && !guard.isStillApplicable())
+        ) { return; }
         const vfs = await this.vfsm.prefetch(source.projectUri);
+        if (
+            !sourceSyncRequests.isCurrent(recordKey, requestGeneration) ||
+            (guard.expectedRecord && pdfViewRecord[source.identifier]?.[pdfPath] !== guard.expectedRecord) ||
+            (guard.isStillApplicable && !guard.isStillApplicable())
+        ) { return; }
         const result = await vfs.syncCode(source.file, source.line, source.column);
         if (result?.length && sourceSyncRequests.isCurrent(recordKey, requestGeneration)) {
-            this.deliverSourceSync(source.identifier, result);
+            this.deliverSourceSync(source.identifier, result, {
+                ...guard,
+                requestGeneration,
+            });
         }
     }
 

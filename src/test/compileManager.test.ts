@@ -15,7 +15,8 @@ class MarkdownStringStub {
 }
 
 const statusItems: any[] = [];
-let executeCommand = async (_command: string): Promise<unknown> => undefined;
+const executedCommands: string[] = [];
+let executeCommand = async (_command: string, ..._args: unknown[]): Promise<unknown> => undefined;
 const vscodeStub = {
     DiagnosticSeverity: {Error: 0, Warning: 1, Information: 2},
     StatusBarAlignment: {Left: 1},
@@ -31,7 +32,8 @@ const vscodeStub = {
         createDiagnosticCollection: () => ({clear() {}, set() {}, dispose() {}}),
     },
     window: {
-        activeTextEditor: undefined,
+        activeTextEditor: undefined as any,
+        visibleTextEditors: [] as any[],
         createStatusBarItem: () => {
             const item = {
                 text: '',
@@ -48,21 +50,39 @@ const vscodeStub = {
     },
     workspace: {
         workspaceFolders: undefined,
-        textDocuments: [],
+        textDocuments: [] as any[],
         saveAll: async () => true,
         getConfiguration: () => ({get: (_key: string, fallback: unknown) => fallback}),
+        getWorkspaceFolder: () => undefined,
     },
     commands: {
-        executeCommand: (command: string) => executeCommand(command),
+        executeCommand: (command: string, ...args: unknown[]) => {
+            executedCommands.push(command);
+            return executeCommand(command, ...args);
+        },
         registerCommand: () => new DisposableStub(),
     },
 };
 
+const eventListeners = new Map<string, Set<(arg: any) => void>>();
 const eventBusStub = {
     EventBus: {
-        on: () => new DisposableStub(),
+        on: (eventName: string, listener: (arg: any) => void) => {
+            const listeners = eventListeners.get(eventName) ?? new Set();
+            listeners.add(listener);
+            eventListeners.set(eventName, listeners);
+            return {
+                dispose: () => listeners.delete(listener),
+            };
+        },
     },
 };
+
+function fireEvent(eventName: string, arg: any) {
+    for (const listener of eventListeners.get(eventName) ?? []) {
+        listener(arg);
+    }
+}
 
 const moduleLoader = require('module') as ModuleLoader;
 const originalLoad = moduleLoader._load;
@@ -72,7 +92,7 @@ moduleLoader._load = function(request, parent, isMain): unknown {
     if (request === 'vscode') { return vscodeStub; }
     if (request === '../core/remoteFileSystemProvider') {
         return {
-            parseUri: () => ({identifier: 'project', pathParts: []}),
+            parseUri: (uri: any) => ({identifier: uri.identifier, pathParts: uri.pathParts}),
         };
     }
     if (request === '../core/pdfViewEditorProvider') { return {}; }
@@ -96,19 +116,139 @@ try {
     }
 }
 
+let nextProject = 0;
+const managers: any[] = [];
+
+function makeUri(identifier: string, pathParts: string[]): any {
+    const [userId, projectId, projectName] = identifier.split('/');
+    const path = `/${projectName}/${pathParts.join('/')}`;
+    const query = `user=${encodeURIComponent(userId)}&project=${encodeURIComponent(projectId)}`;
+    return {
+        scheme: 'overleaf-workshop',
+        authority: 'www.overleaf.com',
+        identifier,
+        pathParts,
+        path,
+        query,
+        toString: () => `overleaf-workshop://www.overleaf.com${path}?${query}`,
+    };
+}
+
+function projectFixture() {
+    nextProject += 1;
+    const identifier = `user/project-${nextProject}/Project-${nextProject}`;
+    return {
+        identifier,
+        sourceUri: makeUri(identifier, ['main.tex']),
+        compileUri: makeUri(identifier, ['main.tex']),
+        pdfUri: makeUri(identifier, ['.output', 'output.pdf']),
+    };
+}
+
+function setActiveEditor(uri: any, line = 4, character = 2, version = 1) {
+    const document = {uri, version, isDirty: false};
+    const editor = {
+        document,
+        selection: {active: {line, character}},
+    };
+    vscodeStub.window.activeTextEditor = editor;
+    vscodeStub.workspace.textDocuments = [document];
+    return editor;
+}
+
+function createManager(vfs: any) {
+    const manager = new CompileManager({prefetch: async () => vfs} as any);
+    managers.push(manager);
+    return manager;
+}
+
+function registerPdfViewer(
+    fixture: ReturnType<typeof projectFixture>,
+    actions: string[],
+    options: {ready?: boolean, refresh?: () => Promise<unknown>} = {},
+) {
+    const messages: any[] = [];
+    const doc = {
+        refresh: options.refresh ?? (async () => {
+            actions.push('refresh');
+        }),
+    };
+    const webviewPanel = {
+        webview: {
+            postMessage: async (message: any) => {
+                actions.push(message.type);
+                messages.push(message);
+                return true;
+            },
+        },
+    };
+    fireEvent('pdfWillOpenEvent', {uri: fixture.pdfUri, doc, webviewPanel});
+    if (options.ready !== false) {
+        fireEvent('pdfViewerReadyEvent', {uri: fixture.pdfUri, webviewPanel});
+    }
+    return {doc, webviewPanel, messages};
+}
+
+function successfulOutcome(): CompileOutcome {
+    return {
+        status: 'success',
+        successful: true,
+        outputsUpdated: true,
+        hasLog: false,
+    };
+}
+
+function failedOutcome(): CompileOutcome {
+    return {
+        status: 'failure',
+        successful: false,
+        outputsUpdated: true,
+        hasLog: false,
+    };
+}
+
+function createVfs(
+    outcome: CompileOutcome,
+    actions: string[],
+    syncCode: (...args: any[]) => Promise<any> = async () => [{page: 1, h: 2, v: 3}],
+) {
+    return {
+        getRootDocName: () => '/main.tex',
+        getCompiler: () => ({name: 'pdfLaTex'}),
+        adoptCachedCompile: async () => undefined,
+        compile: async () => outcome,
+        stopCompile: async () => true,
+        syncCode: async (...args: any[]) => {
+            actions.push('sync-request');
+            return syncCode(...args);
+        },
+    };
+}
+
+async function flushAsync() {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    await Promise.resolve();
+}
+
 describe('CompileManager cached startup', () => {
     beforeEach(() => {
         statusItems.length = 0;
+        executedCommands.length = 0;
         executeCommand = async () => undefined;
+        vscodeStub.window.activeTextEditor = undefined;
+        vscodeStub.workspace.textDocuments = [];
+    });
+
+    afterEach(() => {
+        for (const manager of managers.splice(0)) {
+            manager.pdfWillOpenTrigger.dispose();
+            manager.pdfViewerReadyTrigger.dispose();
+            manager.pdfViewDisposedTrigger.dispose();
+        }
     });
 
     it('falls back to a real compile when a cached output cannot be downloaded', async () => {
-        const uri = {
-            scheme: 'overleaf-workshop',
-            authority: 'www.overleaf.com',
-            path: '/main.tex',
-            query: 'user=user&project=project',
-        };
+        const uri = projectFixture().compileUri;
         const cachedOutcome: CompileOutcome = {
             status: 'success',
             successful: true,
@@ -133,12 +273,260 @@ describe('CompileManager cached startup', () => {
                 return undefined;
             },
         };
-        const manager = new CompileManager({prefetch: async () => vfs} as any);
+        const manager = createManager(vfs);
 
         await manager.compile(true, 'initial-project', uri as any);
 
         assert.equal(diagnosticChecks, 1);
         assert.equal(liveCompiles, 1);
+        assert.equal(statusItems.at(-1)?.text, 'pdfLaTex');
+    });
+});
+
+describe('CompileManager automatic forward SyncTeX after compile', () => {
+    beforeEach(() => {
+        statusItems.length = 0;
+        executedCommands.length = 0;
+        executeCommand = async () => undefined;
+        vscodeStub.window.activeTextEditor = undefined;
+        vscodeStub.workspace.textDocuments = [];
+    });
+
+    afterEach(() => {
+        for (const manager of managers.splice(0)) {
+            manager.pdfWillOpenTrigger.dispose();
+            manager.pdfViewerReadyTrigger.dispose();
+            manager.pdfViewDisposedTrigger.dispose();
+        }
+    });
+
+    it('refreshes an already-open output PDF before syncing to the captured TeX cursor', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        const syncCalls: any[][] = [];
+        const editor = setActiveEditor(fixture.sourceUri, 6, 9, 3);
+        const vfs = createVfs(successfulOutcome(), actions, async (...args) => {
+            syncCalls.push(args);
+            return [{page: 4, h: 5, v: 6}];
+        });
+        const manager = createManager(vfs);
+        const viewer = registerPdfViewer(fixture, actions);
+
+        await manager.compile(true, 'command', fixture.compileUri);
+        await flushAsync();
+
+        assert.deepEqual(syncCalls, [['main.tex', 7, 9]]);
+        assert.deepEqual(actions, ['refresh', 'sync-request', 'syncCode']);
+        assert.deepEqual(viewer.messages, [{type: 'syncCode', content: [{page: 4, h: 5, v: 6}]}]);
+        assert.equal(vscodeStub.window.activeTextEditor, editor);
+        assert.equal(executedCommands.includes('vscode.openWith'), false);
+    });
+
+    it('does not refresh or sync after a failed compile', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        setActiveEditor(fixture.sourceUri);
+        const manager = createManager(createVfs(failedOutcome(), actions));
+        registerPdfViewer(fixture, actions);
+
+        await manager.compile(true, 'command', fixture.compileUri);
+        await flushAsync();
+
+        assert.deepEqual(actions, []);
+    });
+
+    it('does not open a viewer when the output PDF is not already open', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        setActiveEditor(fixture.sourceUri);
+        const manager = createManager(createVfs(successfulOutcome(), actions));
+
+        await manager.compile(true, 'command', fixture.compileUri);
+        await flushAsync();
+
+        assert.deepEqual(actions, []);
+        assert.equal(executedCommands.includes('vscode.openWith'), false);
+    });
+
+    it('refreshes the PDF but skips sync for a TeX editor from another project', async () => {
+        const fixture = projectFixture();
+        const other = projectFixture();
+        const actions: string[] = [];
+        setActiveEditor(other.sourceUri);
+        const manager = createManager(createVfs(successfulOutcome(), actions));
+        registerPdfViewer(fixture, actions);
+
+        await manager.compile(true, 'command', fixture.compileUri);
+        await flushAsync();
+
+        assert.deepEqual(actions, ['refresh']);
+    });
+
+    it('refreshes the PDF but skips sync when the active source is not TeX', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        setActiveEditor(makeUri(fixture.identifier, ['refs.bib']));
+        const manager = createManager(createVfs(successfulOutcome(), actions));
+        registerPdfViewer(fixture, actions);
+
+        await manager.compile(true, 'command', fixture.compileUri);
+        await flushAsync();
+
+        assert.deepEqual(actions, ['refresh']);
+    });
+
+    it('skips a stale captured cursor when the editor moves during compilation', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        const editor = setActiveEditor(fixture.sourceUri, 2, 3, 1);
+        let finishCompile!: (outcome: CompileOutcome) => void;
+        const compileResult = new Promise<CompileOutcome>(resolve => {
+            finishCompile = resolve;
+        });
+        const vfs = createVfs(successfulOutcome(), actions);
+        vfs.compile = async () => compileResult;
+        const manager = createManager(vfs);
+        registerPdfViewer(fixture, actions);
+
+        const compiling = manager.compile(true, 'command', fixture.compileUri);
+        await flushAsync();
+        editor.selection.active = {line: 8, character: 1};
+        finishCompile(successfulOutcome());
+        await compiling;
+        await flushAsync();
+
+        assert.deepEqual(actions, ['refresh']);
+    });
+
+    it('drops auto-sync when the viewer is disposed during PDF refresh', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        setActiveEditor(fixture.sourceUri);
+        let finishRefresh!: () => void;
+        const refreshResult = new Promise<void>(resolve => {
+            finishRefresh = resolve;
+        });
+        const manager = createManager(createVfs(successfulOutcome(), actions));
+        const viewer = registerPdfViewer(fixture, actions, {
+            refresh: async () => {
+                actions.push('refresh');
+                await refreshResult;
+            },
+        });
+
+        const compiling = manager.compile(true, 'command', fixture.compileUri);
+        await flushAsync();
+        fireEvent('pdfViewDisposedEvent', {uri: fixture.pdfUri, webviewPanel: viewer.webviewPanel});
+        finishRefresh();
+        await compiling;
+        await flushAsync();
+
+        assert.deepEqual(actions, ['refresh']);
+    });
+
+    it('drops auto-sync when the viewer is replaced during PDF refresh', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        setActiveEditor(fixture.sourceUri);
+        let finishRefresh!: () => void;
+        const refreshResult = new Promise<void>(resolve => {
+            finishRefresh = resolve;
+        });
+        const manager = createManager(createVfs(successfulOutcome(), actions));
+        registerPdfViewer(fixture, actions, {
+            refresh: async () => {
+                actions.push('refresh');
+                await refreshResult;
+            },
+        });
+
+        const compiling = manager.compile(true, 'command', fixture.compileUri);
+        await flushAsync();
+        registerPdfViewer(fixture, actions);
+        finishRefresh();
+        await compiling;
+        await flushAsync();
+
+        assert.deepEqual(actions, ['refresh']);
+    });
+
+    it('does not commit refresh or sync from a cancelled compile run', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        setActiveEditor(fixture.sourceUri);
+        let finishCompile!: (outcome: CompileOutcome) => void;
+        const compileResult = new Promise<CompileOutcome>(resolve => {
+            finishCompile = resolve;
+        });
+        const vfs = createVfs(successfulOutcome(), actions);
+        vfs.compile = async (...args: any[]) => {
+            args[6]?.();
+            return compileResult;
+        };
+        vfs.stopCompile = async () => true;
+        const manager = createManager(vfs);
+        registerPdfViewer(fixture, actions);
+
+        const compiling = manager.compile(true, 'command', fixture.compileUri);
+        await flushAsync();
+        await manager.stopCompile();
+        finishCompile(successfulOutcome());
+        await compiling;
+        await flushAsync();
+
+        assert.deepEqual(actions, []);
+    });
+
+    it('invalidates an old pending SyncTeX response as soon as a newer compile starts', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        setActiveEditor(fixture.sourceUri);
+        let finishOldSync!: (result: any) => void;
+        const oldSyncResult = new Promise<any>(resolve => {
+            finishOldSync = resolve;
+        });
+        let finishSecondCompile!: (outcome: CompileOutcome) => void;
+        const secondCompileResult = new Promise<CompileOutcome>(resolve => {
+            finishSecondCompile = resolve;
+        });
+        let compileCount = 0;
+        const vfs = createVfs(successfulOutcome(), actions, async () => oldSyncResult);
+        vfs.compile = async () => {
+            compileCount += 1;
+            return compileCount === 1 ? successfulOutcome() : secondCompileResult;
+        };
+        const manager = createManager(vfs);
+        const viewer = registerPdfViewer(fixture, actions);
+
+        await manager.compile(true, 'command', fixture.compileUri);
+        await flushAsync();
+        assert.deepEqual(actions, ['refresh', 'sync-request']);
+
+        const newerCompile = manager.compile(true, 'command', fixture.compileUri);
+        await flushAsync();
+        assert.equal(compileCount, 2);
+        finishOldSync([{page: 1, h: 2, v: 3}]);
+        await flushAsync();
+        assert.deepEqual(viewer.messages, []);
+
+        finishSecondCompile(failedOutcome());
+        await newerCompile;
+        await flushAsync();
+        assert.deepEqual(actions, ['refresh', 'sync-request']);
+    });
+
+    it('keeps a successful compile successful when SyncTeX is unavailable', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        setActiveEditor(fixture.sourceUri);
+        const manager = createManager(createVfs(successfulOutcome(), actions, async () => undefined));
+        const viewer = registerPdfViewer(fixture, actions);
+
+        await manager.compile(true, 'command', fixture.compileUri);
+        await flushAsync();
+
+        assert.deepEqual(actions, ['refresh', 'sync-request']);
+        assert.deepEqual(viewer.messages, []);
         assert.equal(statusItems.at(-1)?.text, 'pdfLaTex');
     });
 });
