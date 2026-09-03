@@ -508,7 +508,7 @@ describe('stale-buffer rollback safety', () => {
         harness.dispose();
     });
 
-    it('does not accept a confirmed clean buffer after the remote document advances', async () => {
+    it('keeps a clean editor clean while the provider publishes a collaborator refresh', async () => {
         const base = 'alpha omega';
         const remote = 'REMOTE alpha omega';
         const server = new DeterministicRealtimeServer();
@@ -532,6 +532,13 @@ describe('stale-buffer rollback safety', () => {
         server.collaboratorUpdate(PROJECT_A, [{p: 0, i: 'REMOTE '}]);
         await settleAsyncWork();
 
+        assert.equal(editor.dirty, false);
+        assert.equal(editor.document.getText(), base);
+        assert.equal(
+            new TextDecoder().decode(await harness.provider.readFile(harness.uri)),
+            remote,
+        );
+
         await assert.rejects(
             harness.provider.writeFile(
                 harness.uri,
@@ -541,10 +548,43 @@ describe('stale-buffer rollback safety', () => {
             (error: any) => error?.code === 'Unavailable',
         );
 
-        assert.equal(editor.dirty, true);
-        assert.equal(editor.document.getText(), remote);
+        assert.equal(editor.dirty, false);
+        assert.equal(editor.document.getText(), base);
         assert.equal(server.capturedUpdates.length, 0);
         assert.equal(server.text(PROJECT_A), remote);
+        harness.dispose();
+    });
+
+    it('advances an empty causal revision without dirtying the editor or losing the next edit', async () => {
+        const base = 'alpha omega';
+        const desired = 'alpha LOCAL omega';
+        const server = new DeterministicRealtimeServer();
+        addProject(server, base, PROJECT_A, 'Empty Causal Revision', 4);
+        const harness = await createEventWiredProviderProject({
+            server,
+            storage: new HarnessStorage(),
+            windowId: 'empty-causal-revision',
+            projectId: PROJECT_A,
+        });
+        assert.equal(new TextDecoder().decode(await harness.provider.readFile(harness.uri)), base);
+        const editor = new SimulatedDirtyEditor(harness.uri, base);
+        editor.openClean(harness.events);
+        await settleAsyncWork();
+        await settleAsyncWork();
+
+        server.collaboratorUpdate(PROJECT_A, []);
+        await settleAsyncWork();
+        assert.equal(server.version(PROJECT_A), 5);
+        assert.equal(editor.dirty, false);
+        assert.equal(editor.document.getText(), base);
+
+        editor.editThroughEvents(desired, harness.events);
+        const result = await editor.saveThroughProvider(harness.provider, harness.events);
+        assert.equal(result.saved, true);
+        assert.equal(editor.dirty, false);
+        assert.equal(server.capturedUpdates.length, 1);
+        assert.equal(server.capturedUpdates[0].update.v, 5);
+        assert.equal(server.text(PROJECT_A), desired);
         harness.dispose();
     });
 
@@ -1693,7 +1733,7 @@ describe('stale-buffer rollback safety', () => {
         assert.equal(server.text(PROJECT_A), remote);
     });
 
-    it('advances a recovery-save editor base when remote text arrives strictly afterward', async () => {
+    it('rebinds a recovery-save editor after the clean host adopts a later remote refresh', async () => {
         const base = 'LEFT middle RIGHT';
         const remote = 'LEFT middle REMOTE';
         const expected = 'LOCAL middle REMOTE';
@@ -1720,10 +1760,11 @@ describe('stale-buffer rollback safety', () => {
         await settleAsyncWork();
         assert.equal(server.text(PROJECT_A), remote);
         assert.equal(server.version(PROJECT_A), 5);
-        assert.equal(editor.dirty, true);
-        assert.equal(editor.document.getText(), remote);
+        assert.equal(editor.dirty, false);
+        assert.equal(editor.document.getText(), base);
+        assert.equal(await openAuthoritativeText(harness), remote);
+        await editor.reloadAuthoritative(harness.vfs, remote);
         const advancedBase = harness.vfs.activeEditorBases.get(bufferId);
-        assert.strictEqual(advancedBase, linearizedBase);
         assert.equal(advancedBase?.version, 5);
         assert.equal(advancedBase?.content, remote);
 

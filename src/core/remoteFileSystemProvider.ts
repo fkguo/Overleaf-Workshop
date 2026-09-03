@@ -200,7 +200,6 @@ type PreparedLiveRemoteEditorUpdate = {
     document: vscode.TextDocument,
     active: EditorDocumentBase,
     transaction: RemoteEditorTransaction,
-    wasDirty: boolean,
 };
 
 type RemoteDocumentCausality = {
@@ -2278,7 +2277,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     private normalizeRealtimeTextOperations(update: UpdateSchema): TextOperation[] {
-        if (!Array.isArray(update.op) || update.op.length === 0) {
+        if (!Array.isArray(update.op)) {
             throw new Error('Realtime update has no text operation');
         }
         return update.op.map(operation => {
@@ -2468,17 +2467,25 @@ export class VirtualFileSystem extends vscode.Disposable {
             return undefined;
         }
         try {
+            const transaction = prepareRemoteEditorTransaction(
+                active.causality,
+                randomUUID(),
+                remoteVersion,
+                operations,
+            );
+            if (!buffer.document.isDirty && transaction.expectedChange !== undefined) {
+                // A provider change notification lets VS Code refresh a clean
+                // document without manufacturing a local dirty edit. Until the
+                // host adopts that refresh, the old editor base is no longer a
+                // causal authority for saving.
+                active.causality.valid = false;
+                return undefined;
+            }
             return {
                 bufferId,
                 document: buffer.document,
                 active,
-                transaction: prepareRemoteEditorTransaction(
-                    active.causality,
-                    randomUUID(),
-                    remoteVersion,
-                    operations,
-                ),
-                wasDirty: buffer.document.isDirty,
+                transaction,
             };
         } catch {
             active.causality.valid = false;

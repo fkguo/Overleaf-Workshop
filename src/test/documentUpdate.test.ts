@@ -260,6 +260,7 @@ describe('prepareProvenDocumentUpdate', () => {
 describe('realtime update classification', () => {
     it('distinguishes the sender version bump from a collaborator operation', () => {
         assert.equal(isSenderConfirmation({}), true);
+        assert.equal(isSenderConfirmation({op: []}), false);
         assert.equal(isSenderConfirmation({op: [{p: 0, i: 'remote'}]}), false);
     });
 });
