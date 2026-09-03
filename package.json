@@ -436,6 +436,12 @@
           "scope": "machine",
           "markdownDescription": "%configuration.localReplica.syncOnFileChange.enabled.markdownDescription%"
         },
+        "overleaf-workshop.trackChanges.enabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "markdownDescription": "%configuration.trackChanges.enabled.markdownDescription%"
+        },
         "overleaf-workshop.compileOutputFolderName": {
           "type": "string",
           "default": ".output",
