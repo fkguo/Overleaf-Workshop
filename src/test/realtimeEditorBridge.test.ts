@@ -12,6 +12,7 @@ import {
     createRealtimeEditorBridgeState,
     prepareHistoryRemoteEditorTransaction,
     prepareRemoteEditorTransaction,
+    rebindHistorySubmissionForRecovery,
     reconcileHistoryEditorAfterJoin,
     recordHistoryLocalEditorChange,
     recordLocalEditorChange,
@@ -28,6 +29,7 @@ import {
     parseHistoryOtSnapshot,
     serializeHistoryOtOperations,
     serializeHistoryOtSnapshot,
+    StringFileDataSnapshot,
 } from '../core/historyOt';
 
 const historyTimestamp = '2026-08-31T06:00:00.000Z';
@@ -632,6 +634,125 @@ describe('realtime editor bridge', () => {
             false,
         );
         assert.equal(rejectHistorySubmission(submitted, 'exact-token').valid, true);
+    });
+
+    it('rebinds an outcome-unknown History submission only to exact recovery joins', () => {
+        const descriptor = {
+            kind: 'tracked-write' as const,
+            tracking: {userId: 'local-user', ts: historyTimestamp},
+        };
+        const base = createHistoryRealtimeEditorBridgeState({
+            socketGeneration: 4,
+            remoteEpoch: 'history-epoch',
+            remoteVersion: 12,
+            remoteSnapshot: {
+                content: 'ab',
+                comments: [{id: 'c', ranges: [{pos: 0, length: 2}]}],
+            },
+            documentVersion: 7,
+            editorContent: 'ab',
+        });
+        const dirty = recordHistoryLocalEditorChange(
+            base,
+            8,
+            [{rangeOffset: 1, rangeLength: 0, text: 'L'}],
+            'aLb',
+            descriptor,
+        );
+        const inflight = beginHistorySubmission(
+            dirty,
+            'old-submission-token',
+            dirty.pending!,
+            descriptor,
+        );
+        const state = recordHistoryLocalEditorChange(
+            inflight,
+            9,
+            [{rangeOffset: 3, rangeLength: 0, text: '!'}],
+            'aLb!',
+            descriptor,
+        );
+        const remoteBefore = serializeHistoryOtSnapshot(state.remoteSnapshot);
+        const wireBefore = serializeHistoryOtOperations(state.inflightWire!);
+        const viewBefore = serializeHistoryOtOperations(state.inflightView!);
+        const pendingBefore = serializeHistoryOtOperations(state.pending!);
+
+        const unapplied = rebindHistorySubmissionForRecovery(state, {
+            socketGeneration: 5,
+            remoteEpoch: 'recovery-epoch-unapplied',
+            submissionToken: 'recovery-token-unapplied',
+            joinVersion: 12,
+            joinSnapshot: {
+                comments: [{ranges: [{length: 2, pos: 0}], id: 'c'}],
+                content: 'ab',
+            },
+            documentVersion: 9,
+            editorContent: 'aLb!',
+        });
+        assert.equal(unapplied.valid, true);
+        assert.equal(unapplied.socketGeneration, 5);
+        assert.equal(unapplied.remoteEpoch, 'recovery-epoch-unapplied');
+        assert.equal(unapplied.inflightToken, 'recovery-token-unapplied');
+
+        const predicted = serializeHistoryOtSnapshot(applyHistoryOtOperations(
+            state.remoteSnapshot,
+            state.inflightView!,
+        )) as StringFileDataSnapshot;
+        const appliedWithoutAck = rebindHistorySubmissionForRecovery(state, {
+            socketGeneration: 6,
+            remoteEpoch: 'recovery-epoch-applied',
+            submissionToken: 'recovery-token-applied',
+            joinVersion: 13,
+            joinSnapshot: {
+                trackedChanges: predicted.trackedChanges,
+                comments: predicted.comments?.map(comment => ({
+                    ranges: comment.ranges.map(range => ({
+                        length: range.length,
+                        pos: range.pos,
+                    })),
+                    id: comment.id,
+                })),
+                content: predicted.content,
+            },
+            documentVersion: 9,
+            editorContent: 'aLb!',
+        });
+        assert.equal(appliedWithoutAck.valid, true);
+        assert.equal(appliedWithoutAck.socketGeneration, 6);
+        assert.equal(appliedWithoutAck.remoteEpoch, 'recovery-epoch-applied');
+        assert.equal(appliedWithoutAck.inflightToken, 'recovery-token-applied');
+
+        for (const rebound of [unapplied, appliedWithoutAck]) {
+            assert.equal(rebound.remoteVersion, 12);
+            assert.equal(rebound.documentVersion, 9);
+            assert.equal(rebound.editorContent, 'aLb!');
+            assert.deepEqual(serializeHistoryOtSnapshot(rebound.remoteSnapshot), remoteBefore);
+            assert.deepEqual(serializeHistoryOtOperations(rebound.inflightWire!), wireBefore);
+            assert.deepEqual(serializeHistoryOtOperations(rebound.inflightView!), viewBefore);
+            assert.deepEqual(serializeHistoryOtOperations(rebound.pending!), pendingBefore);
+            assert.deepEqual(rebound.inflightWriteDescriptor, state.inflightWriteDescriptor);
+            assert.deepEqual(rebound.pendingWriteDescriptor, state.pendingWriteDescriptor);
+        }
+
+        const collaboratorDifference = rebindHistorySubmissionForRecovery(state, {
+            socketGeneration: 5,
+            remoteEpoch: 'recovery-epoch-collaborator',
+            submissionToken: 'recovery-token-collaborator',
+            joinVersion: 13,
+            joinSnapshot: {content: 'Rab'},
+            documentVersion: 9,
+            editorContent: 'aLb!',
+        });
+        assert.equal(collaboratorDifference.valid, false);
+        assert.equal(rebindHistorySubmissionForRecovery(state, {
+            socketGeneration: 5,
+            remoteEpoch: 'recovery-epoch-stale-token',
+            submissionToken: 'old-submission-token',
+            joinVersion: 12,
+            joinSnapshot: remoteBefore,
+            documentVersion: 9,
+            editorContent: 'aLb!',
+        }).valid, false);
     });
 
     it('fails closed if tracking mode changes while a logical local batch is pending', () => {

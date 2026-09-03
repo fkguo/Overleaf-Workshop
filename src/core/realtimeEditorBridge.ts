@@ -824,6 +824,75 @@ export function rejectHistorySubmission(
 }
 
 /**
+ * Rebind an outcome-unknown submission to one new socket session. A fresh join
+ * is accepted only when it proves either that the frozen wire was not applied,
+ * or that exactly its rebased view was applied and only the sender ACK was lost.
+ */
+export function rebindHistorySubmissionForRecovery(
+    stateInput: HistoryRealtimeEditorBridgeState,
+    input: {
+        socketGeneration: number,
+        remoteEpoch: string,
+        submissionToken: string,
+        joinVersion: number,
+        joinSnapshot: HistoryOtSnapshotInput,
+        documentVersion: number,
+        editorContent: string,
+    },
+): HistoryRealtimeEditorBridgeState {
+    const state = cloneHistoryState(stateInput);
+    let joinSnapshot: ParsedHistoryOtSnapshot;
+    try {
+        joinSnapshot = cloneHistorySnapshot(input.joinSnapshot);
+    } catch {
+        return {...state, valid: false};
+    }
+    if (!state.valid
+        || state.authority !== 'ready'
+        || !hasExactHistoryState(state)
+        || state.inflightWire === undefined
+        || state.inflightView === undefined
+        || state.inflightToken === undefined
+        || state.inflightBaseVersion === undefined
+        || state.inflightWriteDescriptor === undefined
+        || state.remoteVersion !== state.inflightBaseVersion
+        || !joinSnapshot.safe
+        || !Number.isSafeInteger(input.socketGeneration)
+        || input.socketGeneration <= state.socketGeneration
+        || typeof input.remoteEpoch !== 'string'
+        || !input.remoteEpoch
+        || input.remoteEpoch === state.remoteEpoch
+        || typeof input.submissionToken !== 'string'
+        || !input.submissionToken
+        || input.submissionToken === state.inflightToken
+        || input.documentVersion !== state.documentVersion
+        || input.editorContent !== state.editorContent) {
+        return {...state, valid: false};
+    }
+    try {
+        const unapplied = input.joinVersion === state.inflightBaseVersion
+            && historyOtJsonEqual(joinSnapshot.raw, state.remoteSnapshot.raw);
+        const predictedApplied = applyHistoryOtOperations(
+            state.remoteSnapshot,
+            state.inflightView,
+        );
+        const appliedWithoutAck = input.joinVersion === state.inflightBaseVersion + 1
+            && historyOtJsonEqual(joinSnapshot.raw, predictedApplied.raw);
+        if (!unapplied && !appliedWithoutAck) {
+            return {...state, valid: false};
+        }
+        return {
+            ...state,
+            socketGeneration: input.socketGeneration,
+            remoteEpoch: input.remoteEpoch,
+            inflightToken: input.submissionToken,
+        };
+    } catch {
+        return {...state, valid: false};
+    }
+}
+
+/**
  * Record a sender ACK only as a prediction witness. The old remote snapshot is
  * deliberately retained and all further edits remain blocked until a fresh
  * authoritative join exactly confirms the prediction.
