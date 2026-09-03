@@ -708,6 +708,41 @@ describe('SyncTeX output identity generation', () => {
         assert.equal(harness.vfs.outputBuildId, 'build');
         assert.equal(harness.vfs.outputEditorId, 'editor');
     });
+
+    it('reports manual SyncTeX failures by default and suppresses automatic failures', async () => {
+        const harness = makeHarness();
+        const shownErrors: string[] = [];
+        const originalShowErrorMessage = vscodeStub.window.showErrorMessage;
+        vscodeStub.window.showErrorMessage = async (message: string) => {
+            shownErrors.push(message);
+            return undefined;
+        };
+
+        try {
+            await harness.vfs.syncCode('main.tex', 1, 0);
+            assert.deepEqual(shownErrors, [
+                'SyncTeX is unavailable until the PDF has been compiled successfully.',
+            ]);
+
+            shownErrors.length = 0;
+            await harness.vfs.syncCode('main.tex', 1, 0, false);
+            assert.deepEqual(shownErrors, []);
+
+            harness.vfs.outputBuildId = 'build';
+            harness.vfs.outputEditorId = 'editor';
+            harness.vfs.api = {
+                proxySyncCode: async () => ({type: 'error', message: 'SyncTeX proxy failed'}),
+            };
+
+            await harness.vfs.syncCode('main.tex', 1, 0, false);
+            assert.deepEqual(shownErrors, []);
+
+            await harness.vfs.syncCode('main.tex', 1, 0);
+            assert.deepEqual(shownErrors, ['SyncTeX proxy failed']);
+        } finally {
+            vscodeStub.window.showErrorMessage = originalShowErrorMessage;
+        }
+    });
 });
 
 async function seedColdRecord(

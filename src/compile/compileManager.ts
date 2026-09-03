@@ -1235,7 +1235,12 @@ export class CompileManager {
             !isPdfGenerationSyncable(record, deliveryGuard.expectedPdfGeneration) ||
             (deliveryGuard.isStillApplicable && !deliveryGuard.isStillApplicable())
         ) { return; }
-        const result = await vfs.syncCode(source.file, source.line, source.column);
+        const result = await vfs.syncCode(
+            source.file,
+            source.line,
+            source.column,
+            manualSource !== undefined,
+        );
         if (result?.length && sourceSyncRequests.isCurrent(recordKey, requestGeneration)) {
             this.deliverSourceSync(source.identifier, result, {
                 ...deliveryGuard,

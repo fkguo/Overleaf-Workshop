@@ -6441,9 +6441,11 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
-    async syncCode(filePath: string, line:number, column:number) {
+    async syncCode(filePath: string, line:number, column:number, reportErrors = true) {
         if (!this.outputBuildId || !this.outputEditorId) {
-            vscode.window.showErrorMessage(vscode.l10n.t('SyncTeX is unavailable until the PDF has been compiled successfully.'));
+            if (reportErrors) {
+                vscode.window.showErrorMessage(vscode.l10n.t('SyncTeX is unavailable until the PDF has been compiled successfully.'));
+            }
             return undefined;
         }
         const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
@@ -6460,7 +6462,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (res.type==='success') {
             return res.syncCode;
         } else {
-            if (res.message!==undefined) {
+            if (reportErrors && res.message!==undefined) {
                 vscode.window.showErrorMessage(res.message);
             }
             return undefined;

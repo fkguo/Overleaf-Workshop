@@ -396,7 +396,7 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
         await manager.compile(true, 'command', fixture.compileUri);
         await flushAsync();
 
-        assert.deepEqual(syncCalls, [['main.tex', 7, 9]]);
+        assert.deepEqual(syncCalls, [['main.tex', 7, 9, false]]);
         assert.deepEqual(actions, ['refresh', 'sync-request', 'syncCode']);
         assert.deepEqual(viewer.messages, [{
             type: 'syncCode',
@@ -527,8 +527,12 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
     it('does not refresh or auto-sync after a failed compile but preserves manual sync', async () => {
         const fixture = projectFixture();
         const actions: string[] = [];
+        const syncCalls: any[][] = [];
         setActiveEditor(fixture.sourceUri);
-        const manager = createManager(createVfs(failedOutcome(), actions));
+        const manager = createManager(createVfs(failedOutcome(), actions, async (...args) => {
+            syncCalls.push(args);
+            return [{page: 1, h: 2, v: 3}];
+        }));
         registerPdfViewer(fixture, actions);
 
         await manager.compile(true, 'command', fixture.compileUri);
@@ -537,6 +541,7 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
         assert.deepEqual(actions, []);
         await manager.syncCode();
         assert.deepEqual(actions, ['sync-request', 'syncCode']);
+        assert.deepEqual(syncCalls, [['main.tex', 5, 2, true]]);
     });
 
     it('does not open a viewer when the output PDF is not already open', async () => {
