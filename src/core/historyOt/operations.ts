@@ -9,6 +9,8 @@ import {
     HistoryOtSetCommentStateOperation,
     HistoryOtSnapshotInput,
     HistoryOtTextOperation,
+    HistoryOtTrackingDirective,
+    JsonValue,
     ParsedHistoryOtOperations,
     ParsedHistoryOtSnapshot,
     StringFileDataSnapshot,
@@ -37,6 +39,24 @@ import {
 
 function clone<T>(value: T): T {
     return deepCloneJson(value) as T;
+}
+
+/** Exact JSON value equality with object-key order treated as non-semantic. */
+export function historyOtJsonEqual(left: JsonValue, right: JsonValue): boolean {
+    if (typeof left !== 'object' || left === null
+        || typeof right !== 'object' || right === null) {
+        return Object.is(left, right);
+    }
+    if (Array.isArray(left) || Array.isArray(right)) {
+        return Array.isArray(left) && Array.isArray(right)
+            && left.length === right.length
+            && left.every((value, index) => historyOtJsonEqual(value, right[index]));
+    }
+    const leftKeys = Object.keys(left);
+    const rightKeys = Object.keys(right);
+    return leftKeys.length === rightKeys.length
+        && leftKeys.every(key => Object.prototype.hasOwnProperty.call(right, key)
+            && historyOtJsonEqual(left[key] as JsonValue, right[key] as JsonValue));
 }
 
 function operationKind(operation: HistoryOtOperation):
@@ -185,7 +205,16 @@ function applySingleOperation(
 ): StringFileDataSnapshot {
     const kind = operationKind(operation);
     if (kind === 'text') {
-        return applyTextOperationToSnapshot(snapshot, asText(operation));
+        const text = asText(operation);
+        assertTextOperationUtf16Boundaries(snapshot.content, text);
+        const result = applyTextOperationToSnapshot(snapshot, text);
+        if (isWellFormedUtf16(snapshot.content) && !isWellFormedUtf16(result.content)) {
+            throw new HistoryOtProtocolError(
+                'MALFORMED_UTF16_RESULT',
+                'History-OT text operation produced malformed UTF-16 from a well-formed snapshot',
+            );
+        }
+        return result;
     }
     const result = clone(snapshot);
     if (kind === 'add-comment') {
@@ -219,6 +248,62 @@ function applySingleOperation(
         }
     }
     return result;
+}
+
+function splitsSurrogatePair(text: string, offset: number): boolean {
+    if (offset <= 0 || offset >= text.length) {
+        return false;
+    }
+    const previous = text.charCodeAt(offset - 1);
+    const next = text.charCodeAt(offset);
+    return previous >= 0xD800 && previous <= 0xDBFF
+        && next >= 0xDC00 && next <= 0xDFFF;
+}
+
+function isWellFormedUtf16(text: string): boolean {
+    for (let offset = 0; offset < text.length; offset += 1) {
+        const code = text.charCodeAt(offset);
+        if (code >= 0xD800 && code <= 0xDBFF) {
+            const next = text.charCodeAt(offset + 1);
+            if (next < 0xDC00 || next > 0xDFFF) {
+                return false;
+            }
+            offset += 1;
+        } else if (code >= 0xDC00 && code <= 0xDFFF) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function assertTextOperationUtf16Boundaries(
+    content: string,
+    operation: HistoryOtTextOperation,
+): void {
+    let sourceCursor = 0;
+    for (const scan of operation.textOperation) {
+        if (splitsSurrogatePair(content, sourceCursor)) {
+            throw new HistoryOtProtocolError(
+                'SURROGATE_BOUNDARY_OPERATION',
+                'History-OT text operation splits an existing UTF-16 surrogate pair',
+            );
+        }
+        if (typeof scan === 'number') {
+            sourceCursor += Math.abs(scan);
+        } else if (typeof scan === 'object' && scan !== null
+            && hasOwn(scan, 'r') && typeof scan.r === 'number') {
+            sourceCursor += scan.r;
+        }
+        if (typeof scan === 'number'
+            || (typeof scan === 'object' && scan !== null && hasOwn(scan, 'r'))) {
+            if (splitsSurrogatePair(content, sourceCursor)) {
+                throw new HistoryOtProtocolError(
+                    'SURROGATE_BOUNDARY_OPERATION',
+                    'History-OT text operation splits an existing UTF-16 surrogate pair',
+                );
+            }
+        }
+    }
 }
 
 export function applyHistoryOtOperations(
@@ -297,6 +382,13 @@ export function composeHistoryOtOperations(
     const second = getSafeOperationsRaw(secondInput);
     assertSnapshotIndependentAlgebraDomain(first, 'compose');
     assertSnapshotIndependentAlgebraDomain(second, 'compose');
+    return composeOperationArrays(first, second);
+}
+
+function composeOperationArrays(
+    first: HistoryOtOperationArray,
+    second: HistoryOtOperationArray,
+): ParsedHistoryOtOperations {
     const operations = [
         ...first,
         ...second,
@@ -319,6 +411,29 @@ export function composeHistoryOtOperations(
     return parseHistoryOtOperations(result.map(canonicalizeGeneratedOperation));
 }
 
+/** Compose with an authoritative snapshot and reject any metadata-loss witness. */
+export function composeHistoryOtOperationsWithSnapshot(
+    snapshot: HistoryOtSnapshotInput,
+    firstInput: HistoryOtOperationsInput,
+    secondInput: HistoryOtOperationsInput,
+): ParsedHistoryOtOperations {
+    const first = getSafeOperationsRaw(firstInput);
+    const second = getSafeOperationsRaw(secondInput);
+    const expected = applyHistoryOtOperations(
+        applyHistoryOtOperations(snapshot, firstInput),
+        secondInput,
+    );
+    const composed = composeOperationArrays(first, second);
+    const actual = applyHistoryOtOperations(snapshot, composed);
+    if (!historyOtJsonEqual(actual.raw, expected.raw)) {
+        throw new HistoryOtProtocolError(
+            'SNAPSHOT_COMPOSE_DIVERGENCE',
+            'History-OT compose cannot preserve the exact authoritative snapshot state',
+        );
+    }
+    return composed;
+}
+
 function transformAddThroughText(
     text: HistoryOtTextOperation,
     add: HistoryOtAddCommentOperation,
@@ -326,9 +441,59 @@ function transformAddThroughText(
     return addFromComment(transformCommentThroughTextOperation(commentFromAdd(add), text));
 }
 
+function trackingDirectivesEqual(
+    left: HistoryOtTrackingDirective,
+    right: HistoryOtTrackingDirective,
+): boolean {
+    if (left.type === 'none' || right.type === 'none') {
+        return left.type === right.type;
+    }
+    return left.type === right.type
+        && left.userId === right.userId
+        && Date.parse(left.ts) === Date.parse(right.ts);
+}
+
+function assertNoConflictingTextTracking(
+    leftOperation: HistoryOtTextOperation,
+    rightOperation: HistoryOtTextOperation,
+): void {
+    const trackingSpans = (operation: HistoryOtTextOperation) => {
+        const spans: Array<{
+            start: number,
+            end: number,
+            tracking: HistoryOtTrackingDirective,
+        }> = [];
+        let cursor = 0;
+        for (const scan of decodeTextOperation(operation).scans) {
+            if (scan.kind === 'insert') {
+                continue;
+            }
+            if (scan.kind === 'retain' && scan.tracking !== undefined) {
+                spans.push({start: cursor, end: cursor + scan.length, tracking: scan.tracking});
+            }
+            cursor += scan.length;
+        }
+        return spans;
+    };
+    const leftSpans = trackingSpans(leftOperation);
+    const rightSpans = trackingSpans(rightOperation);
+    for (const left of leftSpans) {
+        for (const right of rightSpans) {
+            if (left.start < right.end && right.start < left.end
+                && !trackingDirectivesEqual(left.tracking, right.tracking)) {
+                throw new HistoryOtProtocolError(
+                    'CONFLICTING_TRACKING_TRANSFORM',
+                    'Concurrent History-OT operations contain conflicting tracking directives',
+                );
+            }
+        }
+    }
+}
+
 function transformPair(
     left: HistoryOtOperation,
     right: HistoryOtOperation,
+    rejectTrackingConflicts = false,
 ): [HistoryOtOperation, HistoryOtOperation] {
     const leftKind = operationKind(left);
     const rightKind = operationKind(right);
@@ -336,6 +501,9 @@ function transformPair(
         return [clone(left), clone(right)];
     }
     if (leftKind === 'text' && rightKind === 'text') {
+        if (rejectTrackingConflicts) {
+            assertNoConflictingTextTracking(asText(left), asText(right));
+        }
         return transformTextOperations(asText(left), asText(right));
     }
     if (leftKind === 'text') {
@@ -344,7 +512,7 @@ function transformPair(
             : [clone(left), clone(right)];
     }
     if (rightKind === 'text') {
-        const [rightPrime, leftPrime] = transformPair(right, left);
+        const [rightPrime, leftPrime] = transformPair(right, left, rejectTrackingConflicts);
         return [leftPrime, rightPrime];
     }
 
@@ -359,7 +527,7 @@ function transformPair(
             : [clone(left), clone(right)];
     }
     if (leftKind === 'delete-comment' && rightKind === 'add-comment') {
-        const [rightPrime, leftPrime] = transformPair(right, left);
+        const [rightPrime, leftPrime] = transformPair(right, left, rejectTrackingConflicts);
         return [leftPrime, rightPrime];
     }
     if (leftKind === 'add-comment' && rightKind === 'set-comment-state') {
@@ -375,7 +543,7 @@ function transformPair(
         return [add, clone(right)];
     }
     if (leftKind === 'set-comment-state' && rightKind === 'add-comment') {
-        const [rightPrime, leftPrime] = transformPair(right, left);
+        const [rightPrime, leftPrime] = transformPair(right, left, rejectTrackingConflicts);
         return [leftPrime, rightPrime];
     }
     if (leftKind === 'delete-comment' && rightKind === 'delete-comment') {
@@ -389,7 +557,7 @@ function transformPair(
             : [clone(left), clone(right)];
     }
     if (leftKind === 'set-comment-state' && rightKind === 'delete-comment') {
-        const [rightPrime, leftPrime] = transformPair(right, left);
+        const [rightPrime, leftPrime] = transformPair(right, left, rejectTrackingConflicts);
         return [leftPrime, rightPrime];
     }
     if (leftKind === 'set-comment-state' && rightKind === 'set-comment-state') {
@@ -416,11 +584,20 @@ export function transformHistoryOtOperations(
     const right = getSafeOperationsRaw(secondInput).map(operation => clone(operation));
     assertSnapshotIndependentAlgebraDomain(left, 'transform');
     assertSnapshotIndependentAlgebraDomain(right, 'transform');
+    return transformOperationArrays(left, right);
+}
+
+function transformOperationArrays(
+    left: HistoryOtOperationArray,
+    right: HistoryOtOperationArray,
+    rejectTrackingConflicts = false,
+): [ParsedHistoryOtOperations, ParsedHistoryOtOperations] {
     assertCommentTransformOrderDomain(left, right);
     for (let leftIndex = 0; leftIndex < left.length; leftIndex += 1) {
         for (let rightIndex = 0; rightIndex < right.length; rightIndex += 1) {
             [left[leftIndex], right[rightIndex]] = transformPair(
                 left[leftIndex], right[rightIndex],
+                rejectTrackingConflicts,
             );
         }
     }
@@ -428,6 +605,32 @@ export function transformHistoryOtOperations(
         parseHistoryOtOperations(left.map(canonicalizeGeneratedOperation)),
         parseHistoryOtOperations(right.map(canonicalizeGeneratedOperation)),
     ];
+}
+
+/** Transform with an authoritative snapshot and require exact branch convergence. */
+export function transformHistoryOtOperationsWithSnapshot(
+    snapshot: HistoryOtSnapshotInput,
+    firstInput: HistoryOtOperationsInput,
+    secondInput: HistoryOtOperationsInput,
+): [ParsedHistoryOtOperations, ParsedHistoryOtOperations] {
+    const left = getSafeOperationsRaw(firstInput).map(operation => clone(operation));
+    const right = getSafeOperationsRaw(secondInput).map(operation => clone(operation));
+    const [leftPrime, rightPrime] = transformOperationArrays(left, right, true);
+    const leftThenRight = applyHistoryOtOperations(
+        applyHistoryOtOperations(snapshot, firstInput),
+        rightPrime,
+    );
+    const rightThenLeft = applyHistoryOtOperations(
+        applyHistoryOtOperations(snapshot, secondInput),
+        leftPrime,
+    );
+    if (!historyOtJsonEqual(leftThenRight.raw, rightThenLeft.raw)) {
+        throw new HistoryOtProtocolError(
+            'SNAPSHOT_TRANSFORM_DIVERGENCE',
+            'History-OT transform cannot converge the exact authoritative snapshot state',
+        );
+    }
+    return [leftPrime, rightPrime];
 }
 
 function assertCommentCanBeEncoded(comment: HistoryOtComment): void {

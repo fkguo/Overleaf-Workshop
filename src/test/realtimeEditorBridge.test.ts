@@ -13,11 +13,16 @@ import {
     transformLegacyRemoteOperation,
 } from '../core/realtimeEditorBridge';
 import {
+    applyHistoryOtOperations,
+    buildHistoryOtTextUpdate,
     getVisibleHistoryOtText,
     parseHistoryOtOperations,
     parseHistoryOtSnapshot,
     serializeHistoryOtOperations,
+    serializeHistoryOtSnapshot,
 } from '../core/historyOt';
+
+const historyTimestamp = '2026-08-31T06:00:00.000Z';
 
 function bound(content = 'abc') {
     return createRealtimeEditorBridgeState({
@@ -377,5 +382,100 @@ describe('realtime editor bridge', () => {
             serializeHistoryOtOperations(history.pending!),
             [{textOperation: [2, 'L', 1]}],
         );
+    });
+
+    it('rebases tracked inflight and later pending layers from their exact evolving bases', () => {
+        const server = parseHistoryOtSnapshot({content: 'ab'});
+        const inflight = buildHistoryOtTextUpdate(server, [{
+            pos: 1,
+            insertText: 'L',
+            tracking: {userId: 'local-inflight', ts: historyTimestamp},
+        }]);
+        const pendingBase = applyHistoryOtOperations(server, inflight);
+        const pending = buildHistoryOtTextUpdate(pendingBase, [{
+            pos: 2,
+            deleteLength: 1,
+            tracking: {userId: 'local-pending', ts: historyTimestamp},
+        }]);
+        const remote = buildHistoryOtTextUpdate(server, [{
+            pos: 1,
+            insertText: 'R',
+            tracking: {userId: 'remote', ts: historyTimestamp},
+        }]);
+        const immutableWire = serializeHistoryOtOperations(inflight);
+
+        const transformed = transformHistoryRemoteOperation(server, remote, {
+            inflightWire: inflight,
+            inflightView: inflight,
+            pending,
+        });
+
+        assert.deepEqual(serializeHistoryOtOperations(inflight), immutableWire);
+        assert.deepEqual(
+            serializeHistoryOtOperations(transformed.inflightWire!),
+            immutableWire,
+        );
+        assert.deepEqual(serializeHistoryOtOperations(transformed.pending!), [{
+            textOperation: [3, {
+                r: 1,
+                tracking: {
+                    type: 'delete',
+                    userId: 'local-pending',
+                    ts: historyTimestamp,
+                },
+            }],
+        }]);
+        assert.equal(getVisibleHistoryOtText(transformed.visibleSnapshot), 'aRL');
+        assert.deepEqual(serializeHistoryOtSnapshot(transformed.visibleSnapshot), {
+            content: 'aRLb',
+            trackedChanges: [
+                {
+                    range: {pos: 1, length: 1},
+                    tracking: {type: 'insert', userId: 'remote', ts: historyTimestamp},
+                },
+                {
+                    range: {pos: 2, length: 1},
+                    tracking: {type: 'insert', userId: 'local-inflight', ts: historyTimestamp},
+                },
+                {
+                    range: {pos: 3, length: 1},
+                    tracking: {type: 'delete', userId: 'local-pending', ts: historyTimestamp},
+                },
+            ],
+        });
+    });
+
+    it('accepts structurally equal tracked/comment branches with different object key order', () => {
+        const server = parseHistoryOtSnapshot({
+            trackedChanges: [{
+                tracking: {ts: historyTimestamp, userId: 'old', type: 'insert'},
+                range: {length: 1, pos: 0},
+            }],
+            comments: [{ranges: [{length: 2, pos: 0}], id: 'c'}],
+            content: 'ab',
+        });
+        const remoteClear = parseHistoryOtOperations([{
+            textOperation: [{r: 1, tracking: {type: 'none'}}, 1],
+        }]);
+        const pendingInsert = parseHistoryOtOperations([{
+            textOperation: [1, {
+                i: 'X',
+                tracking: {ts: historyTimestamp, userId: 'new', type: 'insert'},
+            }, 1],
+        }]);
+
+        const transformed = transformHistoryRemoteOperation(
+            server,
+            remoteClear,
+            {pending: pendingInsert},
+        );
+        assert.deepEqual(serializeHistoryOtSnapshot(transformed.visibleSnapshot), {
+            trackedChanges: [{
+                range: {pos: 1, length: 1},
+                tracking: {ts: historyTimestamp, userId: 'new', type: 'insert'},
+            }],
+            comments: [{ranges: [{length: 1, pos: 0}, {length: 1, pos: 2}], id: 'c'}],
+            content: 'aXb',
+        });
     });
 });

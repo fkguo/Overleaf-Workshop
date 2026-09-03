@@ -8,8 +8,10 @@ import {
     buildHistoryOtTextUpdate,
     buildRejectTrackedChangesOperation,
     composeHistoryOtOperations,
+    composeHistoryOtOperationsWithSnapshot,
     getVisibleHistoryOtText,
     getSafeHistoryOtWireOperation,
+    historyOtJsonEqual,
     invertHistoryOtOperations,
     parseHistoryOtOperations,
     parseHistoryOtOperationSequence,
@@ -20,6 +22,7 @@ import {
     serializeHistoryOtWireOperation,
     snapshotOffsetToVisible,
     transformHistoryOtOperations,
+    transformHistoryOtOperationsWithSnapshot,
     visibleOffsetToSnapshot,
 } from '../core/historyOt';
 
@@ -500,6 +503,43 @@ describe('History-OT tracked edits and visible offsets', () => {
         );
     });
 
+    it('rejects scans that split an existing surrogate pair and permits whole-pair scans', () => {
+        const snapshot = parseHistoryOtSnapshot({content: '😀'});
+        const split = parseHistoryOtOperations([{textOperation: [-1, 1]}]);
+        assert.throws(
+            () => applyHistoryOtOperations(snapshot, split),
+            /splits an existing UTF-16 surrogate pair/,
+        );
+        assert.throws(
+            () => applyHistoryOtOperations(
+                snapshot,
+                parseHistoryOtOperations([{textOperation: [1, 1]}]),
+            ),
+            /splits an existing UTF-16 surrogate pair/,
+        );
+        assert.throws(
+            () => applyHistoryOtOperations(
+                snapshot,
+                parseHistoryOtOperations([{textOperation: [{
+                    r: 1,
+                    tracking: {type: 'delete', userId: 'u', ts: timestamp},
+                }, 1]}]),
+            ),
+            /splits an existing UTF-16 surrogate pair/,
+        );
+
+        const retained = applyHistoryOtOperations(
+            snapshot,
+            parseHistoryOtOperations([{textOperation: [2]}]),
+        );
+        assert.equal((rawSnapshot(retained) as {content: string}).content, '😀');
+        const removed = applyHistoryOtOperations(
+            snapshot,
+            parseHistoryOtOperations([{textOperation: [-2]}]),
+        );
+        assert.equal((rawSnapshot(removed) as {content: string}).content, '');
+    });
+
     it('builds accept and reject operations for exact selected tracked ranges', () => {
         const snapshot = parseHistoryOtSnapshot({
             content: 'aIbDc',
@@ -628,6 +668,156 @@ describe('History-OT algebra', () => {
             () => transformHistoryOtOperations(clearTracking, parseHistoryOtOperations([{textOperation: [1]}])),
             /cannot preserve authoritative tracking metadata/,
         );
+    });
+
+    it('composes sequential tracked edits into one exact snapshot-witnessed operation', () => {
+        const snapshot = parseHistoryOtSnapshot({content: 'ab'});
+        const insert = buildHistoryOtTextUpdate(snapshot, [{
+            pos: 1,
+            insertText: 'Y',
+            tracking: {userId: 'u', ts: timestamp},
+        }]);
+        const afterInsert = applyHistoryOtOperations(snapshot, insert);
+        const deleteOriginal = buildHistoryOtTextUpdate(afterInsert, [{
+            pos: 0,
+            deleteLength: 1,
+            tracking: {userId: 'u', ts: timestamp},
+        }]);
+        const sequential = applyHistoryOtOperations(afterInsert, deleteOriginal);
+        const composed = composeHistoryOtOperationsWithSnapshot(
+            snapshot,
+            insert,
+            deleteOriginal,
+        );
+
+        assert.equal((rawOperations(composed) as unknown[]).length, 1);
+        assert.deepEqual(
+            rawSnapshot(applyHistoryOtOperations(snapshot, composed)),
+            rawSnapshot(sequential),
+        );
+        assert.deepEqual(rawSnapshot(sequential), {
+            content: 'aYb',
+            trackedChanges: [
+                {
+                    range: {pos: 0, length: 1},
+                    tracking: {type: 'delete', userId: 'u', ts: timestamp},
+                },
+                {
+                    range: {pos: 1, length: 1},
+                    tracking: {type: 'insert', userId: 'u', ts: timestamp},
+                },
+            ],
+        });
+    });
+
+    it('transforms compatible tracked edits and rejects conflicting directives', () => {
+        const snapshot = parseHistoryOtSnapshot({content: 'ab'});
+        const remoteInsert = buildHistoryOtTextUpdate(snapshot, [{
+            pos: 1,
+            insertText: 'R',
+            tracking: {userId: 'remote', ts: timestamp},
+        }]);
+        const localDelete = buildHistoryOtTextUpdate(snapshot, [{
+            pos: 1,
+            deleteLength: 1,
+            tracking: {userId: 'local', ts: timestamp},
+        }]);
+        const [remotePrime, localPrime] = transformHistoryOtOperationsWithSnapshot(
+            snapshot,
+            remoteInsert,
+            localDelete,
+        );
+        assert.deepEqual(
+            rawSnapshot(applyHistoryOtOperations(
+                applyHistoryOtOperations(snapshot, remoteInsert),
+                localPrime,
+            )),
+            rawSnapshot(applyHistoryOtOperations(
+                applyHistoryOtOperations(snapshot, localDelete),
+                remotePrime,
+            )),
+        );
+
+        const leftDelete = buildHistoryOtTextUpdate(snapshot, [{
+            pos: 0,
+            deleteLength: 1,
+            tracking: {userId: 'left', ts: timestamp},
+        }]);
+        const rightDelete = buildHistoryOtTextUpdate(snapshot, [{
+            pos: 0,
+            deleteLength: 1,
+            tracking: {userId: 'right', ts: timestamp},
+        }]);
+        assert.throws(
+            () => transformHistoryOtOperationsWithSnapshot(
+                snapshot,
+                leftDelete,
+                rightDelete,
+            ),
+            /conflicting tracking directives/,
+        );
+    });
+
+    it('treats object key order as non-semantic in exact tracked/comment witnesses', () => {
+        const tracking = {
+            ts: timestamp,
+            userId: 'old',
+            type: 'insert' as const,
+        };
+        const composeBase = parseHistoryOtSnapshot({
+            comments: [{ranges: [{length: 2, pos: 0}], id: 'c'}],
+            trackedChanges: [{tracking, range: {length: 1, pos: 0}}],
+            content: 'ab',
+        });
+        const clear = parseHistoryOtOperations([{
+            textOperation: [{r: 1, tracking: {type: 'none'}}, 1],
+        }]);
+        const markDeleted = parseHistoryOtOperations([{
+            textOperation: [{
+                r: 1,
+                tracking: {ts: timestamp, userId: 'new', type: 'delete'},
+            }, 1],
+        }]);
+        const sequential = applyHistoryOtOperations(
+            applyHistoryOtOperations(composeBase, clear),
+            markDeleted,
+        );
+        const composed = applyHistoryOtOperations(
+            composeBase,
+            composeHistoryOtOperationsWithSnapshot(composeBase, clear, markDeleted),
+        );
+        assert.notEqual(JSON.stringify(rawSnapshot(sequential)), JSON.stringify(rawSnapshot(composed)));
+        assert.equal(historyOtJsonEqual(sequential.raw, composed.raw), true);
+
+        const transformBase = parseHistoryOtSnapshot({
+            trackedChanges: [{tracking, range: {length: 1, pos: 0}}],
+            comments: [{ranges: [{length: 2, pos: 0}], id: 'c'}],
+            content: 'ab',
+        });
+        const trackedInsert = parseHistoryOtOperations([{
+            textOperation: [1, {
+                i: 'X',
+                tracking: {ts: timestamp, userId: 'insert', type: 'insert'},
+            }, 1],
+        }]);
+        const [clearPrime, insertPrime] = transformHistoryOtOperationsWithSnapshot(
+            transformBase,
+            clear,
+            trackedInsert,
+        );
+        const clearThenInsert = applyHistoryOtOperations(
+            applyHistoryOtOperations(transformBase, clear),
+            insertPrime,
+        );
+        const insertThenClear = applyHistoryOtOperations(
+            applyHistoryOtOperations(transformBase, trackedInsert),
+            clearPrime,
+        );
+        assert.notEqual(
+            JSON.stringify(rawSnapshot(clearThenInsert)),
+            JSON.stringify(rawSnapshot(insertThenClear)),
+        );
+        assert.equal(historyOtJsonEqual(clearThenInsert.raw, insertThenClear.raw), true);
     });
 
     it('only folds adjacent compatible array members', () => {

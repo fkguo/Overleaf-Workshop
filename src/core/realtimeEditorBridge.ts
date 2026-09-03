@@ -9,11 +9,12 @@ import {
     applyHistoryOtOperations,
     HistoryOtOperationsInput,
     HistoryOtSnapshotInput,
+    historyOtJsonEqual,
     parseHistoryOtOperations,
     ParsedHistoryOtOperations,
     ParsedHistoryOtSnapshot,
     serializeHistoryOtOperations,
-    transformHistoryOtOperations,
+    transformHistoryOtOperationsWithSnapshot,
 } from './historyOt';
 
 export type RealtimeEditorBridgeState = {
@@ -342,14 +343,18 @@ export function transformHistoryRemoteOperation(
     let editorOperations = parseHistoryOtOperations(serializeHistoryOtOperations(remoteInput));
     let inflightView: ParsedHistoryOtOperations | undefined;
     let pending: ParsedHistoryOtOperations | undefined;
+    let localBase: HistoryOtSnapshotInput = serverSnapshot;
     if (local.inflightView !== undefined) {
-        [editorOperations, inflightView] = transformHistoryOtOperations(
+        [editorOperations, inflightView] = transformHistoryOtOperationsWithSnapshot(
+            localBase,
             editorOperations,
             local.inflightView,
         );
+        localBase = applyHistoryOtOperations(localBase, local.inflightView);
     }
     if (local.pending !== undefined) {
-        [editorOperations, pending] = transformHistoryOtOperations(
+        [editorOperations, pending] = transformHistoryOtOperationsWithSnapshot(
+            localBase,
             editorOperations,
             local.pending,
         );
@@ -365,7 +370,7 @@ export function transformHistoryRemoteOperation(
         applyHistoryOtOperations(serverAfter, inflightView ?? []),
         pending ?? [],
     );
-    if (JSON.stringify(visibleFromEditor.raw) !== JSON.stringify(visibleFromServer.raw)) {
+    if (!historyOtJsonEqual(visibleFromEditor.raw, visibleFromServer.raw)) {
         throw new Error('History OT remote/local transform failed its convergence witness');
     }
     return {

@@ -21,8 +21,11 @@ export {
 export {
     applyHistoryOtOperations,
     composeHistoryOtOperations,
+    composeHistoryOtOperationsWithSnapshot,
+    historyOtJsonEqual,
     invertHistoryOtOperations,
     transformHistoryOtOperations,
+    transformHistoryOtOperationsWithSnapshot,
 } from './operations';
 
 export {
