@@ -2,6 +2,7 @@ import {
     applyHistoryOtOperations,
     buildHistoryOtTextUpdate,
     getVisibleHistoryOtText,
+    historyOtJsonEqual,
     HistoryOtProtocolError,
     HistoryOtSnapshotInput,
     HistoryOtTextEdit,
@@ -255,8 +256,10 @@ function synthesizeSequentialOperation(
     builder.remove(sourceRaw.content.length - sourceCursor);
     const operation = parseHistoryOtOperations([builder.toRaw()]);
     const applied = applyHistoryOtOperations(source, operation);
-    if (JSON.stringify(serializeHistoryOtSnapshot(applied))
-        !== JSON.stringify(serializeHistoryOtSnapshot(expected))) {
+    if (!historyOtJsonEqual(
+        serializeHistoryOtSnapshot(applied),
+        serializeHistoryOtSnapshot(expected),
+    )) {
         throw new HistoryOtProtocolError(
             'UNREPRESENTABLE_SEQUENTIAL_UPDATE',
             'History-OT cannot encode the exact sequential snapshot state as one logical text operation',
@@ -348,8 +351,10 @@ export function prepareHistoryOtDocumentUpdate(
     const operation = synthesizeSequentialOperation(snapshot, currentSnapshot, markers);
     const applied = applyHistoryOtOperations(snapshot, operation);
     if (currentVisibleContent !== desiredVisibleContent
-        || JSON.stringify(serializeHistoryOtSnapshot(applied))
-            !== JSON.stringify(serializeHistoryOtSnapshot(currentSnapshot))) {
+        || !historyOtJsonEqual(
+            serializeHistoryOtSnapshot(applied),
+            serializeHistoryOtSnapshot(currentSnapshot),
+        )) {
         throw new Error('History OT exact sequential mapping failed its apply witness');
     }
     return {

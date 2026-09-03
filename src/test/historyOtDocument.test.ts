@@ -160,6 +160,25 @@ describe('History OT visible document bridge', () => {
         assert.equal(getVisibleHistoryOtText(applied), 'Yb');
     });
 
+    it('treats JSON object key order as non-semantic in sequential snapshot witnesses', () => {
+        const snapshot = parseHistoryOtSnapshot({
+            comments: [{ranges: [{length: 1, pos: 1}], id: 'comment-a'}],
+            content: 'ab',
+        });
+        const prepared = prepareHistoryOtDocumentUpdate(
+            snapshot,
+            'ab',
+            'Yb',
+            [{p: 1, i: 'Y'}, {p: 0, d: 'a'}],
+            {ts: timestamp, userId: 'u-new'},
+        );
+
+        assert.equal(prepared.mergeApplied, true);
+        const applied = applyHistoryOtOperations(snapshot, prepared.operation!);
+        assert.equal(getVisibleHistoryOtText(applied), 'Yb');
+        assert.equal((applied.raw as any).comments[0].id, 'comment-a');
+    });
+
     it('rejects a visible surrogate pair separated by a hidden tracked deletion', () => {
         const snapshot = parseHistoryOtSnapshot({
             content: '\uD83Dhidden\uDE00',
