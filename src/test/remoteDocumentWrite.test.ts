@@ -691,6 +691,75 @@ function makeHistoryWriteHarness(
             harness.doc.version = remoteVersion;
             harness.doc.remoteCache = getVisibleHistoryOtText(remoteSnapshot);
         },
+        reconnectAfterConfirmedAck: (
+            generation = 2,
+            publicId = 'public-2',
+        ) => {
+            const previousProject = harness.vfs.previousRoot;
+            assert.ok(previousProject);
+            const replacementDoc: import('../core/remoteFileSystemProvider').DocumentEntity = {
+                _id: harness.doc._id,
+                name: harness.doc.name,
+                _type: 'doc',
+                otType: 'history-ot',
+            };
+            const replacementProject = {
+                _id: 'project-1',
+                owner: {_id: 'user-1'},
+                members: [],
+                rootFolder: [{
+                    _id: 'root-folder',
+                    name: 'Project',
+                    docs: [replacementDoc],
+                    fileRefs: [],
+                    folders: [],
+                }],
+            };
+            harness.vfs.restoreDocumentRuntime(previousProject, replacementProject);
+            assert.strictEqual(replacementDoc.historyOtSession, session);
+            harness.vfs.root = replacementProject;
+            harness.vfs.previousRoot = replacementProject;
+            harness.doc = replacementDoc;
+            harness.vfs._resolveUri = async () => ({
+                fileType: 'doc',
+                fileEntity: replacementDoc,
+            });
+            harness.vfs.ensureDocumentSession = async () => {
+                if (Number.isSafeInteger(replacementDoc.version)
+                    && replacementDoc.remoteCache !== undefined) {
+                    return {doc: replacementDoc, content: replacementDoc.remoteCache};
+                }
+                return harness.vfs.joinFreshDocumentSession(replacementDoc._id);
+            };
+            session.reconnect(generation);
+            session.updatePermission(generation, {level: permission, userId: 'user-1'});
+            const joined = session.acceptJoin(generation, {
+                snapshot: serializeHistoryOtSnapshot(remoteSnapshot),
+                version: remoteVersion,
+                operations: [],
+                ranges: {},
+                otType: 'history-ot',
+            });
+            assert.equal(joined.state.phase, 'ready');
+            harness.vfs.socket.isConnected = true;
+            harness.vfs.socket.generation = generation;
+            harness.vfs.socket.projectSession = {
+                publicId,
+                permissionsLevel: permission,
+                protocolVersion: 2,
+                generation,
+            };
+            harness.vfs.publicId = publicId;
+            harness.vfs.permissionsLevel = permission;
+            harness.vfs.protocolVersion = 2;
+            harness.vfs.freshConnectionRequested = false;
+            harness.doc.otType = 'history-ot';
+            harness.doc.historyOtSession = session;
+            harness.doc.historyOtSnapshot = serializeHistoryOtSnapshot(remoteSnapshot);
+            harness.doc.historyOtEpoch = `history-confirmed-epoch-${generation}`;
+            harness.doc.version = remoteVersion;
+            harness.doc.remoteCache = getVisibleHistoryOtText(remoteSnapshot);
+        },
         applyCollaborator: async (operation: unknown, source = 'remote-source') => {
             const baseVersion = remoteVersion;
             remoteSnapshot = applyHistoryOtOperations(
@@ -709,6 +778,34 @@ function makeHistoryWriteHarness(
                 publicId: harness.vfs.socket.projectSession.publicId,
                 generation: harness.vfs.socket.generation,
             });
+        },
+        emitCollaborator: async (operation: unknown, source = 'remote-source') => {
+            const baseVersion = remoteVersion;
+            remoteSnapshot = applyHistoryOtOperations(
+                remoteSnapshot,
+                parseHistoryOtOperations(operation),
+            );
+            remoteVersion += 1;
+            harness.setRemoteVersion(remoteVersion);
+            harness.setRemoteText(getVisibleHistoryOtText(remoteSnapshot));
+            const update = {
+                doc: 'doc-1',
+                v: baseVersion,
+                op: operation,
+                meta: {source},
+            };
+            const sender = {
+                publicId: harness.vfs.socket.projectSession.publicId,
+                generation: harness.vfs.socket.generation,
+            };
+            const deferred = harness.vfs.recordConfirmedHistoryCollaboratorUpdate(
+                update,
+                sender,
+            );
+            if (!deferred) {
+                await harness.vfs.queueHistoryOtDocumentUpdate(update, sender);
+            }
+            return deferred;
         },
         advanceRemoteWithoutEvent: (operation: unknown) => {
             remoteSnapshot = applyHistoryOtOperations(
@@ -1719,6 +1816,326 @@ describe('History OT VFS join gate', () => {
             bufferIncarnationId: bufferId,
             baseVersion: 6,
             baseText: 'abcL',
+            dirtyText: 'abcL!?',
+        });
+        assert.equal(record.kind, 'valid');
+        if (record.kind === 'valid') {
+            assert.equal(record.record.pendingWrite, undefined);
+        }
+    });
+
+    it('retains a confirmed-reconciling owner when authority disappears before finalization', async () => {
+        const harness = makeHistoryWriteHarness();
+        const bufferId = await confirmBase(harness, 'abc');
+        harness.document.setDirtyText('abcL');
+        observeDirtyChange(harness);
+        harness.vfs.observeWillSaveTextDocument(harness.document);
+
+        const originalEnqueue = harness.vfs.enqueueConfirmedHistoryDeferredBatch.bind(harness.vfs);
+        let releasePhase!: () => void;
+        let phaseEntered!: () => void;
+        const phaseGate = new Promise<void>(resolve => { releasePhase = resolve; });
+        const phaseStarted = new Promise<void>(resolve => { phaseEntered = resolve; });
+        harness.vfs.enqueueConfirmedHistoryDeferredBatch = (...args: any[]) => {
+            const handoff = originalEnqueue(...args);
+            const pending = args[0];
+            if ((pending.durablePendingWrite as any)?.state !== 'confirmed-reconciling') {
+                return handoff;
+            }
+            return {
+                ...handoff,
+                beforeBarrier: handoff.beforeBarrier.then(async () => {
+                    phaseEntered();
+                    await phaseGate;
+                }),
+            };
+        };
+
+        let firstWrite!: Promise<void>;
+        let originalEnvelope: unknown;
+        let originalToken: string;
+        try {
+            firstWrite = harness.vfs.writeFileNow(
+                harness.uri,
+                new TextEncoder().encode('abcL'),
+                false,
+                true,
+            );
+            void firstWrite.catch(() => {});
+            await phaseStarted;
+            const pending = harness.vfs.pendingDocumentUpdates.get(bufferId);
+            assert.ok(pending);
+            originalEnvelope = JSON.parse(JSON.stringify(pending.update));
+            originalToken = pending.submissionToken;
+            assert.equal(pending.confirmationVersion, 5);
+            assert.equal((pending.durablePendingWrite as any)?.state, 'confirmed-reconciling');
+            assert.equal(
+                (pending.durablePendingWrite as any)?.historyReconciliationVersion,
+                6,
+            );
+
+            harness.vfs.forceFreshConnection();
+            releasePhase();
+            await assert.rejects(firstWrite, /lost its document authority/i);
+        } finally {
+            releasePhase();
+            harness.vfs.enqueueConfirmedHistoryDeferredBatch = originalEnqueue;
+        }
+
+        const retained = harness.vfs.pendingDocumentUpdates.get(bufferId);
+        assert.ok(retained);
+        assert.deepEqual(retained.update, originalEnvelope);
+        assert.equal(retained.submissionToken, originalToken);
+        assert.equal((retained.durablePendingWrite as any)?.state, 'confirmed-reconciling');
+        assert.equal(harness.historySubmissions.length, 1);
+        let record = await harness.store.resolveCurrentRecord(
+            retained.provenanceRecordName,
+            {
+                identity: retained.identity,
+                bufferIncarnationId: bufferId,
+                baseVersion: 5,
+                baseText: 'abc',
+                dirtyText: 'abcL',
+            },
+        );
+        assert.equal(record.kind, 'valid');
+        assert.equal((record.kind === 'valid' ? record.record.pendingWrite : undefined as any)?.state,
+            'confirmed-reconciling');
+
+        harness.reconnectAfterConfirmedAck();
+        harness.vfs.observeWillSaveTextDocument(harness.document);
+        await assert.rejects(
+            harness.vfs.writeFileNow(
+                harness.uri,
+                new TextEncoder().encode('abcL'),
+                false,
+                true,
+            ),
+            /lost its original editor incarnation|incomplete collaborator ancestry/i,
+        );
+
+        assert.equal(harness.historySubmissions.length, 1);
+        assert.equal(harness.vfs.pendingDocumentUpdates.has(bufferId), false);
+        const active = harness.vfs.activeEditorBases.get(bufferId);
+        record = await harness.store.resolveCurrentRecord(active.recordName, {
+            identity: active.identity,
+            bufferIncarnationId: bufferId,
+            baseVersion: 6,
+            baseText: 'abcL',
+            dirtyText: 'abcL',
+        });
+        assert.equal(record.kind, 'valid');
+        if (record.kind === 'valid') {
+            assert.equal(record.record.pendingWrite, undefined);
+        }
+
+        harness.vfs.observeWillSaveTextDocument(harness.document);
+        await harness.vfs.writeFileNow(
+            harness.uri,
+            new TextEncoder().encode('abcL'),
+            false,
+            true,
+        );
+        assert.equal(harness.historySubmissions.length, 1);
+    });
+
+    it('keeps a confirmed History owner during fatal realtime shutdown', async () => {
+        const harness = makeHistoryWriteHarness();
+        const bufferId = await confirmBase(harness, 'abc');
+        harness.document.setDirtyText('abcL');
+        observeDirtyChange(harness);
+        harness.vfs.observeWillSaveTextDocument(harness.document);
+
+        const originalEnqueue = harness.vfs.enqueueConfirmedHistoryDeferredBatch.bind(harness.vfs);
+        let releasePhase!: () => void;
+        let phaseEntered!: () => void;
+        const phaseGate = new Promise<void>(resolve => { releasePhase = resolve; });
+        const phaseStarted = new Promise<void>(resolve => { phaseEntered = resolve; });
+        harness.vfs.enqueueConfirmedHistoryDeferredBatch = (...args: any[]) => {
+            const handoff = originalEnqueue(...args);
+            const pending = args[0];
+            if ((pending.durablePendingWrite as any)?.state !== 'confirmed-reconciling') {
+                return handoff;
+            }
+            return {
+                ...handoff,
+                beforeBarrier: handoff.beforeBarrier.then(async () => {
+                    phaseEntered();
+                    await phaseGate;
+                }),
+            };
+        };
+
+        try {
+            const saving = harness.vfs.writeFileNow(
+                harness.uri,
+                new TextEncoder().encode('abcL'),
+                false,
+                true,
+            );
+            void saving.catch(() => {});
+            await phaseStarted;
+            const pending = harness.vfs.pendingDocumentUpdates.get(bufferId);
+            assert.ok(pending);
+            assert.equal((pending.durablePendingWrite as any)?.state, 'confirmed-reconciling');
+
+            harness.vfs.handleFatalRealtime(
+                new RealtimeFatalError('force_disconnect', 'maintenance'),
+            );
+            releasePhase();
+            await assert.rejects(saving, /lost its document authority/i);
+
+            assert.strictEqual(harness.vfs.pendingDocumentUpdates.get(bufferId), pending);
+            assert.equal(harness.historySubmissions.length, 1);
+            const record = await harness.store.resolveCurrentRecord(
+                pending.provenanceRecordName,
+                {
+                    identity: pending.identity,
+                    bufferIncarnationId: bufferId,
+                    baseVersion: 5,
+                    baseText: 'abc',
+                    dirtyText: 'abcL',
+                },
+            );
+            assert.equal(record.kind, 'valid');
+            assert.equal(
+                (record.kind === 'valid' ? record.record.pendingWrite : undefined as any)?.state,
+                'confirmed-reconciling',
+            );
+        } finally {
+            releasePhase();
+            harness.vfs.enqueueConfirmedHistoryDeferredBatch = originalEnqueue;
+        }
+    });
+
+    it('retries a confirmed-retiring owner idempotently across repeated authority loss', async () => {
+        const harness = makeHistoryWriteHarness();
+        const bufferId = await confirmBase(harness, 'abc');
+        harness.document.setDirtyText('abcL');
+        observeDirtyChange(harness);
+        harness.vfs.observeWillSaveTextDocument(harness.document);
+        harness.setAfterNextAck(() => {
+            harness.advanceRemoteWithoutEvent([{textOperation: [4, 'X']}]);
+        });
+
+        const controls = Array.from({length: 2}, () => {
+            let release!: () => void;
+            let enter!: () => void;
+            return {
+                gate: new Promise<void>(resolve => { release = resolve; }),
+                started: new Promise<void>(resolve => { enter = resolve; }),
+                release: () => release(),
+                enter: () => enter(),
+            };
+        });
+        const originalEnqueue = harness.vfs.enqueueConfirmedHistoryDeferredBatch.bind(harness.vfs);
+        const store = harness.store as any;
+        const originalReplacePendingWrite = store.replacePendingWrite.bind(store);
+        let injectedGenerationThreeUpdate = false;
+        store.replacePendingWrite = async (...args: any[]) => {
+            const record = await originalReplacePendingWrite(...args);
+            const nextMarker = args[2];
+            if (!injectedGenerationThreeUpdate
+                && harness.vfs.socket.generation === 3
+                && nextMarker?.state === 'confirmed-retiring') {
+                injectedGenerationThreeUpdate = true;
+                assert.equal(
+                    await harness.emitCollaborator(
+                        [{textOperation: [5, 'Y']}],
+                        'remote-generation-3',
+                    ),
+                    true,
+                );
+            }
+            return record;
+        };
+        let heldPhases = 0;
+        harness.vfs.enqueueConfirmedHistoryDeferredBatch = (...args: any[]) => {
+            const handoff = originalEnqueue(...args);
+            const pending = args[0];
+            if ((pending.durablePendingWrite as any)?.state !== 'confirmed-retiring'
+                || heldPhases >= controls.length) {
+                return handoff;
+            }
+            const control = controls[heldPhases++];
+            return {
+                ...handoff,
+                beforeBarrier: handoff.beforeBarrier.then(async () => {
+                    control.enter();
+                    await control.gate;
+                }),
+            };
+        };
+
+        const attempt = async (controlIndex: number, text: string) => {
+            harness.vfs.observeWillSaveTextDocument(harness.document);
+            const saving = harness.vfs.writeFileNow(
+                harness.uri,
+                new TextEncoder().encode(text),
+                false,
+                true,
+            );
+            void saving.catch(() => {});
+            await controls[controlIndex].started;
+            const pending = harness.vfs.pendingDocumentUpdates.get(bufferId);
+            assert.ok(pending);
+            assert.equal((pending.durablePendingWrite as any)?.state, 'confirmed-retiring');
+            assert.equal(
+                (pending.durablePendingWrite as any)?.historyReconciliationVersion,
+                7,
+            );
+            harness.vfs.forceFreshConnection();
+            controls[controlIndex].release();
+            await assert.rejects(saving, /lost its authoritative base/i);
+            assert.strictEqual(harness.vfs.pendingDocumentUpdates.get(bufferId), pending);
+            assert.equal(harness.historySubmissions.length, 1);
+        };
+
+        try {
+            await attempt(0, 'abcL');
+            harness.document.setDirtyText('abcL!');
+            observeDirtyChange(harness);
+            await harness.store.flush();
+            harness.reconnectAfterConfirmedAck();
+
+            await attempt(1, 'abcL!');
+            harness.document.setDirtyText('abcL!?');
+            observeDirtyChange(harness);
+            await harness.store.flush();
+            harness.reconnectAfterConfirmedAck(3, 'public-3');
+            const generationThreePending = harness.vfs.pendingDocumentUpdates.get(bufferId);
+            assert.ok(generationThreePending?.historyConfirmedAdvance);
+            generationThreePending.historyConfirmedAdvance.invalidReason =
+                'pre-join event belonged to the retired sender generation';
+
+            harness.vfs.observeWillSaveTextDocument(harness.document);
+            await assert.rejects(
+                harness.vfs.writeFileNow(
+                    harness.uri,
+                    new TextEncoder().encode('abcL!?'),
+                    false,
+                    true,
+                ),
+                /lost its original editor incarnation|incomplete collaborator ancestry|retired sender generation/i,
+            );
+        } finally {
+            controls.forEach(control => control.release());
+            harness.vfs.enqueueConfirmedHistoryDeferredBatch = originalEnqueue;
+            store.replacePendingWrite = originalReplacePendingWrite;
+        }
+
+        assert.equal(injectedGenerationThreeUpdate, true);
+        assert.equal(harness.historySubmissions.length, 1);
+        assert.equal(harness.vfs.pendingDocumentUpdates.has(bufferId), false);
+        assert.equal(harness.document.getText(), 'abcL!?');
+        assert.equal(harness.getRemoteText(), 'abcLXY');
+        const active = harness.vfs.activeEditorBases.get(bufferId);
+        assert.equal(active.historyCausality.valid, false);
+        const record = await harness.store.resolveCurrentRecord(active.recordName, {
+            identity: active.identity,
+            bufferIncarnationId: bufferId,
+            baseVersion: 8,
+            baseText: 'abcLXY',
             dirtyText: 'abcL!?',
         });
         assert.equal(record.kind, 'valid');

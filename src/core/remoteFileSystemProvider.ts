@@ -247,6 +247,9 @@ type PendingDocumentUpdate = {
         }>,
         /** Fresh-join cutoff while later socket events are held for ordered handoff. */
         reconcilingVersion?: number,
+        /** Current fresh-join sender which owns the deferred event handoff. */
+        reconcilingPublicId?: string,
+        reconcilingSocketGeneration?: number,
         deferredUpdates?: ReceivedDocumentUpdate[],
         handoffInstalled?: boolean,
         invalidReason?: string,
@@ -2365,7 +2368,8 @@ export class VirtualFileSystem extends vscode.Disposable {
         const matches = [...this.pendingDocumentUpdates.values()].filter(pending =>
             pending.otType === 'history-ot'
             && pending.docId === docId
-            && pending.historySession?.getState().hasPendingOperation === true
+            && (pending.historySession?.getState().hasPendingOperation === true
+                || pending.confirmationVersion !== undefined)
         );
         return matches.length === 1 ? matches[0] : undefined;
     }
@@ -2565,7 +2569,10 @@ export class VirtualFileSystem extends vscode.Disposable {
         this.terminalRealtimeError = error;
         if (this.root) { this.previousRoot = this.root; }
         this.invalidateDocumentSessions(this.previousRoot);
-        this.pendingDocumentUpdates.clear();
+        // Durable pending markers remain owned until they are reconciled or
+        // explicitly cleared. Terminal transport state already blocks every
+        // mutation, so dropping the in-memory owners here would only orphan
+        // recovery records without making the project safer.
         this.root = undefined;
         this.joiningProject = undefined;
         this.publicId = undefined;
@@ -5034,6 +5041,26 @@ export class VirtualFileSystem extends vscode.Disposable {
         throw new Error('History pending recovery text did not reach a stable durability point');
     }
 
+    /**
+     * A confirmed History owner may be dropped only after its durable marker
+     * was atomically replaced by a proven base. Otherwise keep the owner for a
+     * later zero-wire fresh-join reconciliation and discard only the failed
+     * promise chain so that the durability operation itself can be retried.
+     */
+    private settleConfirmedHistoryPendingOwnerAfterFailure(
+        pending: PendingDocumentUpdate,
+    ): boolean {
+        if (this.pendingDocumentUpdates.get(pending.bufferId) !== pending) {
+            return false;
+        }
+        if (pending.durablePendingWriteCleared) {
+            this.pendingDocumentUpdates.delete(pending.bufferId);
+        } else {
+            pending.durablePendingWriteTransition = undefined;
+        }
+        return true;
+    }
+
     private finalizeConfirmedHistoryPendingMarker(
         pending: PendingDocumentUpdate,
         expectedMarker: ProvenanceJsonValue,
@@ -5074,20 +5101,40 @@ export class VirtualFileSystem extends vscode.Disposable {
     ): void {
         const advance = pending.historyConfirmedAdvance;
         if (!advance) { return; }
-        if (advance.reconcilingVersion !== undefined
-            && advance.reconcilingVersion !== targetVersion) {
-            advance.invalidReason ??= 'confirmed History reconciliation changed its fresh-join cutoff';
-            return;
+        const sameHandoffAuthority = advance.reconcilingPublicId === sender.publicId
+            && advance.reconcilingSocketGeneration === sender.generation;
+        if (advance.reconcilingVersion !== undefined) {
+            if (sameHandoffAuthority && advance.reconcilingVersion !== targetVersion) {
+                advance.invalidReason ??= 'confirmed History reconciliation changed its fresh-join cutoff';
+                return;
+            }
+            if (!sameHandoffAuthority) {
+                // A later fresh join supersedes every deferred event captured
+                // under the retired socket. Only events witnessed under the
+                // new join authority may cross its durability barrier.
+                advance.deferredUpdates = [];
+            }
         }
         advance.reconcilingVersion = targetVersion;
+        advance.reconcilingPublicId = sender.publicId;
+        advance.reconcilingSocketGeneration = sender.generation;
         advance.deferredUpdates ??= [];
-        for (const [revision, recorded] of advance.updates) {
-            if (revision < targetVersion) { continue; }
-            advance.deferredUpdates.push({
-                update: deepCloneJson(recorded.raw),
-                sender: {...sender},
-            });
-            advance.updates.delete(revision);
+        advance.handoffInstalled = false;
+        if (advance.publicId === sender.publicId
+            && advance.socketGeneration === sender.generation) {
+            for (const [revision, recorded] of advance.updates) {
+                if (revision < targetVersion) { continue; }
+                advance.deferredUpdates.push({
+                    update: deepCloneJson(recorded.raw),
+                    sender: {...sender},
+                });
+                advance.updates.delete(revision);
+            }
+        } else {
+            // The fresh join is authoritative through targetVersion. Old
+            // generation evidence cannot be relabelled as a new-generation
+            // realtime event.
+            advance.updates.clear();
         }
     }
 
@@ -5100,12 +5147,18 @@ export class VirtualFileSystem extends vscode.Disposable {
             return {updates: [], invalidReason: 'confirmed History reconciliation lost its event cutoff'};
         }
         const deferred = advance.deferredUpdates?.splice(0) ?? [];
+        const reconcilingPublicId = advance.reconcilingPublicId;
+        const reconcilingSocketGeneration = advance.reconcilingSocketGeneration;
         advance.reconcilingVersion = undefined;
         advance.handoffInstalled = true;
         const accepted: ReceivedDocumentUpdate[] = [];
         const acceptedRaw = new Map<number, HistoryJsonValue>();
         let expectedRevision = targetVersion;
-        let invalidReason = advance.invalidReason;
+        // The ACK-era reconciliation reason still decides whether the owner
+        // must be retired, but it must not poison a later fresh-generation
+        // handoff. This batch is rejected only by errors in its own frozen
+        // cutoff/event sequence.
+        let invalidReason: string | undefined;
         for (const received of deferred) {
             let parsed;
             try {
@@ -5121,8 +5174,8 @@ export class VirtualFileSystem extends vscode.Disposable {
                 || typeof parsed.source !== 'string'
                 || pending.submittedPublicIds.includes(parsed.source)
                 || parsed.duplicate
-                || received.sender?.publicId !== advance.publicId
-                || received.sender?.generation !== advance.socketGeneration) {
+                || received.sender?.publicId !== reconcilingPublicId
+                || received.sender?.generation !== reconcilingSocketGeneration) {
                 invalidReason ??= 'deferred History update has unproven collaborator authority';
                 continue;
             }
@@ -5414,7 +5467,8 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (resolved.kind !== 'valid' || !this.pendingRecordMatches(resolved.record, pending)) {
             throw new Error(`Confirmed History recovery record is no longer exact: ${reason}`);
         }
-        const submittedMarker = this.pendingWritePayload(pending);
+        const expectedMarker = pending.durablePendingWrite
+            ?? this.pendingWritePayload(pending);
         const retiringMarker = this.pendingWritePayload(
             pending,
             'confirmed-retiring',
@@ -5423,7 +5477,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         const retiringTransition = (pending.durablePendingWriteTransition ?? Promise.resolve())
             .then(() => this.provenanceStore.replacePendingWrite(
                 pending.provenanceRecordName,
-                submittedMarker,
+                expectedMarker,
                 retiringMarker,
             )).then(() => {
                 pending.durablePendingWrite = retiringMarker;
@@ -5433,16 +5487,16 @@ export class VirtualFileSystem extends vscode.Disposable {
             await retiringTransition;
             await this.awaitHistoryPendingDurability(pending);
         } catch (error) {
-            if (this.pendingDocumentUpdates.get(pending.bufferId) === pending) {
-                this.pendingDocumentUpdates.delete(pending.bufferId);
-            }
+            const ownsPending = this.settleConfirmedHistoryPendingOwnerAfterFailure(pending);
             const active = this.activeEditorBases.get(pending.bufferId);
-            if (active) { this.invalidateEditorBase(active); }
-            this.showDocumentRecovery(
-                witness.document.uri,
-                new TextEncoder().encode(witness.document.getText()),
-                `the confirmed History outcome remains non-resendable: ${String(error)}`,
-            );
+            if (ownsPending) {
+                if (active) { this.invalidateEditorBase(active); }
+                this.showDocumentRecovery(
+                    witness.document.uri,
+                    new TextEncoder().encode(witness.document.getText()),
+                    `the confirmed History outcome remains non-resendable: ${String(error)}`,
+                );
+            }
             throw error;
         }
         const active = this.activeEditorBases.get(pending.bufferId);
@@ -5451,22 +5505,23 @@ export class VirtualFileSystem extends vscode.Disposable {
         try {
             await handoff.beforeBarrier;
             await this.awaitHistoryPendingDurability(pending);
-            let currentDoc: DocumentEntity;
+            let currentDoc: DocumentEntity | undefined;
             try {
                 currentDoc = this.currentDocument(pending.docId);
             } catch {
-                currentDoc = authoritative.doc;
+                currentDoc = undefined;
             }
-            const baseVersion = currentDoc.version;
-            const baseContent = currentDoc.remoteCache;
+            const baseVersion = currentDoc?.version;
+            const baseContent = currentDoc?.remoteCache;
             const live = this.editorBuffers.get(pending.bufferId);
             const dirtyText = live && this.bufferMatchesIncarnation(live)
                 ? live.document.getText() : resolved.record.dirtyText;
             if (!isNonnegativeSafeInteger(baseVersion)
                 || baseContent === undefined
-                || currentDoc.otType !== 'history-ot'
+                || currentDoc?.otType !== 'history-ot'
                 || currentDoc.historyOtSnapshot === undefined
-                || currentDoc.historyOtSession !== pending.historySession) {
+                || currentDoc.historyOtSession !== pending.historySession
+                || !this.documentMatchesAuthority(currentDoc, baseVersion, baseContent)) {
                 throw new Error(`Confirmed History recovery lost its authoritative base: ${reason}`);
             }
             const record = await this.finalizeConfirmedHistoryPendingMarker(
@@ -5506,8 +5561,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             );
             throw new Error(finalReason);
         } catch (error) {
-            if (this.pendingDocumentUpdates.get(pending.bufferId) === pending) {
-                this.pendingDocumentUpdates.delete(pending.bufferId);
+            if (this.settleConfirmedHistoryPendingOwnerAfterFailure(pending)) {
                 if (active) { this.invalidateEditorBase(active); }
                 this.showDocumentRecovery(
                     witness.document.uri,
@@ -5715,7 +5769,8 @@ export class VirtualFileSystem extends vscode.Disposable {
                 'the History OT sender identity changed before durable reconciliation',
             );
         }
-        const submittedMarker = this.pendingWritePayload(pending);
+        const expectedMarker = pending.durablePendingWrite
+            ?? this.pendingWritePayload(pending);
         const reconcilingMarker = this.pendingWritePayload(
             pending,
             'confirmed-reconciling',
@@ -5724,7 +5779,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         const reconcilingTransition = (pending.durablePendingWriteTransition ?? Promise.resolve())
             .then(() => this.provenanceStore.replacePendingWrite(
                 pending.provenanceRecordName,
-                submittedMarker,
+                expectedMarker,
                 reconcilingMarker,
             )).then(() => {
                 pending.durablePendingWrite = reconcilingMarker;
@@ -5734,15 +5789,14 @@ export class VirtualFileSystem extends vscode.Disposable {
             await reconcilingTransition;
             await this.awaitHistoryPendingDurability(pending);
         } catch (error) {
-            if (this.pendingDocumentUpdates.get(pending.bufferId) === pending) {
-                this.pendingDocumentUpdates.delete(pending.bufferId);
+            if (this.settleConfirmedHistoryPendingOwnerAfterFailure(pending)) {
+                this.invalidateEditorBase(active);
+                this.showDocumentRecovery(
+                    live.document.uri,
+                    new TextEncoder().encode(live.document.getText()),
+                    `the confirmed History outcome remains non-resendable: ${String(error)}`,
+                );
             }
-            this.invalidateEditorBase(active);
-            this.showDocumentRecovery(
-                live.document.uri,
-                new TextEncoder().encode(live.document.getText()),
-                `the confirmed History outcome remains non-resendable: ${String(error)}`,
-            );
             throw error;
         }
         const handoff = this.enqueueConfirmedHistoryDeferredBatch(pending, version);
@@ -5817,18 +5871,21 @@ export class VirtualFileSystem extends vscode.Disposable {
                     active.version = finalVersion;
                     active.content = finalContent;
                 }
-                if (this.pendingDocumentUpdates.get(pending.bufferId) === pending) {
+                if (pending.durablePendingWriteCleared
+                    && this.pendingDocumentUpdates.get(pending.bufferId) === pending) {
                     this.pendingDocumentUpdates.delete(pending.bufferId);
                 }
                 this.invalidateEditorBase(active);
                 this.editorSaveReceipts.delete(pending.bufferId);
                 const reason = failureReason
                     ?? 'the confirmed History OT event handoff lost its authoritative state';
-                this.showDocumentRecovery(
-                    live.document.uri,
-                    new TextEncoder().encode(live.document.getText()),
-                    reason,
-                );
+                if (pending.durablePendingWriteCleared) {
+                    this.showDocumentRecovery(
+                        live.document.uri,
+                        new TextEncoder().encode(live.document.getText()),
+                        reason,
+                    );
+                }
                 throw new Error(reason);
             }
 
@@ -5904,8 +5961,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 currentMatchesAuthoritative,
             };
         } catch (error) {
-            if (this.pendingDocumentUpdates.get(pending.bufferId) === pending) {
-                this.pendingDocumentUpdates.delete(pending.bufferId);
+            if (this.settleConfirmedHistoryPendingOwnerAfterFailure(pending)) {
                 this.invalidateEditorBase(active);
                 this.showDocumentRecovery(
                     live.document.uri,
@@ -6101,8 +6157,10 @@ export class VirtualFileSystem extends vscode.Disposable {
                         staged.submissionToken,
                     );
                 }
-                this.pendingDocumentUpdates.delete(witness.bufferId);
                 await this.provenanceStore.clearPendingWrite(pending.provenanceRecordName);
+                if (this.pendingDocumentUpdates.get(witness.bufferId) === pending) {
+                    this.pendingDocumentUpdates.delete(witness.bufferId);
+                }
                 throw error;
             }
             throw new SocketRequestError(
@@ -6842,7 +6900,6 @@ export class VirtualFileSystem extends vscode.Disposable {
                             pending.update.op ?? [],
                         );
                     }
-                    this.pendingDocumentUpdates.delete(witness.bufferId);
                     try {
                         await this.provenanceStore.clearPendingWrite(pending.provenanceRecordName);
                     } catch (persistenceError) {
@@ -6852,6 +6909,9 @@ export class VirtualFileSystem extends vscode.Disposable {
                             `the rejected write could not be cleared from recovery state: ${String(persistenceError)}`,
                         );
                         throw persistenceError;
+                    }
+                    if (this.pendingDocumentUpdates.get(witness.bufferId) === pending) {
+                        this.pendingDocumentUpdates.delete(witness.bufferId);
                     }
                 }
                 this.showDocumentRecovery(
