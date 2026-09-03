@@ -47,11 +47,18 @@ const pdfViewRecord: {
 type PendingPdfSync = {
     result: SyncCodeResponseSchema,
     requestGeneration: number,
-    expectedRecord?: PdfViewRecord,
+    expectedRecord: PdfViewRecord,
+    pdfGeneration: number,
     isStillApplicable?: () => boolean,
 };
 
 const pendingPdfSync: {[key: string]: PendingPdfSync} = {};
+const pendingSourceSync: {
+    [key: string]: {
+        source: PendingSourceSync,
+        requestGeneration: number,
+    } | undefined,
+} = {};
 const sourceSyncRequests = new LatestRequestGate();
 
 function pdfRecordKey(identifier: string, filePath: string): string {
@@ -73,6 +80,7 @@ type CapturedCompileSourceSync = PendingSourceSync & {
 type SourceSyncDeliveryGuard = {
     requestGeneration?: number,
     expectedRecord?: PdfViewRecord,
+    expectedPdfGeneration?: number,
     isStillApplicable?: () => boolean,
 };
 
@@ -208,12 +216,30 @@ export class CompileManager {
             const previousRecord = pdfViewRecord[identifier]?.[filePath];
             if (previousRecord && previousRecord.webviewPanel !== webviewPanel) {
                 delete pendingPdfSync[recordKey];
+                delete pendingSourceSync[recordKey];
                 sourceSyncRequests.invalidate(recordKey);
             }
             if (pdfViewRecord[identifier]) {
                 pdfViewRecord[identifier][filePath] = {doc, webviewPanel, ready: false};
             } else {
                 pdfViewRecord[identifier] = {[filePath]:{doc, webviewPanel, ready: false}};
+            }
+            const pendingSource = pendingSourceSync[recordKey];
+            const record = pdfViewRecord[identifier][filePath];
+            if (
+                pendingSource &&
+                sourceSyncRequests.isCurrent(recordKey, pendingSource.requestGeneration) &&
+                Number.isSafeInteger(record.doc.generation) &&
+                record.doc.generation > 0
+            ) {
+                delete pendingSourceSync[recordKey];
+                void this.requestSourceSync(pendingSource.source, {
+                    requestGeneration: pendingSource.requestGeneration,
+                    expectedRecord: record,
+                    expectedPdfGeneration: record.doc.generation,
+                }).catch(error => {
+                    console.warn('Unable to forward-sync the opened Overleaf PDF.', error);
+                });
             }
         });
         this.pdfViewerReadyTrigger = EventBus.on('pdfViewerReadyEvent', ({uri, webviewPanel}) => {
@@ -228,10 +254,15 @@ export class CompileManager {
                 delete pendingPdfSync[pendingKey];
                 if (
                     sourceSyncRequests.isCurrent(pendingKey, pending.requestGeneration) &&
-                    (!pending.expectedRecord || pending.expectedRecord === record) &&
+                    pending.expectedRecord === record &&
+                    record.doc.generation === pending.pdfGeneration &&
                     (!pending.isStillApplicable || pending.isStillApplicable())
                 ) {
-                    void record.webviewPanel.webview.postMessage({type: 'syncCode', content: pending.result});
+                    void record.webviewPanel.webview.postMessage({
+                        type: 'syncCode',
+                        content: pending.result,
+                        pdfGeneration: pending.pdfGeneration,
+                    });
                 }
             }
         });
@@ -243,6 +274,7 @@ export class CompileManager {
             delete pdfViewRecord[identifier][filePath];
             const recordKey = pdfRecordKey(identifier, filePath);
             delete pendingPdfSync[recordKey];
+            delete pendingSourceSync[recordKey];
             sourceSyncRequests.invalidate(recordKey);
             if (Object.keys(pdfViewRecord[identifier]).length === 0) {
                 delete pdfViewRecord[identifier];
@@ -429,16 +461,24 @@ export class CompileManager {
         const requestGeneration = sourceSyncRequests.begin(recordKey);
         delete pendingPdfSync[recordKey];
 
+        let refreshedPdf: Uint8Array;
         try {
-            await record.doc.refresh();
+            refreshedPdf = await record.doc.refresh();
         } catch (error) {
             console.warn('Unable to refresh the compiled Overleaf PDF.', error);
             return;
         }
+        // PdfDocument deliberately retains the previous visible PDF when the
+        // replacement cannot be downloaded. Never apply the new build's
+        // SyncTeX coordinates to that older document.
+        if (refreshedPdf.byteLength === 0) { return; }
+        const pdfGeneration = record.doc.generation;
 
         if (
             !isCurrent() ||
             pdfViewRecord[identifier]?.[pdfPath] !== record ||
+            !Number.isSafeInteger(pdfGeneration) ||
+            pdfGeneration <= 0 ||
             !sourceSyncRequests.isCurrent(recordKey, requestGeneration) ||
             !capturedSourcePromise
         ) { return; }
@@ -451,12 +491,14 @@ export class CompileManager {
                 !capturedSource ||
                 capturedSource.identifier !== identifier ||
                 pdfViewRecord[identifier]?.[pdfPath] !== record ||
+                record.doc.generation !== pdfGeneration ||
                 !sourceSyncRequests.isCurrent(recordKey, requestGeneration) ||
                 !this.isCapturedCompileSourceStillApplicable(capturedSource)
             ) { return; }
             return this.requestSourceSync(capturedSource, {
                 requestGeneration,
                 expectedRecord: record,
+                expectedPdfGeneration: pdfGeneration,
                 isStillApplicable: () => this.isCapturedCompileSourceStillApplicable(capturedSource),
             });
         }).catch(error => {
@@ -469,6 +511,7 @@ export class CompileManager {
     private invalidateSourceSync(identifier: string) {
         const recordKey = pdfRecordKey(identifier, `${OUTPUT_FOLDER_NAME}/output.pdf`);
         delete pendingPdfSync[recordKey];
+        delete pendingSourceSync[recordKey];
         sourceSyncRequests.invalidate(recordKey);
     }
 
@@ -776,21 +819,31 @@ export class CompileManager {
         const pdfPath = `${OUTPUT_FOLDER_NAME}/output.pdf`;
         const record = pdfViewRecord[identifier]?.[pdfPath];
         const recordKey = pdfRecordKey(identifier, pdfPath);
+        const pdfGeneration = guard.expectedPdfGeneration ?? record?.doc.generation;
         if (
+            !record ||
+            !Number.isSafeInteger(pdfGeneration) ||
+            (pdfGeneration as number) <= 0 ||
             !sourceSyncRequests.isCurrent(recordKey, guard.requestGeneration) ||
             (guard.expectedRecord && guard.expectedRecord !== record) ||
+            record.doc.generation !== pdfGeneration ||
             (guard.isStillApplicable && !guard.isStillApplicable())
         ) { return; }
-        if (!record?.ready) {
+        if (!record.ready) {
             pendingPdfSync[recordKey] = {
                 result,
                 requestGeneration: guard.requestGeneration,
-                expectedRecord: guard.expectedRecord,
+                expectedRecord: record,
+                pdfGeneration: pdfGeneration as number,
                 isStillApplicable: guard.isStillApplicable,
             };
             return;
         }
-        void record.webviewPanel.webview.postMessage({type: 'syncCode', content: result});
+        void record.webviewPanel.webview.postMessage({
+            type: 'syncCode',
+            content: result,
+            pdfGeneration,
+        });
     }
 
     private async requestSourceSync(
@@ -799,25 +852,44 @@ export class CompileManager {
     ) {
         const pdfPath = `${OUTPUT_FOLDER_NAME}/output.pdf`;
         const recordKey = pdfRecordKey(source.identifier, pdfPath);
+        const record = pdfViewRecord[source.identifier]?.[pdfPath];
         const requestGeneration = guard.requestGeneration ?? sourceSyncRequests.begin(recordKey);
+        if (!record) {
+            if (!sourceSyncRequests.isCurrent(recordKey, requestGeneration)) { return; }
+            delete pendingPdfSync[recordKey];
+            pendingSourceSync[recordKey] = {source, requestGeneration};
+            return;
+        }
+        const deliveryGuard: SourceSyncDeliveryGuard = {
+            ...guard,
+            expectedRecord: guard.expectedRecord ?? record,
+            expectedPdfGeneration: guard.expectedPdfGeneration ?? record.doc.generation,
+        };
+        if (
+            !Number.isSafeInteger(deliveryGuard.expectedPdfGeneration) ||
+            (deliveryGuard.expectedPdfGeneration as number) <= 0
+        ) { return; }
         // A newly requested cursor location supersedes any older result which
         // was waiting for the PDF viewer to become ready.
         delete pendingPdfSync[recordKey];
+        delete pendingSourceSync[recordKey];
         if (
             !sourceSyncRequests.isCurrent(recordKey, requestGeneration) ||
-            (guard.expectedRecord && pdfViewRecord[source.identifier]?.[pdfPath] !== guard.expectedRecord) ||
-            (guard.isStillApplicable && !guard.isStillApplicable())
+            pdfViewRecord[source.identifier]?.[pdfPath] !== deliveryGuard.expectedRecord ||
+            record.doc.generation !== deliveryGuard.expectedPdfGeneration ||
+            (deliveryGuard.isStillApplicable && !deliveryGuard.isStillApplicable())
         ) { return; }
         const vfs = await this.vfsm.prefetch(source.projectUri);
         if (
             !sourceSyncRequests.isCurrent(recordKey, requestGeneration) ||
-            (guard.expectedRecord && pdfViewRecord[source.identifier]?.[pdfPath] !== guard.expectedRecord) ||
-            (guard.isStillApplicable && !guard.isStillApplicable())
+            pdfViewRecord[source.identifier]?.[pdfPath] !== deliveryGuard.expectedRecord ||
+            record.doc.generation !== deliveryGuard.expectedPdfGeneration ||
+            (deliveryGuard.isStillApplicable && !deliveryGuard.isStillApplicable())
         ) { return; }
         const result = await vfs.syncCode(source.file, source.line, source.column);
         if (result?.length && sourceSyncRequests.isCurrent(recordKey, requestGeneration)) {
             this.deliverSourceSync(source.identifier, result, {
-                ...guard,
+                ...deliveryGuard,
                 requestGeneration,
             });
         }

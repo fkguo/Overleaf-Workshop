@@ -37,7 +37,7 @@
         pdfSidebarView: SidebarView.NONE,
     };
     let firstLoaded = true;
-    let pendingSyncCode;
+    const syncGenerationGate = OverleafPdfSyncGeneration.createGate();
     let pdfLoadGeneration = 0;
     let loadingPdfGeneration = 0;
     let readyPdfGeneration = 0;
@@ -153,8 +153,11 @@
         container.insertBefore(button, firstChild);
     }
 
-    async function updatePdf(pdf) {
-        const generation = ++pdfLoadGeneration;
+    async function updatePdf(pdf, generation) {
+        if (!syncGenerationGate.beginPdfLoad(generation)) {
+            return;
+        }
+        pdfLoadGeneration = generation;
         // The old PDF remains mounted while getDocument parses the replacement.
         // Do not consume a new SyncTeX result against that stale viewport.
         readyPdfGeneration = 0;
@@ -218,14 +221,16 @@
     }
 
     function flushPendingSyncCode() {
-        if (pendingSyncCode && revealSyncCode(pendingSyncCode)) {
-            pendingSyncCode = undefined;
+        const pendingSyncCode = syncGenerationGate.readyContent(readyPdfGeneration);
+        if (pendingSyncCode !== undefined && revealSyncCode(pendingSyncCode)) {
+            syncGenerationGate.consume(readyPdfGeneration);
         }
     }
 
-    function syncCode(pdf) {
-        pendingSyncCode = pdf;
-        window.requestAnimationFrame(flushPendingSyncCode);
+    function syncCode(pdf, pdfGeneration) {
+        if (syncGenerationGate.queueSync(pdfGeneration, pdf)) {
+            window.requestAnimationFrame(flushPendingSyncCode);
+        }
     }
 
     //Reference: https://github.com/overleaf/overleaf/blob/main/services/web/frontend/js/features/pdf-preview/util/pdf-js-wrapper.js#L163
@@ -278,10 +283,10 @@
             const message = e.data;
             switch (message.type) {
                 case 'update':
-                    updatePdf(message.content);
+                    updatePdf(message.content, message.pdfGeneration);
                     break;
                 case 'syncCode':
-                    syncCode(message.content);
+                    syncCode(message.content, message.pdfGeneration);
                     break;
                 case 'initState':
                     updatePdfViewerDefaults(message.defaults);

@@ -5,8 +5,9 @@ import { GlobalStateManager } from '../utils/globalStateManager';
 
 export class PdfDocument implements vscode.CustomDocument {
     cache: Uint8Array = new Uint8Array(0);
+    private _generation = 0;
 
-    private readonly _onDidChange = new vscode.EventEmitter<{}>();
+    private readonly _onDidChange = new vscode.EventEmitter<{content: Uint8Array, generation: number}>();
     readonly onDidChange = this._onDidChange.event;
 
     constructor(readonly uri: vscode.Uri) {
@@ -18,14 +19,25 @@ export class PdfDocument implements vscode.CustomDocument {
 
     dispose() { }
 
+    get generation() {
+        return this._generation;
+    }
+
     async refresh(): Promise<Uint8Array> {
         try {
-            this.cache = new Uint8Array(await vscode.workspace.fs.readFile(this.uri));
+            const content = new Uint8Array(await vscode.workspace.fs.readFile(this.uri));
+            if (content.byteLength === 0) {
+                return content;
+            }
+            this.cache = content;
+            this._generation += 1;
+            this._onDidChange.fire({content, generation: this._generation});
+            return content;
         } catch {
-            this.cache = new Uint8Array();
+            // Keep the last successfully loaded PDF visible. Callers use the
+            // empty result to suppress SyncTeX for this failed refresh.
+            return new Uint8Array();
         }
-        this._onDidChange.fire({content:this.cache});
-        return this.cache;
     }
 }
 
@@ -60,8 +72,12 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         EventBus.fire('pdfWillOpenEvent', {uri: doc.uri, doc, webviewPanel});
 
         const updateWebview = () => {
-            if (doc.cache.buffer.byteLength !== 0) {
-                webviewPanel.webview.postMessage({type:'update', content:doc.cache.buffer});
+            if (doc.cache.byteLength !== 0) {
+                webviewPanel.webview.postMessage({
+                    type: 'update',
+                    content: doc.cache.buffer,
+                    pdfGeneration: doc.generation,
+                });
             }
         };
 
@@ -133,9 +149,13 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
 
         // patch custom files
         const workerScript = `<script src="${patchPath('vendor','build','pdf.worker.js')}"></script>`;
+        const syncGenerationScript = `<script src="${patchPath('syncGeneration.js')}"></script>`;
         const customScript = `<script src="${patchPath('index.js')}"></script>`;
         const customStyle = `<link rel="stylesheet" href="${patchPath('index.css')}" />`;
-        html = html.replace(/\<\/head\>/, `${workerScript}\n${customScript}\n${customStyle}\n</head>`);
+        html = html.replace(
+            /\<\/head\>/,
+            `${workerScript}\n${syncGenerationScript}\n${customScript}\n${customStyle}\n</head>`,
+        );
 
         return html;
     }
