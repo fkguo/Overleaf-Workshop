@@ -520,6 +520,55 @@ describe('DocumentProvenanceStore', () => {
         assert.equal(reconciled.dirtyText, 'abXYc');
     });
 
+    it('atomically replaces only the exact pending marker', async () => {
+        const storage = new FailingMemoryStorage();
+        const store = createStore(storage, 'window-a');
+        const created = await store.createOrUpdateCurrent({
+            identity: baseIdentity,
+            bufferIncarnationId: defaultBufferIncarnationId,
+            baseVersion: 12,
+            baseText: 'abc',
+            dirtyText: 'abXc',
+        });
+        const submitted: JsonValue = {state: 'submitted', confirmationVersion: 12};
+        const reconciling: JsonValue = {state: 'confirmed-reconciling', targetVersion: 13};
+        await store.markPendingWrite(created.recordName, submitted);
+
+        await assert.rejects(
+            () => store.replacePendingWrite(
+                created.recordName,
+                {state: 'wrong'},
+                reconciling,
+            ),
+            /pending-write mismatch/,
+        );
+        storage.failNextWrite = true;
+        await assert.rejects(
+            () => store.replacePendingWrite(created.recordName, submitted, reconciling),
+            /injected atomic write failure/,
+        );
+        let retained = await store.resolveCurrentRecord(created.recordName, {
+            identity: baseIdentity,
+            bufferIncarnationId: defaultBufferIncarnationId,
+        });
+        assert.equal(retained.kind, 'valid');
+        if (retained.kind === 'valid') {
+            assert.deepEqual(retained.record.pendingWrite, submitted);
+        }
+
+        await store.replacePendingWrite(created.recordName, submitted, reconciling);
+        retained = await store.resolveCurrentRecord(created.recordName, {
+            identity: baseIdentity,
+            bufferIncarnationId: defaultBufferIncarnationId,
+        });
+        assert.equal(retained.kind, 'valid');
+        if (retained.kind === 'valid') {
+            assert.deepEqual(retained.record.pendingWrite, reconciling);
+            assert.equal(retained.record.baseVersion, 12);
+            assert.equal(retained.record.dirtyText, 'abXc');
+        }
+    });
+
     it('updates post-submit dirty recovery text without mutating the pending wire intent', async () => {
         const storage = new MemoryStorage();
         const store = createStore(storage, 'window-a');

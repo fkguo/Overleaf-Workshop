@@ -148,17 +148,17 @@ let nextProject = 0;
 const managers: any[] = [];
 
 function makeUri(identifier: string, pathParts: string[]): any {
-    const [userId, projectId, projectName] = identifier.split('/');
+    const [authority, userId, projectId, projectName] = JSON.parse(identifier) as string[];
     const path = `/${projectName}/${pathParts.join('/')}`;
     const query = `user=${encodeURIComponent(userId)}&project=${encodeURIComponent(projectId)}`;
     const uri = {
         scheme: 'overleaf-workshop',
-        authority: 'www.overleaf.com',
+        authority,
         identifier,
         pathParts,
         path,
         query,
-        toString: () => `overleaf-workshop://www.overleaf.com${path}?${query}`,
+        toString: () => `overleaf-workshop://${authority}${path}?${query}`,
         with: (changes: {path?: string}) => {
             const changedPath = changes.path ?? path;
             const changedParts = changedPath.split('/').slice(2);
@@ -168,9 +168,16 @@ function makeUri(identifier: string, pathParts: string[]): any {
     return uri;
 }
 
-function projectFixture() {
+function projectFixture(authority = 'www.overleaf.com', identity?: {
+    userId: string,
+    projectId: string,
+    projectName: string,
+}) {
     nextProject += 1;
-    const identifier = `user/project-${nextProject}/Project-${nextProject}`;
+    const userId = identity?.userId ?? 'user';
+    const projectId = identity?.projectId ?? `project-${nextProject}`;
+    const projectName = identity?.projectName ?? `Project-${nextProject}`;
+    const identifier = JSON.stringify([authority, userId, projectId, projectName]);
     return {
         identifier,
         sourceUri: makeUri(identifier, ['main.tex']),
@@ -405,6 +412,52 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
         }]);
         assert.equal(vscodeStub.window.activeTextEditor, editor);
         assert.equal(executedCommands.includes('vscode.openWith'), false);
+    });
+
+    it('keeps compile and PDF viewer state isolated across Overleaf authorities', async () => {
+        const identity = {
+            userId: 'same-user',
+            projectId: 'same-project',
+            projectName: 'Same-Project',
+        };
+        const primary = projectFixture('www.overleaf.com', identity);
+        const community = projectFixture('overleaf.example.edu', identity);
+        const primaryActions: string[] = [];
+        const communityActions: string[] = [];
+        setActiveEditor(primary.sourceUri);
+        const manager = createManager(createVfs(successfulOutcome(), primaryActions));
+        registerPdfViewer(primary, primaryActions);
+        registerPdfViewer(community, communityActions);
+
+        await manager.compile(true, 'command', primary.compileUri);
+        await flushAsync();
+
+        assert.deepEqual(primaryActions, ['refresh', 'sync-request', 'syncCode']);
+        assert.deepEqual(communityActions, []);
+    });
+
+    it('keeps reverse SyncTeX state isolated across Overleaf authorities', async () => {
+        const identity = {
+            userId: 'same-user',
+            projectId: 'same-project',
+            projectName: 'Same-Project',
+        };
+        const primary = projectFixture('www.overleaf.com', identity);
+        const community = projectFixture('overleaf.example.edu', identity);
+        const reverseCalls: any[][] = [];
+        const vfs = createVfs(successfulOutcome(), []);
+        vfs.syncPdf = async (...args: any[]) => {
+            reverseCalls.push(args);
+            return undefined;
+        };
+        const manager = createManager(vfs);
+        const primaryViewer = registerPdfViewer(primary, []);
+        const communityViewer = registerPdfViewer(community, []);
+
+        await manager.syncPdf(reverseSyncRequest(primary, primaryViewer));
+        await manager.syncPdf(reverseSyncRequest(community, communityViewer));
+
+        assert.deepEqual(reverseCalls, [[2, 3, 4], [2, 3, 4]]);
     });
 
     it('delivers one manual sync requested during an in-flight PDF refresh', async () => {
@@ -743,6 +796,57 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
         const compiling = manager.compile(true, 'command', fixture.compileUri);
         await flushAsync();
         editor.selection.active = {line: 8, character: 1};
+        finishCompile(successfulOutcome());
+        await compiling;
+        await flushAsync();
+
+        assert.deepEqual(actions, ['refresh']);
+    });
+
+    it('skips auto-sync when a different source object has the same URI, version, and cursor', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        const capturedEditor = setActiveEditor(fixture.sourceUri, 2, 3, 1);
+        let finishCompile!: (outcome: CompileOutcome) => void;
+        const compileResult = new Promise<CompileOutcome>(resolve => {
+            finishCompile = resolve;
+        });
+        const vfs = createVfs(successfulOutcome(), actions);
+        vfs.compile = async () => compileResult;
+        const manager = createManager(vfs);
+        registerPdfViewer(fixture, actions);
+
+        const compiling = manager.compile(true, 'command', fixture.compileUri);
+        await flushAsync();
+        const replacementEditor = setActiveEditor(fixture.sourceUri, 2, 3, 1);
+        vscodeStub.workspace.textDocuments = [
+            capturedEditor.document,
+            replacementEditor.document,
+        ];
+        finishCompile(successfulOutcome());
+        await compiling;
+        await flushAsync();
+
+        assert.deepEqual(actions, ['refresh']);
+    });
+
+    it('skips auto-sync when the captured source object leaves the workspace document set', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        const editor = setActiveEditor(fixture.sourceUri, 2, 3, 1);
+        let finishCompile!: (outcome: CompileOutcome) => void;
+        const compileResult = new Promise<CompileOutcome>(resolve => {
+            finishCompile = resolve;
+        });
+        const vfs = createVfs(successfulOutcome(), actions);
+        vfs.compile = async () => compileResult;
+        const manager = createManager(vfs);
+        registerPdfViewer(fixture, actions);
+
+        const compiling = manager.compile(true, 'command', fixture.compileUri);
+        await flushAsync();
+        vscodeStub.workspace.textDocuments = [];
+        assert.equal(vscodeStub.window.activeTextEditor, editor);
         finishCompile(successfulOutcome());
         await compiling;
         await flushAsync();

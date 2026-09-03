@@ -15,6 +15,10 @@ describe('Overleaf project URI normalization', () => {
         assert.equal(parsed.userId, userId);
         assert.equal(parsed.projectId, projectId);
         assert.equal(parsed.projectName, 'Xb');
+        assert.equal(
+            parsed.identifier,
+            JSON.stringify(['www.overleaf.com', userId, projectId, 'Xb']),
+        );
         assert.deepEqual(parsed.pathParts, ['sections', 'a.tex']);
     });
 
@@ -38,6 +42,32 @@ describe('Overleaf project URI normalization', () => {
             projectConnectionKey('www.overleaf.com', `project=${projectId}&user=${userId}`),
             expected,
         );
+    });
+
+    it('maps encoded and reordered aliases to one opaque project identifier', () => {
+        const expected = parseProjectUri('www.overleaf.com', '/Xb', decodedQuery).identifier;
+        assert.equal(
+            parseProjectUri(
+                'www.overleaf.com',
+                '/Xb',
+                encodeURIComponent(decodedQuery),
+            ).identifier,
+            expected,
+        );
+        assert.equal(
+            parseProjectUri(
+                'www.overleaf.com',
+                '/Xb',
+                `project=${projectId}&user=${userId}`,
+            ).identifier,
+            expected,
+        );
+    });
+
+    it('keeps the same account/project tuple distinct across authorities', () => {
+        const primary = parseProjectUri('www.overleaf.com', '/Xb', decodedQuery);
+        const community = parseProjectUri('overleaf.example.edu', '/Xb', decodedQuery);
+        assert.notEqual(primary.identifier, community.identifier);
     });
 
     it('rejects a history URI without an actionable project identity', () => {

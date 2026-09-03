@@ -38,6 +38,7 @@ import {
     acknowledgeHistorySubmission,
     beginHistorySubmission,
     beginLocalEditorSubmission,
+    commitHistoryCleanRemoteEditorTransaction,
     commitHistoryRemoteEditorTransaction,
     commitRemoteEditorTransaction,
     confirmLocalEditorSubmission,
@@ -47,6 +48,7 @@ import {
     HistoryRealtimeEditorBridgeState,
     HistoryRemoteEditorTransaction,
     prepareHistoryRemoteEditorTransaction,
+    prepareHistoryRemoteEditorCatchupTransaction,
     prepareRemoteEditorTransaction,
     rebindHistorySubmissionForRecovery,
     reconcileHistoryEditorAfterJoin,
@@ -78,6 +80,8 @@ import {
 } from './documentProvenance';
 import { WorkspaceProvenanceStorage } from './workspaceProvenanceStorage';
 import {
+    applyHistoryOtOperations,
+    composeHistoryOtOperationsWithSnapshot,
     getVisibleHistoryOtText,
     historyOtJsonEqual,
     JsonValue as HistoryJsonValue,
@@ -219,6 +223,34 @@ type PendingDocumentUpdate = {
     submissionToken: string,
     confirmationVersion?: number,
     historyIntent?: import('./historyOtSession').HistoryOtWriteIntent,
+    /** Exact original editor/protocol identity; never serialized into the wire envelope. */
+    identity?: DocumentProvenanceIdentity,
+    /** Current crash-safe marker while a confirmed History outcome is handed off. */
+    durablePendingWrite?: ProvenanceJsonValue,
+    /** Serializes marker transitions with dirty recovery-text persistence. */
+    durablePendingWriteTransition?: Promise<void>,
+    /** Proven base used by dirty updates after the confirmed marker is cleared. */
+    durableReconciledBase?: {
+        identity: DocumentProvenanceIdentity,
+        baseVersion: number,
+        baseText: string,
+    },
+    durablePendingWriteCleared?: boolean,
+    /** Same-generation collaborator evidence observed after a sender ACK. */
+    historyConfirmedAdvance?: {
+        publicId: string,
+        socketGeneration: number,
+        committedVersion: number,
+        updates: Map<number, {
+            raw: HistoryJsonValue,
+            operation: HistoryJsonValue,
+        }>,
+        /** Fresh-join cutoff while later socket events are held for ordered handoff. */
+        reconcilingVersion?: number,
+        deferredUpdates?: ReceivedDocumentUpdate[],
+        handoffInstalled?: boolean,
+        invalidReason?: string,
+    },
     /** Same-host recovery authority only; never serialized to provenance. */
     historySession?: HistoryOtSession,
 };
@@ -289,6 +321,9 @@ type PendingHistoryRemoteEditorTransaction = {
 };
 
 type PendingHistoryCleanEditorRefresh = {
+    bufferId: string,
+    docId: string,
+    publicId: string,
     document: vscode.TextDocument,
     active: EditorDocumentBase,
     transaction: HistoryRemoteEditorTransaction,
@@ -1044,12 +1079,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             && this.wasDocumentOpenBeforeProviderRead(document)
         );
         const provenCleanRefresh = alreadyObservedDocuments.length === 1
-            && this.matchesPendingCleanRefresh(
-                alreadyObservedDocuments[0],
-                doc._id,
-                doc.version,
-                content,
-            );
+            && this.matchesPendingCleanRefresh(alreadyObservedDocuments[0], doc, content);
         this.pendingReadTickets.set(resourceKey, {
             token: randomUUID(),
             resourceKey,
@@ -1077,42 +1107,81 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     private matchesPendingCleanRefresh(
         document: vscode.TextDocument,
-        docId: string,
-        version: number,
+        doc: DocumentEntity,
         content: string,
     ): boolean {
         const bufferId = this.editorBufferIds.get(document);
         const pending = bufferId ? this.cleanEditorRefreshMap().get(bufferId) : undefined;
+        const historyPending = bufferId
+            ? this.historyCleanEditorRefreshMap().get(bufferId) : undefined;
         const buffer = bufferId ? this.editorBuffers.get(bufferId) : undefined;
         const sender = this.currentSenderWitness();
-        const matches = Boolean(
+        const legacyMatches = Boolean(
             bufferId
             && pending
             && buffer
             && pending.document === document
             && pending.active === this.activeEditorBases.get(bufferId)
-            && buffer.docId === docId
+            && buffer.docId === doc._id
             && this.bufferMatchesIncarnation(buffer)
             && !document.isDirty
             && document.version >= pending.transaction.beforeDocumentVersion
             && pending.candidateContents.has(document.getText())
-            && pending.nextRemoteVersion === version
+            && pending.nextRemoteVersion === doc.version
             && pending.nextRemoteContent === content
             && sender?.generation === pending.transaction.socketGeneration,
         );
-        if (matches && pending) {
-            const recent = [...pending.candidateContents].at(-1);
-            pending.candidateContents.clear();
+        const active = bufferId ? this.activeEditorBases.get(bufferId) : undefined;
+        const history = active?.historyCausality;
+        const historyMatches = Boolean(
+            bufferId
+            && historyPending
+            && buffer
+            && active
+            && history
+            && historyPending.bufferId === bufferId
+            && historyPending.docId === doc._id
+            && historyPending.document === document
+            && historyPending.active === active
+            && buffer.docId === doc._id
+            && this.bufferMatchesIncarnation(buffer)
+            && !document.isDirty
+            && document.version >= historyPending.transaction.beforeDocumentVersion
+            && historyPending.candidateContents.has(document.getText())
+            && historyPending.nextRemoteVersion === doc.version
+            && historyPending.nextRemoteContent === content
+            && doc.otType === 'history-ot'
+            && doc.remoteCache === content
+            && doc.historyOtSnapshot !== undefined
+            && historyOtJsonEqual(doc.historyOtSnapshot, historyPending.nextRemoteSnapshot)
+            && history.valid
+            && history.authority === 'ready'
+            && history.socketGeneration === historyPending.transaction.socketGeneration
+            && history.remoteEpoch === historyPending.transaction.remoteEpoch
+            && history.remoteVersion === historyPending.transaction.baseRemoteVersion
+            && history.documentVersion === historyPending.transaction.beforeDocumentVersion
+            && history.editorContent === historyPending.transaction.beforeEditorContent
+            && history.inflightWire === undefined
+            && history.inflightView === undefined
+            && history.inflightToken === undefined
+            && history.pending === undefined
+            && sender?.publicId === historyPending.publicId
+            && sender.generation === historyPending.transaction.socketGeneration,
+        );
+        const matched = legacyMatches ? pending : historyMatches ? historyPending : undefined;
+        if (matched) {
+            const recent = [...matched.candidateContents].at(-1);
+            matched.candidateContents.clear();
             [
-                pending.transaction.beforeEditorContent,
+                matched.transaction.beforeEditorContent,
                 document.getText(),
                 recent,
                 content,
             ].forEach(candidate => {
-                if (candidate !== undefined) { pending.candidateContents.add(candidate); }
+                if (candidate !== undefined) { matched.candidateContents.add(candidate); }
             });
         }
-        return matches;
+        return legacyMatches || historyMatches;
     }
 
     private cachedDocumentIdForUri(uri: vscode.Uri): string | undefined {
@@ -1435,38 +1504,70 @@ export class VirtualFileSystem extends vscode.Disposable {
                     }
                 } else if (pendingHistoryClean) {
                     const transaction = pendingHistoryClean.transaction;
-                    let next = commitHistoryRemoteEditorTransaction(
-                        history,
-                        transaction,
-                        document.version,
-                        changes,
-                        document.getText(),
-                    );
                     let current: DocumentEntity | undefined;
                     try {
                         current = this.currentDocument(active.identity.docId);
                     } catch {
                         current = undefined;
                     }
-                    if (pendingHistoryClean.document !== document
-                        || pendingHistoryClean.active !== active
-                        || document.isDirty
-                        || sender?.generation !== next.socketGeneration
-                        || !current
-                        || current.version !== pendingHistoryClean.nextRemoteVersion
-                        || current.remoteCache !== pendingHistoryClean.nextRemoteContent
-                        || current.historyOtSnapshot === undefined
-                        || !historyOtJsonEqual(
+                    const cleanRefreshStillBound = history.valid
+                        && history.authority === 'ready'
+                        && pendingHistoryClean.bufferId === buffer!.bufferId
+                        && pendingHistoryClean.docId === active.identity.docId
+                        && pendingHistoryClean.document === document
+                        && pendingHistoryClean.active === active
+                        && transaction.socketGeneration === history.socketGeneration
+                        && transaction.remoteEpoch === history.remoteEpoch
+                        && transaction.baseRemoteVersion === history.remoteVersion
+                        && transaction.beforeDocumentVersion === history.documentVersion
+                        && transaction.beforeEditorContent === history.editorContent
+                        && !document.isDirty
+                        && Number.isSafeInteger(document.version)
+                        && document.version >= history.documentVersion
+                        && pendingHistoryClean.candidateContents.has(document.getText())
+                        && history.inflightWire === undefined
+                        && history.inflightView === undefined
+                        && history.inflightToken === undefined
+                        && history.pending === undefined
+                        && sender?.publicId === pendingHistoryClean.publicId
+                        && sender.generation === history.socketGeneration
+                        && current !== undefined
+                        && current._id === pendingHistoryClean.docId
+                        && current.otType === 'history-ot'
+                        && current.version === pendingHistoryClean.nextRemoteVersion
+                        && current.remoteCache === pendingHistoryClean.nextRemoteContent
+                        && current.historyOtSnapshot !== undefined
+                        && historyOtJsonEqual(
                             current.historyOtSnapshot,
                             pendingHistoryClean.nextRemoteSnapshot,
-                        )) {
+                        );
+                    const cleanRefreshComplete = cleanRefreshStillBound
+                        && document.version > history.documentVersion
+                        && document.getText() === pendingHistoryClean.nextRemoteContent;
+                    let next = cleanRefreshComplete
+                        ? commitHistoryCleanRemoteEditorTransaction(
+                            history,
+                            transaction,
+                            document.version,
+                            document.getText(),
+                        )
+                        : {...history, valid: cleanRefreshStillBound};
+                    if (!cleanRefreshStillBound
+                        || pendingHistoryClean.document !== document
+                        || pendingHistoryClean.active !== active
+                        || document.isDirty
+                        || !current
+                        || sender?.publicId !== pendingHistoryClean.publicId
+                        || sender.generation !== next.socketGeneration) {
                         next = {...next, valid: false};
                     }
                     active.historyCausality = next;
-                    this.historyCleanEditorRefreshMap().delete(buffer!.bufferId);
-                    this.pendingReadTickets.delete(buffer!.resourceKey);
-                    this.boundReadCandidates.delete(buffer!.bufferId);
-                    if (next.valid && current) {
+                    if (!next.valid || cleanRefreshComplete) {
+                        this.historyCleanEditorRefreshMap().delete(buffer!.bufferId);
+                        this.pendingReadTickets.delete(buffer!.resourceKey);
+                        this.boundReadCandidates.delete(buffer!.bufferId);
+                    }
+                    if (next.valid && cleanRefreshComplete && current) {
                         active.version = next.remoteVersion;
                         active.content = getVisibleHistoryOtText(next.remoteSnapshot);
                         active.recordName = undefined;
@@ -1659,11 +1760,46 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (!active) { return; }
         const pending = this.pendingDocumentUpdates.get(buffer.bufferId);
         if (pending) {
-            const persistence = this.provenanceStore.updatePendingDirtyText(
-                pending.provenanceRecordName,
-                this.pendingWritePayload(pending),
-                document.getText(),
-            );
+            const dirtyText = document.getText();
+            let persistence: Promise<DocumentProvenanceRecord>;
+            if (pending.otType === 'history-ot') {
+                const beforePersistence = pending.durablePendingWriteTransition
+                    ?? Promise.resolve();
+                persistence = beforePersistence.then(() => {
+                    if (pending.durablePendingWriteCleared) {
+                        const base = pending.durableReconciledBase;
+                        if (!base) {
+                            throw new Error(
+                                'Confirmed History recovery lost its reconciled durability base',
+                            );
+                        }
+                        return this.provenanceStore.createOrUpdateCurrent({
+                            identity: base.identity,
+                            bufferIncarnationId: pending.bufferId,
+                            baseVersion: base.baseVersion,
+                            baseText: base.baseText,
+                            dirtyText,
+                        });
+                    }
+                    return this.provenanceStore.updatePendingDirtyText(
+                        pending.provenanceRecordName,
+                        pending.durablePendingWrite ?? this.pendingWritePayload(pending),
+                        dirtyText,
+                    );
+                });
+                const transition = persistence.then(() => undefined);
+                // Keep the rejected promise available to the fail-closed History
+                // reconciliation path without exposing an unhandled rejection
+                // while an outcome-unknown write awaits a later fresh join.
+                void transition.catch(() => {});
+                pending.durablePendingWriteTransition = transition;
+            } else {
+                persistence = this.provenanceStore.updatePendingDirtyText(
+                    pending.provenanceRecordName,
+                    this.pendingWritePayload(pending),
+                    dirtyText,
+                );
+            }
             active.persistence = persistence;
             void persistence.then(record => {
                 if (this.activeEditorBases.get(buffer.bufferId) === active
@@ -2232,6 +2368,87 @@ export class VirtualFileSystem extends vscode.Disposable {
             && pending.historySession?.getState().hasPendingOperation === true
         );
         return matches.length === 1 ? matches[0] : undefined;
+    }
+
+    /** Capture exact same-generation collaborator evidence after a sender ACK. */
+    private recordConfirmedHistoryCollaboratorUpdate(
+        update: unknown,
+        eventSender?: ProjectSenderWitness,
+    ): boolean {
+        let parsed;
+        try {
+            parsed = parseHistoryOtRealtimeEnvelope(update);
+        } catch {
+            return false;
+        }
+        const docId = parsed.doc;
+        if (!docId) { return false; }
+        const matches = [...this.pendingDocumentUpdates.values()].filter(pending =>
+            pending.otType === 'history-ot'
+            && pending.docId === docId
+            && pending.confirmationVersion !== undefined
+        );
+        if (matches.length === 0) { return false; }
+        if (matches.length !== 1) {
+            matches.forEach(pending => {
+                if (pending.historyConfirmedAdvance) {
+                    pending.historyConfirmedAdvance.invalidReason =
+                        'multiple confirmed History writes share one document';
+                }
+            });
+            return true;
+        }
+        const pending = matches[0];
+        const advance = pending.historyConfirmedAdvance;
+        const current = this.currentSenderWitness();
+        const reject = (reason: string) => {
+            if (advance) { advance.invalidReason ??= reason; }
+            return true;
+        };
+        if (!advance) { return reject('confirmed History advance has no ACK ledger'); }
+        if (advance.reconcilingVersion !== undefined) {
+            // Reconciliation has frozen the pre-join evidence set. Preserve all
+            // later wire events losslessly; they are validated and installed
+            // behind one durable non-resendable marker before that marker is
+            // cleared.
+            advance.deferredUpdates ??= [];
+            advance.deferredUpdates.push({
+                update: deepCloneJson(parsed.raw),
+                sender: eventSender ? {...eventSender} : undefined,
+            });
+            return true;
+        }
+        if (advance.handoffInstalled) { return false; }
+        if (!parsed.safe
+            || parsed.classification !== 'collaborator-update'
+            || parsed.version === undefined
+            || parsed.operation === undefined) {
+            return reject(`unsafe confirmed History collaborator update: ${parsed.unsafeReasons.join('; ')}`);
+        }
+        if (!current
+            || eventSender?.publicId !== advance.publicId
+            || eventSender.generation !== advance.socketGeneration
+            || current.publicId !== advance.publicId
+            || current.generation !== advance.socketGeneration) {
+            return reject('confirmed History collaborator update changed sender generation');
+        }
+        if (parsed.version < advance.committedVersion
+            || typeof parsed.source !== 'string'
+            || pending.submittedPublicIds.includes(parsed.source)
+            || parsed.duplicate) {
+            return reject('confirmed History collaborator update has unproven ancestry');
+        }
+        const raw = deepCloneJson(parsed.raw) as HistoryJsonValue;
+        const operation = serializeHistoryOtWireOperation(parsed.operation);
+        const previous = advance.updates.get(parsed.version);
+        if (previous) {
+            if (!historyOtJsonEqual(previous.raw, raw)) {
+                advance.invalidReason ??= 'conflicting confirmed History collaborator revision';
+            }
+            return true;
+        }
+        advance.updates.set(parsed.version, {raw, operation});
+        return true;
     }
 
     private invalidateDocumentSessions(project?: ProjectEntity) {
@@ -3563,6 +3780,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         doc: DocumentEntity,
         remoteVersion: number,
         remoteOperations: HistoryJsonValue,
+        forceWorkspaceEdit = false,
     ): PreparedHistoryRemoteEditorUpdate | undefined {
         const candidates = [...this.activeEditorBases.entries()].filter(([bufferId, active]) => {
             const buffer = this.editorBuffers.get(bufferId);
@@ -3603,7 +3821,8 @@ export class VirtualFileSystem extends vscode.Disposable {
                 remoteVersion,
                 remoteOperations,
             );
-            const clean = !buffer.document.isDirty
+            const clean = !forceWorkspaceEdit
+                && !buffer.document.isDirty
                 && history.inflightWire === undefined
                 && history.inflightView === undefined
                 && history.pending === undefined;
@@ -3613,13 +3832,19 @@ export class VirtualFileSystem extends vscode.Disposable {
                 transaction.transformed.serverSnapshot,
             );
             const cleanRefresh = clean ? {
+                bufferId,
+                docId: doc._id,
+                publicId: sender.publicId,
                 document: buffer.document,
                 active,
                 transaction,
                 nextRemoteVersion: remoteVersion + 1,
                 nextRemoteSnapshot,
                 nextRemoteContent: getVisibleHistoryOtText(transaction.transformed.serverSnapshot),
-                candidateContents: new Set([transaction.beforeEditorContent]),
+                candidateContents: new Set([
+                    transaction.beforeEditorContent,
+                    getVisibleHistoryOtText(transaction.transformed.serverSnapshot),
+                ]),
             } : undefined;
             return {bufferId, document: buffer.document, active, transaction, delivery, cleanRefresh};
         } catch {
@@ -3636,6 +3861,8 @@ export class VirtualFileSystem extends vscode.Disposable {
         const sender = this.currentSenderWitness();
         if (prepared.delivery !== 'provider-refresh'
             || !cleanRefresh
+            || cleanRefresh.bufferId !== bufferId
+            || cleanRefresh.docId !== active.identity.docId
             || transaction.expectedChange === undefined
             || buffer?.document !== document
             || !this.bufferMatchesIncarnation(buffer)
@@ -3644,6 +3871,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             || document.version !== transaction.beforeDocumentVersion
             || document.getText() !== transaction.beforeEditorContent
             || sender?.generation !== transaction.socketGeneration
+            || sender.publicId !== cleanRefresh.publicId
             || this.historyCleanEditorRefreshMap().has(bufferId)) {
             this.invalidateEditorBase(active);
             return false;
@@ -3654,6 +3882,7 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     private async applyPreparedHistoryRemoteEditorUpdate(
         prepared: PreparedHistoryRemoteEditorUpdate,
+        persistBase = true,
     ): Promise<boolean> {
         const {active, bufferId, document, transaction} = prepared;
         const history = active.historyCausality;
@@ -3715,7 +3944,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         const exact = applied
             && pending.consumed
             && committed?.valid === true
-            && committed.remoteVersion === transaction.baseRemoteVersion + 1
+            && committed.remoteVersion === transaction.nextRemoteVersion
             && committed.editorContent === document.getText();
         if (!exact) {
             this.invalidateEditorBase(active);
@@ -3724,6 +3953,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (committed.inflightWire === undefined) {
             active.version = committed.remoteVersion;
             active.content = getVisibleHistoryOtText(committed.remoteSnapshot);
+            if (!persistBase) { return true; }
             const record = await this.provenanceStore.createOrUpdateCurrent({
                 identity: active.identity,
                 bufferIncarnationId: bufferId,
@@ -3740,6 +3970,8 @@ export class VirtualFileSystem extends vscode.Disposable {
     private async applyHistoryOtDocumentUpdate(
         update: unknown,
         eventSender?: ProjectSenderWitness,
+        persistBase = true,
+        forceWorkspaceEdit = false,
     ): Promise<void> {
         const parsed = parseHistoryOtRealtimeEnvelope(update);
         const docId = parsed.doc;
@@ -3760,6 +3992,10 @@ export class VirtualFileSystem extends vscode.Disposable {
                 docId,
                 new Error('History OT update belongs to an unproven realtime generation'),
             );
+            return;
+        }
+        if (parsed.classification === 'collaborator-update'
+            && this.recordConfirmedHistoryCollaboratorUpdate(update, eventSender)) {
             return;
         }
         const resolved = this._resolveById(docId);
@@ -3808,6 +4044,24 @@ export class VirtualFileSystem extends vscode.Disposable {
                 );
             }
             pending.confirmationVersion = parsed.version;
+            pending.historyConfirmedAdvance = {
+                publicId: sender.publicId,
+                socketGeneration: sender.generation,
+                committedVersion: parsed.version + 1,
+                updates: new Map(),
+            };
+            await this.provenanceStore.markPendingWrite(
+                pending.provenanceRecordName,
+                this.pendingWritePayload(pending),
+            );
+            const senderAfterPersistence = this.currentSenderWitness();
+            if (this.pendingDocumentUpdates.get(pending.bufferId) !== pending
+                || senderAfterPersistence?.publicId !== sender.publicId
+                || senderAfterPersistence.generation !== sender.generation) {
+                pending.historyConfirmedAdvance.invalidReason =
+                    'History sender authority changed while persisting the commit witness';
+                throw new Error('History sender authority changed while persisting the commit witness');
+            }
             doc.version = undefined;
             doc.remoteCache = undefined;
             doc.historyOtSnapshot = undefined;
@@ -3835,6 +4089,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             doc,
             beforeVersion,
             remoteOperations,
+            forceWorkspaceEdit,
         );
         const result = session.receiveApplied(sender.generation, update);
         if (!result.applied || result.requiresRejoin) {
@@ -3860,7 +4115,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 && prepared.transaction.expectedChange !== undefined
                 ? this.stageHistoryCleanRemoteEditorRefresh(prepared) : false;
             liveApplied = !stagedClean
-                ? await this.applyPreparedHistoryRemoteEditorUpdate(prepared) : false;
+                ? await this.applyPreparedHistoryRemoteEditorUpdate(prepared, persistBase) : false;
         }
         const uri = this.pathToUri(resolved.path);
         if (stagedClean) {
@@ -3879,11 +4134,16 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
-    private queueHistoryOtDocumentUpdate(update: unknown, sender?: ProjectSenderWitness) {
+    private queueHistoryOtDocumentUpdate(
+        update: unknown,
+        sender?: ProjectSenderWitness,
+        persistBase = true,
+        forceWorkspaceEdit = false,
+    ): Promise<void> {
         const docId = realtimeUpdateDocId(update);
         if (!docId) {
             this.invalidateDocumentSessions(this.root);
-            return;
+            return Promise.resolve();
         }
         const queues = this.remoteUpdateQueueMap();
         const previous = queues.get(docId);
@@ -3894,7 +4154,12 @@ export class VirtualFileSystem extends vscode.Disposable {
                 || current.generation !== sender.generation) {
                 return Promise.resolve();
             }
-            return this.applyHistoryOtDocumentUpdate(update, sender);
+            return this.applyHistoryOtDocumentUpdate(
+                update,
+                sender,
+                persistBase,
+                forceWorkspaceEdit,
+            );
         };
         const operation = previous ? previous.catch(() => undefined).then(applyIfCurrent) : applyIfCurrent();
         let queued!: Promise<void>;
@@ -3907,6 +4172,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             if (queues.get(docId) === queued) { queues.delete(docId); }
         });
         queues.set(docId, queued);
+        return queued;
     }
 
     private queueDocumentUpdate(update: UpdateSchema, sender?: ProjectSenderWitness) {
@@ -4081,6 +4347,8 @@ export class VirtualFileSystem extends vscode.Disposable {
                     this.invalidateDocumentSessions(this.root);
                     return;
                 }
+                const confirmedHistoryUpdate =
+                    this.recordConfirmedHistoryCollaboratorUpdate(update, sender);
                 const joining = this.joiningDocuments.get(docId);
                 if (joining && joining.generation === this.socket.generation) {
                     try {
@@ -4090,6 +4358,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                     }
                     return;
                 }
+                if (confirmedHistoryUpdate) { return; }
                 const resolved = this._resolveById(docId);
                 const doc = resolved?.fileType === 'doc'
                     ? resolved.fileEntity as DocumentEntity
@@ -4438,6 +4707,9 @@ export class VirtualFileSystem extends vscode.Disposable {
         const queuedUpdateCount = receivedUpdates.length;
         if (joining.invalid) { throw joining.invalid; }
         this.assertReceivedDocumentUpdateAuthority(docId, receivedUpdates, joiningSender);
+        receivedUpdates.forEach(received => {
+            this.recordConfirmedHistoryCollaboratorUpdate(received.update, received.sender);
+        });
 
         let content: string;
         let changedDuringJoin = false;
@@ -4736,6 +5008,8 @@ export class VirtualFileSystem extends vscode.Disposable {
             socketGeneration: pending.socketGeneration,
             submissionToken: pending.submissionToken,
             historyIntent: pending.historyIntent,
+            historyConfirmationVersion: pending.otType === 'history-ot'
+                ? pending.confirmationVersion : undefined,
             ...extra,
         })) as ProvenanceJsonValue;
     }
@@ -4745,7 +5019,178 @@ export class VirtualFileSystem extends vscode.Disposable {
         pending: PendingDocumentUpdate,
     ): boolean {
         return record.pendingWrite !== undefined
-            && JSON.stringify(record.pendingWrite) === JSON.stringify(this.pendingWritePayload(pending));
+            && JSON.stringify(record.pendingWrite) === JSON.stringify(
+                pending.durablePendingWrite ?? this.pendingWritePayload(pending),
+            );
+    }
+
+    private async awaitHistoryPendingDurability(pending: PendingDocumentUpdate): Promise<void> {
+        for (let attempt = 0; attempt < 32; attempt += 1) {
+            const transition = pending.durablePendingWriteTransition;
+            if (!transition) { return; }
+            await transition;
+            if (pending.durablePendingWriteTransition === transition) { return; }
+        }
+        throw new Error('History pending recovery text did not reach a stable durability point');
+    }
+
+    private finalizeConfirmedHistoryPendingMarker(
+        pending: PendingDocumentUpdate,
+        expectedMarker: ProvenanceJsonValue,
+        input: {
+            identity: DocumentProvenanceIdentity,
+            bufferIncarnationId: string,
+            baseVersion: number,
+            baseText: string,
+            dirtyText: string,
+        },
+    ): Promise<DocumentProvenanceRecord> {
+        pending.durableReconciledBase = {
+            identity: input.identity,
+            baseVersion: input.baseVersion,
+            baseText: input.baseText,
+        };
+        pending.durablePendingWriteCleared = false;
+        const finalization = (pending.durablePendingWriteTransition ?? Promise.resolve())
+            .then(() => this.provenanceStore.reconcilePendingWrite(
+                pending.provenanceRecordName,
+                expectedMarker,
+                input,
+            )).then(record => {
+                pending.durablePendingWrite = undefined;
+                pending.durablePendingWriteCleared = true;
+                return record;
+            });
+        const transition = finalization.then(() => undefined);
+        void transition.catch(() => {});
+        pending.durablePendingWriteTransition = transition;
+        return finalization;
+    }
+
+    private freezeConfirmedHistoryAdvance(
+        pending: PendingDocumentUpdate,
+        targetVersion: number,
+        sender: ProjectSenderWitness,
+    ): void {
+        const advance = pending.historyConfirmedAdvance;
+        if (!advance) { return; }
+        if (advance.reconcilingVersion !== undefined
+            && advance.reconcilingVersion !== targetVersion) {
+            advance.invalidReason ??= 'confirmed History reconciliation changed its fresh-join cutoff';
+            return;
+        }
+        advance.reconcilingVersion = targetVersion;
+        advance.deferredUpdates ??= [];
+        for (const [revision, recorded] of advance.updates) {
+            if (revision < targetVersion) { continue; }
+            advance.deferredUpdates.push({
+                update: deepCloneJson(recorded.raw),
+                sender: {...sender},
+            });
+            advance.updates.delete(revision);
+        }
+    }
+
+    private takeConfirmedHistoryDeferredBatch(
+        pending: PendingDocumentUpdate,
+        targetVersion: number,
+    ): {updates: ReceivedDocumentUpdate[], invalidReason?: string} {
+        const advance = pending.historyConfirmedAdvance;
+        if (!advance || advance.reconcilingVersion !== targetVersion) {
+            return {updates: [], invalidReason: 'confirmed History reconciliation lost its event cutoff'};
+        }
+        const deferred = advance.deferredUpdates?.splice(0) ?? [];
+        advance.reconcilingVersion = undefined;
+        advance.handoffInstalled = true;
+        const accepted: ReceivedDocumentUpdate[] = [];
+        const acceptedRaw = new Map<number, HistoryJsonValue>();
+        let expectedRevision = targetVersion;
+        let invalidReason = advance.invalidReason;
+        for (const received of deferred) {
+            let parsed;
+            try {
+                parsed = parseHistoryOtRealtimeEnvelope(received.update);
+            } catch (error) {
+                invalidReason ??= `deferred History update is malformed: ${String(error)}`;
+                continue;
+            }
+            if (!parsed.safe
+                || parsed.classification !== 'collaborator-update'
+                || parsed.version === undefined
+                || parsed.operation === undefined
+                || typeof parsed.source !== 'string'
+                || pending.submittedPublicIds.includes(parsed.source)
+                || parsed.duplicate
+                || received.sender?.publicId !== advance.publicId
+                || received.sender?.generation !== advance.socketGeneration) {
+                invalidReason ??= 'deferred History update has unproven collaborator authority';
+                continue;
+            }
+            if (parsed.version < targetVersion) {
+                const recorded = advance.updates.get(parsed.version);
+                if (!recorded || !historyOtJsonEqual(recorded.raw, parsed.raw)) {
+                    invalidReason ??= 'deferred History update conflicts with pre-join evidence';
+                }
+                continue;
+            }
+            if (parsed.version < expectedRevision) {
+                const recorded = acceptedRaw.get(parsed.version);
+                if (!recorded || !historyOtJsonEqual(recorded, parsed.raw)) {
+                    invalidReason ??= 'deferred History update conflicts with an earlier revision';
+                }
+                continue;
+            }
+            if (parsed.version !== expectedRevision) {
+                invalidReason ??= `deferred History updates are missing revision ${expectedRevision}`;
+                continue;
+            }
+            if (!isNonnegativeSafeInteger(expectedRevision + 1)) {
+                invalidReason ??= 'deferred History updates exceed the safe revision range';
+                continue;
+            }
+            acceptedRaw.set(parsed.version, deepCloneJson(parsed.raw) as HistoryJsonValue);
+            accepted.push(this.snapshotReceivedDocumentUpdate(parsed.raw, received.sender));
+            expectedRevision += 1;
+        }
+        return invalidReason ? {updates: [], invalidReason} : {updates: accepted};
+    }
+
+    private installHistoryUpdateBarrier(docId: string): {
+        beforeBarrier: Promise<void>,
+        release: () => void,
+    } {
+        const queues = this.remoteUpdateQueueMap();
+        const beforeBarrier = (queues.get(docId) ?? Promise.resolve()).catch(() => undefined);
+        let release!: () => void;
+        const gate = new Promise<void>(resolve => { release = resolve; });
+        let barrier!: Promise<void>;
+        barrier = beforeBarrier.then(() => gate).finally(() => {
+            if (queues.get(docId) === barrier) { queues.delete(docId); }
+        });
+        queues.set(docId, barrier);
+        return {beforeBarrier, release};
+    }
+
+    private enqueueConfirmedHistoryDeferredBatch(
+        pending: PendingDocumentUpdate,
+        targetVersion: number,
+    ): {
+        invalidReason?: string,
+        beforeBarrier: Promise<void>,
+        release: () => void,
+    } {
+        const batch = this.takeConfirmedHistoryDeferredBatch(pending, targetVersion);
+        if (!batch.invalidReason) {
+            batch.updates.forEach(received => {
+                this.queueHistoryOtDocumentUpdate(
+                    received.update,
+                    received.sender,
+                    false,
+                    true,
+                );
+            });
+        }
+        return {...this.installHistoryUpdateBarrier(pending.docId), invalidReason: batch.invalidReason};
     }
 
     private async reconcileConfirmedPending(
@@ -4932,6 +5377,150 @@ export class VirtualFileSystem extends vscode.Disposable {
         };
     }
 
+    private async retireConfirmedHistoryPending(
+        pending: PendingDocumentUpdate,
+        authoritative: {doc: DocumentEntity, content: string},
+        witness: EditorBufferWitness,
+        reason: string,
+    ): Promise<never> {
+        const version = authoritative.doc.version;
+        const identity = pending.identity;
+        const sender = this.currentSenderWitness();
+        if (!isNonnegativeSafeInteger(version)
+            || !identity
+            || !sender
+            || identity.canonicalServerUrl !== this.serverUrl
+            || identity.userId !== this.userId
+            || identity.projectId !== this.projectId
+            || identity.docId !== pending.docId
+            || identity.canonicalEditorUri !== this.canonicalEditorUri(pending.docId)
+            || identity.otType !== 'history-ot'
+            || identity.protocolVersion !== SUPPORTED_WRITE_PROTOCOL_VERSION
+            || !this.documentMatchesAuthority(
+                authoritative.doc,
+                version,
+                authoritative.content,
+            )) {
+            throw new Error(`Confirmed History recovery could not be retired durably: ${reason}`);
+        }
+        this.freezeConfirmedHistoryAdvance(pending, version, sender);
+        const resolved = await this.provenanceStore.resolveCurrentRecord(
+            pending.provenanceRecordName,
+            {
+                identity,
+                bufferIncarnationId: pending.bufferId,
+            },
+        );
+        if (resolved.kind !== 'valid' || !this.pendingRecordMatches(resolved.record, pending)) {
+            throw new Error(`Confirmed History recovery record is no longer exact: ${reason}`);
+        }
+        const submittedMarker = this.pendingWritePayload(pending);
+        const retiringMarker = this.pendingWritePayload(
+            pending,
+            'confirmed-retiring',
+            {historyReconciliationVersion: version},
+        );
+        const retiringTransition = (pending.durablePendingWriteTransition ?? Promise.resolve())
+            .then(() => this.provenanceStore.replacePendingWrite(
+                pending.provenanceRecordName,
+                submittedMarker,
+                retiringMarker,
+            )).then(() => {
+                pending.durablePendingWrite = retiringMarker;
+        });
+        pending.durablePendingWriteTransition = retiringTransition;
+        try {
+            await retiringTransition;
+            await this.awaitHistoryPendingDurability(pending);
+        } catch (error) {
+            if (this.pendingDocumentUpdates.get(pending.bufferId) === pending) {
+                this.pendingDocumentUpdates.delete(pending.bufferId);
+            }
+            const active = this.activeEditorBases.get(pending.bufferId);
+            if (active) { this.invalidateEditorBase(active); }
+            this.showDocumentRecovery(
+                witness.document.uri,
+                new TextEncoder().encode(witness.document.getText()),
+                `the confirmed History outcome remains non-resendable: ${String(error)}`,
+            );
+            throw error;
+        }
+        const active = this.activeEditorBases.get(pending.bufferId);
+        if (active) { this.invalidateEditorBase(active); }
+        const handoff = this.enqueueConfirmedHistoryDeferredBatch(pending, version);
+        try {
+            await handoff.beforeBarrier;
+            await this.awaitHistoryPendingDurability(pending);
+            let currentDoc: DocumentEntity;
+            try {
+                currentDoc = this.currentDocument(pending.docId);
+            } catch {
+                currentDoc = authoritative.doc;
+            }
+            const baseVersion = currentDoc.version;
+            const baseContent = currentDoc.remoteCache;
+            const live = this.editorBuffers.get(pending.bufferId);
+            const dirtyText = live && this.bufferMatchesIncarnation(live)
+                ? live.document.getText() : resolved.record.dirtyText;
+            if (!isNonnegativeSafeInteger(baseVersion)
+                || baseContent === undefined
+                || currentDoc.otType !== 'history-ot'
+                || currentDoc.historyOtSnapshot === undefined
+                || currentDoc.historyOtSession !== pending.historySession) {
+                throw new Error(`Confirmed History recovery lost its authoritative base: ${reason}`);
+            }
+            const record = await this.finalizeConfirmedHistoryPendingMarker(
+                pending,
+                retiringMarker,
+                {
+                    identity,
+                    bufferIncarnationId: pending.bufferId,
+                    baseVersion,
+                    baseText: baseContent,
+                    dirtyText,
+                },
+            );
+            await this.awaitHistoryPendingDurability(pending);
+            const latestLive = this.editorBuffers.get(pending.bufferId);
+            const latestDirtyText = latestLive && this.bufferMatchesIncarnation(latestLive)
+                ? latestLive.document.getText() : dirtyText;
+            if (active) {
+                active.version = baseVersion;
+                active.content = baseContent;
+                active.recordName = record.recordName;
+                active.persistence = Promise.resolve(record);
+            }
+            if (this.pendingDocumentUpdates.get(pending.bufferId) === pending) {
+                this.pendingDocumentUpdates.delete(pending.bufferId);
+            }
+            this.editorSaveReceipts.delete(pending.bufferId);
+            this.historyRemoteEditorTransactionMap().delete(pending.bufferId);
+            this.historyCleanEditorRefreshMap().delete(pending.bufferId);
+            this.stageEditorBase(witness.document.uri, currentDoc, baseContent);
+            const finalReason = handoff.invalidReason
+                ? `${reason}; ${handoff.invalidReason}` : reason;
+            this.showDocumentRecovery(
+                witness.document.uri,
+                new TextEncoder().encode(latestDirtyText),
+                finalReason,
+            );
+            throw new Error(finalReason);
+        } catch (error) {
+            if (this.pendingDocumentUpdates.get(pending.bufferId) === pending) {
+                this.pendingDocumentUpdates.delete(pending.bufferId);
+                if (active) { this.invalidateEditorBase(active); }
+                this.showDocumentRecovery(
+                    witness.document.uri,
+                    new TextEncoder().encode(witness.document.getText()),
+                    `the confirmed History outcome remains non-resendable: ${String(error)}`,
+                );
+            }
+            throw error;
+        } finally {
+            handoff.release();
+        }
+    }
+
     private async reconcileConfirmedHistoryPending(
         pending: PendingDocumentUpdate,
         authoritative: {doc: DocumentEntity, content: string},
@@ -4953,13 +5542,57 @@ export class VirtualFileSystem extends vscode.Disposable {
             || snapshot === undefined
             || !epoch
             || !sender
-            || !active?.historyCausality
+            || !this.documentMatchesAuthority(
+                authoritative.doc,
+                version,
+                authoritative.content,
+            )
+            || authoritative.doc.historyOtSession !== pending.historySession
+            || this.pendingDocumentUpdates.get(pending.bufferId) !== pending) {
+            throw new Error('The confirmed History OT write has no exact authoritative reconciliation state');
+        }
+        const committedVersion = pending.confirmationVersion + 1;
+        const advance = pending.historyConfirmedAdvance;
+        if (advance) {
+            this.freezeConfirmedHistoryAdvance(pending, version, sender);
+        }
+        if (!active?.historyCausality
             || !live
             || !this.bufferMatchesIncarnation(live)
-            || this.pendingDocumentUpdates.get(pending.bufferId) !== pending) {
-            throw new Error('The confirmed History OT write has no exact live reconciliation state');
+            || active.bufferId !== pending.bufferId
+            || active.identity.docId !== pending.docId) {
+            return this.retireConfirmedHistoryPending(
+                pending,
+                authoritative,
+                witness,
+                'the confirmed History OT write lost its original editor incarnation',
+            );
         }
-        const history = reconcileHistoryEditorAfterJoin(active.historyCausality, {
+        const originalHistory = active.historyCausality;
+        const commitWitness = originalHistory.senderCommitWitness;
+        if (!originalHistory.valid
+            || originalHistory.authority !== 'rejoin-required'
+            || !commitWitness
+            || commitWitness.submissionToken !== pending.submissionToken
+            || commitWitness.committedVersion !== committedVersion
+            || !advance
+            || advance.publicId !== sender.publicId
+            || advance.socketGeneration !== sender.generation
+            || advance.committedVersion !== committedVersion
+            || advance.invalidReason !== undefined
+            || [...advance.updates.keys()].some(revision =>
+                revision < committedVersion
+            )) {
+            return this.retireConfirmedHistoryPending(
+                pending,
+                authoritative,
+                witness,
+                advance?.invalidReason
+                    ?? 'the confirmed History OT write has incomplete collaborator ancestry',
+            );
+        }
+
+        let history = reconcileHistoryEditorAfterJoin(originalHistory, {
             socketGeneration: sender.generation,
             remoteEpoch: epoch,
             remoteVersion: version,
@@ -4968,62 +5601,322 @@ export class VirtualFileSystem extends vscode.Disposable {
             editorContent: live.document.getText(),
         });
         if (!history.valid || history.authority !== 'ready') {
-            throw new Error('The fresh History OT snapshot does not exactly witness the committed operation');
-        }
-        const identity = this.documentProvenanceIdentity(pending.docId, live);
-        if (!identity || identity.otType !== 'history-ot') {
-            throw new Error('The History OT sender identity changed before durable reconciliation');
-        }
-        const record = await this.provenanceStore.reconcilePendingWrite(
-            pending.provenanceRecordName,
-            this.pendingWritePayload(pending),
-            {
-                identity,
-                bufferIncarnationId: pending.bufferId,
-                baseVersion: version,
-                baseText: authoritative.content,
-                dirtyText: live.document.getText(),
-            },
-        );
-        if (this.pendingDocumentUpdates.get(pending.bufferId) !== pending
-            || this.activeEditorBases.get(pending.bufferId) !== active
-            || !this.bufferMatchesIncarnation(live)
-            || live.document.version !== history.documentVersion
-            || live.document.getText() !== history.editorContent) {
-            throw new Error('The History OT editor changed during durable reconciliation');
-        }
-        this.pendingDocumentUpdates.delete(pending.bufferId);
-        active.identity = identity;
-        active.version = version;
-        active.content = authoritative.content;
-        active.recordName = record.recordName;
-        active.persistence = Promise.resolve(record);
-        active.causality = this.createLocalEditorCausality(
-            live.document,
-            pending.docId,
-            version,
-            authoritative.content,
-        );
-        active.historyCausality = history;
-        this.stageEditorBase(live.document.uri, authoritative.doc, authoritative.content);
-        const currentMatchesAuthoritative = live.document.getText() === authoritative.content
-            && this.documentMatchesAuthority(authoritative.doc, version, authoritative.content);
-        if (currentMatchesAuthoritative) {
-            authoritative.doc.localCache = authoritative.content;
-            this.editorSaveReceipts.set(pending.bufferId, {
-                document: live.document,
-                identity,
-                bufferId: pending.bufferId,
-                version,
-                content: authoritative.content,
+            if (version <= committedVersion) {
+                return this.retireConfirmedHistoryPending(
+                    pending,
+                    authoritative,
+                    witness,
+                    'the fresh History OT snapshot does not exactly witness the committed operation',
+                );
+            }
+            let composed: ReturnType<typeof parseHistoryOtOperations> | undefined;
+            let replayed = parseHistoryOtSnapshot(commitWitness.predictedRemoteSnapshot.raw);
+            for (let revision = committedVersion; revision < version; revision += 1) {
+                const recorded = advance.updates.get(revision);
+                if (!recorded) {
+                    return this.retireConfirmedHistoryPending(
+                        pending,
+                        authoritative,
+                        witness,
+                        `the confirmed History OT collaborator chain is missing revision ${revision}`,
+                    );
+                }
+                const operations = parseHistoryOtOperations(recorded.operation);
+                composed = composed === undefined ? operations
+                    : composeHistoryOtOperationsWithSnapshot(
+                        commitWitness.predictedRemoteSnapshot,
+                        composed,
+                        operations,
+                    );
+                replayed = applyHistoryOtOperations(replayed, operations);
+            }
+            if (!composed || !historyOtJsonEqual(replayed.raw, snapshot)) {
+                return this.retireConfirmedHistoryPending(
+                    pending,
+                    authoritative,
+                    witness,
+                    'the confirmed History OT collaborator chain does not match the fresh snapshot',
+                );
+            }
+            const anchored = reconcileHistoryEditorAfterJoin(originalHistory, {
+                socketGeneration: sender.generation,
+                remoteEpoch: epoch,
+                remoteVersion: committedVersion,
+                remoteSnapshot: commitWitness.predictedRemoteSnapshot,
+                documentVersion: live.document.version,
+                editorContent: live.document.getText(),
             });
-        } else {
-            this.editorSaveReceipts.delete(pending.bufferId);
+            if (!anchored.valid || anchored.authority !== 'ready') {
+                return this.retireConfirmedHistoryPending(
+                    pending,
+                    authoritative,
+                    witness,
+                    'the confirmed History OT sender snapshot cannot anchor collaborator replay',
+                );
+            }
+            let transaction: HistoryRemoteEditorTransaction;
+            try {
+                transaction = prepareHistoryRemoteEditorCatchupTransaction(
+                    anchored,
+                    randomUUID(),
+                    version,
+                    composed,
+                    snapshot,
+                );
+            } catch (error) {
+                return this.retireConfirmedHistoryPending(
+                    pending,
+                    authoritative,
+                    witness,
+                    `the confirmed History OT collaborator replay diverged: ${String(error)}`,
+                );
+            }
+            active.historyCausality = anchored;
+            const applied = await this.applyPreparedHistoryRemoteEditorUpdate({
+                bufferId: pending.bufferId,
+                document: live.document,
+                active,
+                transaction,
+                delivery: 'workspace-edit',
+            }, false);
+            history = active.historyCausality;
+            if (!applied
+                || !history?.valid
+                || history.authority !== 'ready'
+                || history.remoteVersion !== version
+                || !historyOtJsonEqual(history.remoteSnapshot.raw, snapshot)
+                || this.pendingDocumentUpdates.get(pending.bufferId) !== pending
+                || this.activeEditorBases.get(pending.bufferId) !== active
+                || !this.bufferMatchesIncarnation(live)
+                || !this.documentMatchesAuthority(
+                    authoritative.doc,
+                    version,
+                    authoritative.content,
+                )) {
+                return this.retireConfirmedHistoryPending(
+                    pending,
+                    authoritative,
+                    witness,
+                    'the confirmed History OT collaborator replay was not applied exactly to the editor',
+                );
+            }
         }
-        return {
-            submissionWitnessStillMatches: this.bufferMatchesWitness(witness),
-            currentMatchesAuthoritative,
-        };
+        active.historyCausality = history;
+
+        const identity = this.documentProvenanceIdentity(pending.docId, live);
+        if (!identity
+            || identity.otType !== 'history-ot'
+            || !pending.identity
+            || !this.sameDocumentProvenanceIdentity(identity, pending.identity)) {
+            return this.retireConfirmedHistoryPending(
+                pending,
+                authoritative,
+                witness,
+                'the History OT sender identity changed before durable reconciliation',
+            );
+        }
+        const submittedMarker = this.pendingWritePayload(pending);
+        const reconcilingMarker = this.pendingWritePayload(
+            pending,
+            'confirmed-reconciling',
+            {historyReconciliationVersion: version},
+        );
+        const reconcilingTransition = (pending.durablePendingWriteTransition ?? Promise.resolve())
+            .then(() => this.provenanceStore.replacePendingWrite(
+                pending.provenanceRecordName,
+                submittedMarker,
+                reconcilingMarker,
+            )).then(() => {
+                pending.durablePendingWrite = reconcilingMarker;
+        });
+        pending.durablePendingWriteTransition = reconcilingTransition;
+        try {
+            await reconcilingTransition;
+            await this.awaitHistoryPendingDurability(pending);
+        } catch (error) {
+            if (this.pendingDocumentUpdates.get(pending.bufferId) === pending) {
+                this.pendingDocumentUpdates.delete(pending.bufferId);
+            }
+            this.invalidateEditorBase(active);
+            this.showDocumentRecovery(
+                live.document.uri,
+                new TextEncoder().encode(live.document.getText()),
+                `the confirmed History outcome remains non-resendable: ${String(error)}`,
+            );
+            throw error;
+        }
+        const handoff = this.enqueueConfirmedHistoryDeferredBatch(pending, version);
+        try {
+            await handoff.beforeBarrier;
+            await this.awaitHistoryPendingDurability(pending);
+            let finalDoc: DocumentEntity | undefined;
+            try {
+                finalDoc = this.currentDocument(pending.docId);
+            } catch {
+                finalDoc = undefined;
+            }
+            const finalVersion = finalDoc?.version;
+            const finalContent = finalDoc?.remoteCache;
+            const finalSnapshot = finalDoc?.historyOtSnapshot;
+            const finalHistory = active.historyCausality;
+            const finalSender = this.currentSenderWitness();
+            const finalIdentity = this.documentProvenanceIdentity(pending.docId, live);
+            const bridgeFailures = finalHistory ? [
+                finalHistory.valid ? undefined : 'invalid',
+                finalHistory.authority === 'ready' ? undefined : 'authority',
+                finalHistory.socketGeneration === finalSender?.generation ? undefined : 'generation',
+                finalHistory.remoteEpoch === finalDoc?.historyOtEpoch ? undefined : 'epoch',
+                finalHistory.remoteVersion === finalVersion ? undefined : 'remote-version',
+                finalSnapshot !== undefined
+                    && historyOtJsonEqual(finalHistory.remoteSnapshot.raw, finalSnapshot)
+                    ? undefined : 'snapshot',
+                finalHistory.documentVersion === live.document.version ? undefined : 'document-version',
+                finalHistory.editorContent === live.document.getText() ? undefined : 'editor-content',
+            ].filter((item): item is string => item !== undefined) : ['missing'];
+            const finalStateFailure = !finalDoc
+                || !isNonnegativeSafeInteger(finalVersion)
+                || finalContent === undefined
+                || finalSnapshot === undefined
+                || finalDoc.otType !== 'history-ot'
+                || finalDoc.historyOtSession !== pending.historySession
+                || !this.documentMatchesAuthority(finalDoc, finalVersion!, finalContent)
+                ? 'the deferred History handoff lost its document authority'
+                : this.activeEditorBases.get(pending.bufferId) !== active
+                    || this.pendingDocumentUpdates.get(pending.bufferId) !== pending
+                    || !this.bufferMatchesIncarnation(live)
+                    || !finalIdentity
+                    || !this.sameDocumentProvenanceIdentity(finalIdentity, identity)
+                    || finalSender?.publicId !== advance.publicId
+                    || finalSender.generation !== advance.socketGeneration
+                    ? 'the deferred History handoff lost its editor incarnation'
+                    : bridgeFailures.length > 0
+                        ? `the deferred History handoff lost its exact editor bridge (${bridgeFailures.join(', ')})`
+                        : undefined;
+            const failureReason = handoff.invalidReason
+                ?? finalStateFailure;
+            if (failureReason || !finalDoc || !isNonnegativeSafeInteger(finalVersion)
+                || finalContent === undefined) {
+                if (finalDoc && isNonnegativeSafeInteger(finalVersion)
+                    && finalContent !== undefined
+                    && finalDoc.historyOtSnapshot !== undefined
+                    && finalDoc.historyOtSession === pending.historySession) {
+                    const retired = await this.finalizeConfirmedHistoryPendingMarker(
+                        pending,
+                        reconcilingMarker,
+                        {
+                            identity,
+                            bufferIncarnationId: pending.bufferId,
+                            baseVersion: finalVersion,
+                            baseText: finalContent,
+                            dirtyText: live.document.getText(),
+                        },
+                    );
+                    await this.awaitHistoryPendingDurability(pending);
+                    active.recordName = retired.recordName;
+                    active.persistence = Promise.resolve(retired);
+                    active.version = finalVersion;
+                    active.content = finalContent;
+                }
+                if (this.pendingDocumentUpdates.get(pending.bufferId) === pending) {
+                    this.pendingDocumentUpdates.delete(pending.bufferId);
+                }
+                this.invalidateEditorBase(active);
+                this.editorSaveReceipts.delete(pending.bufferId);
+                const reason = failureReason
+                    ?? 'the confirmed History OT event handoff lost its authoritative state';
+                this.showDocumentRecovery(
+                    live.document.uri,
+                    new TextEncoder().encode(live.document.getText()),
+                    reason,
+                );
+                throw new Error(reason);
+            }
+
+            const record = await this.finalizeConfirmedHistoryPendingMarker(
+                pending,
+                reconcilingMarker,
+                {
+                    identity,
+                    bufferIncarnationId: pending.bufferId,
+                    baseVersion: finalVersion,
+                    baseText: finalContent,
+                    dirtyText: live.document.getText(),
+                },
+            );
+            await this.awaitHistoryPendingDurability(pending);
+            const latestHistory = active.historyCausality;
+            const latestSender = this.currentSenderWitness();
+            const latestIdentity = this.documentProvenanceIdentity(pending.docId, live);
+            if (this.activeEditorBases.get(pending.bufferId) !== active
+                || this.pendingDocumentUpdates.get(pending.bufferId) !== pending
+                || !this.bufferMatchesIncarnation(live)
+                || !latestIdentity
+                || !this.sameDocumentProvenanceIdentity(latestIdentity, identity)
+                || latestSender?.publicId !== advance.publicId
+                || latestSender.generation !== advance.socketGeneration
+                || !latestHistory?.valid
+                || latestHistory.authority !== 'ready'
+                || latestHistory.remoteVersion !== finalVersion
+                || !historyOtJsonEqual(latestHistory.remoteSnapshot.raw, finalSnapshot!)
+                || latestHistory.documentVersion !== live.document.version
+                || latestHistory.editorContent !== live.document.getText()
+                || !this.documentMatchesAuthority(finalDoc, finalVersion, finalContent)) {
+                this.invalidateEditorBase(active);
+                this.showDocumentRecovery(
+                    live.document.uri,
+                    new TextEncoder().encode(live.document.getText()),
+                    'the History OT editor changed during durable reconciliation',
+                );
+                throw new Error('The History OT editor changed during durable reconciliation');
+            }
+            if (this.pendingDocumentUpdates.get(pending.bufferId) === pending) {
+                this.pendingDocumentUpdates.delete(pending.bufferId);
+            }
+            active.identity = identity;
+            active.version = finalVersion;
+            active.content = finalContent;
+            active.recordName = record.recordName;
+            active.persistence = Promise.resolve(record);
+            active.causality = this.createLocalEditorCausality(
+                live.document,
+                pending.docId,
+                finalVersion,
+                finalContent,
+            );
+            active.historyCausality = latestHistory;
+            this.stageEditorBase(live.document.uri, finalDoc, finalContent);
+            const currentMatchesAuthoritative = live.document.getText() === finalContent
+                && this.documentMatchesAuthority(finalDoc, finalVersion, finalContent);
+            if (currentMatchesAuthoritative) {
+                finalDoc.localCache = finalContent;
+                this.editorSaveReceipts.set(pending.bufferId, {
+                    document: live.document,
+                    identity,
+                    bufferId: pending.bufferId,
+                    version: finalVersion,
+                    content: finalContent,
+                });
+            } else {
+                this.editorSaveReceipts.delete(pending.bufferId);
+            }
+            return {
+                submissionWitnessStillMatches: this.bufferMatchesWitness(witness),
+                currentMatchesAuthoritative,
+            };
+        } catch (error) {
+            if (this.pendingDocumentUpdates.get(pending.bufferId) === pending) {
+                this.pendingDocumentUpdates.delete(pending.bufferId);
+                this.invalidateEditorBase(active);
+                this.showDocumentRecovery(
+                    live.document.uri,
+                    new TextEncoder().encode(live.document.getText()),
+                    `the confirmed History outcome remains non-resendable: ${String(error)}`,
+                );
+            }
+            throw error;
+        } finally {
+            handoff.release();
+        }
     }
 
     private async writeHistoryOtDocument(
@@ -5130,6 +6023,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             socketGeneration: sender.generation,
             submissionToken: staged.submissionToken,
             historyIntent: intent,
+            identity: active.identity,
             historySession,
         };
         let pendingRecord: DocumentProvenanceRecord;
@@ -5195,11 +6089,11 @@ export class VirtualFileSystem extends vscode.Disposable {
         } catch (error) {
             waiter.cancel();
             const sessionAfterFailure = historySession.getState();
-            const outcomeUnknown = sessionAfterFailure.pendingWireAttempted
-                || !(error instanceof SocketRequestError)
-                || error.outcomeUnknown;
+            const outcomeUnknown = error instanceof SocketRequestError
+                ? error.outcomeUnknown
+                : sessionAfterFailure.pendingWireAttempted;
             if (!outcomeUnknown) {
-                historySession.cancelStagedSubmission(sender.generation, staged.submissionToken);
+                historySession.rejectStagedSubmission(sender.generation, staged.submissionToken);
                 const current = this.activeEditorBases.get(witness.bufferId);
                 if (current?.historyCausality) {
                     current.historyCausality = rejectHistorySubmission(
@@ -5367,11 +6261,11 @@ export class VirtualFileSystem extends vscode.Disposable {
             );
         } catch (error) {
             waiter.cancel();
-            const outcomeUnknown = historySession.getState().pendingWireAttempted
-                || !(error instanceof SocketRequestError)
-                || error.outcomeUnknown;
+            const outcomeUnknown = error instanceof SocketRequestError
+                ? error.outcomeUnknown
+                : historySession.getState().pendingWireAttempted;
             if (!outcomeUnknown) {
-                historySession.cancelStagedSubmission(sender.generation, staged.submissionToken);
+                historySession.rejectStagedSubmission(sender.generation, staged.submissionToken);
                 await this.provenanceStore.markPendingWrite(
                     pending.provenanceRecordName,
                     this.pendingWritePayload(pending),
@@ -5456,7 +6350,8 @@ export class VirtualFileSystem extends vscode.Disposable {
                 bufferIncarnationId: witness.bufferId,
                 baseVersion: pending.baseVersion,
                 baseText: pending.baseContent,
-                dirtyText: pending.desiredContent,
+                dirtyText: pending.confirmationVersion === undefined
+                    ? pending.desiredContent : desiredContent,
             },
         );
         if (resolved.kind !== 'valid' || !this.pendingRecordMatches(resolved.record, pending)) {

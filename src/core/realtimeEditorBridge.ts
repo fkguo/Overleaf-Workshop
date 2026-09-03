@@ -427,6 +427,7 @@ export interface HistoryRemoteEditorTransaction {
     readonly socketGeneration: number,
     readonly remoteEpoch: string,
     readonly baseRemoteVersion: number,
+    readonly nextRemoteVersion: number,
     readonly beforeDocumentVersion: number,
     readonly beforeEditorContent: string,
     readonly transformed: HistoryRemoteTransformResult,
@@ -692,6 +693,7 @@ export function prepareHistoryRemoteEditorTransaction(
         socketGeneration: state.socketGeneration,
         remoteEpoch: state.remoteEpoch,
         baseRemoteVersion: state.remoteVersion,
+        nextRemoteVersion: state.remoteVersion + 1,
         beforeDocumentVersion: state.documentVersion,
         beforeEditorContent: state.editorContent,
         transformed,
@@ -715,6 +717,8 @@ export function commitHistoryRemoteEditorTransaction(
         && transaction.socketGeneration === state.socketGeneration
         && transaction.remoteEpoch === state.remoteEpoch
         && transaction.baseRemoteVersion === state.remoteVersion
+        && Number.isSafeInteger(transaction.nextRemoteVersion)
+        && transaction.nextRemoteVersion > state.remoteVersion
         && transaction.beforeDocumentVersion === state.documentVersion
         && transaction.beforeEditorContent === state.editorContent
         && documentVersion === state.documentVersion + (transaction.expectedChange ? 1 : 0)
@@ -730,7 +734,7 @@ export function commitHistoryRemoteEditorTransaction(
     }
     const next: HistoryRealtimeEditorBridgeState = {
         ...state,
-        remoteVersion: state.remoteVersion + 1,
+        remoteVersion: transaction.nextRemoteVersion,
         remoteSnapshot: cloneHistorySnapshot(transaction.transformed.serverSnapshot),
         documentVersion,
         editorContent,
@@ -738,6 +742,89 @@ export function commitHistoryRemoteEditorTransaction(
         pending: cloneHistoryOperations(transaction.transformed.pending),
     };
     return hasExactHistoryState(next) ? next : {...next, valid: false};
+}
+
+/**
+ * Commit a provider-driven refresh for an exact clean History editor. VS Code
+ * and Cursor are free to report the reload as a line replacement, a full
+ * setValue, or no individual changes, and may advance the document version by
+ * more than one. The final buffer and every causal/authority witness must still
+ * match exactly. Dirty WorkspaceEdit feedback continues to use the stricter
+ * commitHistoryRemoteEditorTransaction contract above.
+ */
+export function commitHistoryCleanRemoteEditorTransaction(
+    stateInput: HistoryRealtimeEditorBridgeState,
+    transaction: HistoryRemoteEditorTransaction,
+    documentVersion: number,
+    editorContent: string,
+): HistoryRealtimeEditorBridgeState {
+    const state = cloneHistoryState(stateInput);
+    const nextEditorContent = getVisibleHistoryOtText(transaction.transformed.visibleSnapshot);
+    const matches = state.valid
+        && state.authority === 'ready'
+        && hasExactHistoryState(state)
+        && transaction.token.length > 0
+        && transaction.socketGeneration === state.socketGeneration
+        && transaction.remoteEpoch === state.remoteEpoch
+        && transaction.baseRemoteVersion === state.remoteVersion
+        && Number.isSafeInteger(transaction.nextRemoteVersion)
+        && transaction.nextRemoteVersion > state.remoteVersion
+        && transaction.beforeDocumentVersion === state.documentVersion
+        && transaction.beforeEditorContent === state.editorContent
+        && Number.isSafeInteger(documentVersion)
+        && documentVersion > state.documentVersion
+        && editorContent === nextEditorContent
+        && state.inflightWire === undefined
+        && state.inflightView === undefined
+        && state.inflightToken === undefined
+        && state.inflightBaseVersion === undefined
+        && state.inflightWriteDescriptor === undefined
+        && state.pending === undefined
+        && state.pendingWriteDescriptor === undefined
+        && transaction.transformed.inflightWire === undefined
+        && transaction.transformed.inflightView === undefined
+        && transaction.transformed.pending === undefined;
+    if (!matches) {
+        return {...state, documentVersion, editorContent, valid: false};
+    }
+    const next: HistoryRealtimeEditorBridgeState = {
+        ...state,
+        remoteVersion: transaction.nextRemoteVersion,
+        remoteSnapshot: cloneHistorySnapshot(transaction.transformed.serverSnapshot),
+        documentVersion,
+        editorContent,
+    };
+    return hasExactHistoryState(next) ? next : {...next, valid: false};
+}
+
+/**
+ * Prepare one exact editor transaction for a continuous, already-witnessed
+ * sequence of remote History revisions. The caller proves revision continuity;
+ * this helper proves that their composition reaches the exact fresh-join
+ * snapshot while converging with the local editor projection.
+ */
+export function prepareHistoryRemoteEditorCatchupTransaction(
+    state: HistoryRealtimeEditorBridgeState,
+    token: string,
+    nextRemoteVersion: number,
+    remoteOperations: HistoryOtOperationsInput,
+    nextRemoteSnapshot: HistoryOtSnapshotInput,
+): HistoryRemoteEditorTransaction {
+    if (!Number.isSafeInteger(nextRemoteVersion)
+        || nextRemoteVersion <= state.remoteVersion) {
+        throw new Error('History OT catch-up requires a later exact remote revision');
+    }
+    const transaction = prepareHistoryRemoteEditorTransaction(
+        state,
+        token,
+        state.remoteVersion,
+        remoteOperations,
+    );
+    const expected = cloneHistorySnapshot(nextRemoteSnapshot);
+    if (!historyOtJsonEqual(transaction.transformed.serverSnapshot.raw, expected.raw)) {
+        throw new Error('History OT catch-up does not reach the exact fresh-join snapshot');
+    }
+    return {...transaction, nextRemoteVersion};
 }
 
 export function beginHistorySubmission(
@@ -774,7 +861,7 @@ export function beginHistorySubmission(
     };
 }
 
-/** Restore a definitely-unsent rebased operation ahead of later local input. */
+/** Restore a definitely-unapplied rebased operation ahead of later local input. */
 export function rejectHistorySubmission(
     stateInput: HistoryRealtimeEditorBridgeState,
     submissionToken: string,

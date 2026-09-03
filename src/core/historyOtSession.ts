@@ -404,6 +404,7 @@ export type HistoryOtSessionResultKind =
     | 'wire-attempted'
     | 'queue-accepted'
     | 'staged-cancelled'
+    | 'staged-rejected'
     | 'recovery-staged'
     | 'sender-commit'
     | 'collaborator-applied'
@@ -912,6 +913,36 @@ export class HistoryOtSession {
         return this.result('queue-accepted');
     }
 
+    private rollbackStagedSubmission(kind: 'staged-cancelled' | 'staged-rejected'):
+    HistoryOtSessionResult {
+        if (this.pending === undefined) {
+            throw new HistoryOtSessionError(
+                'STAGED_SUBMISSION_MISMATCH',
+                'No exact staged History OT submission can be rolled back',
+            );
+        }
+        if (this.pending.recoveryAttempt) {
+            this.pending.publicIds.pop();
+            this.pending.authorizedEnvelope = cloneObject(this.pending.originalEnvelope);
+            this.pending.submissionToken = undefined;
+            this.pending.recoveryAttempt = false;
+            this.pending.wireAttempted = false;
+            this.pending.queued = false;
+            if (this.pending.recoveryBlockedReason === undefined
+                && this.phase !== 'rejoin-required') {
+                this.phase = 'recovery-ready';
+                this.rejoinReason = undefined;
+            }
+        } else {
+            this.pending = undefined;
+            if (this.phase !== 'rejoin-required') {
+                this.phase = 'ready';
+                this.rejoinReason = undefined;
+            }
+        }
+        return this.result(kind);
+    }
+
     /**
      * Cancel only the exact staged attempt after a deterministic zero-wire
      * rejection. A recovery retry is peeled off without deleting the durable
@@ -938,25 +969,32 @@ export class HistoryOtSession {
                 'A History OT submission that may have crossed the wire cannot be cancelled deterministically',
             );
         }
-        if (this.pending.recoveryAttempt) {
-            this.pending.publicIds.pop();
-            this.pending.authorizedEnvelope = cloneObject(this.pending.originalEnvelope);
-            this.pending.submissionToken = undefined;
-            this.pending.recoveryAttempt = false;
-            this.pending.wireAttempted = false;
-            if (this.pending.recoveryBlockedReason === undefined
-                && this.phase !== 'rejoin-required') {
-                this.phase = 'recovery-ready';
-                this.rejoinReason = undefined;
-            }
-        } else {
-            this.pending = undefined;
-            if (this.phase !== 'rejoin-required') {
-                this.phase = 'ready';
-                this.rejoinReason = undefined;
-            }
+        return this.rollbackStagedSubmission('staged-cancelled');
+    }
+
+    /**
+     * Retire the exact staged attempt after the transport has proved that the
+     * server rejected it without applying it. Unlike cancellation, this
+     * transition may follow a wire attempt because an explicit error ACK makes
+     * the outcome deterministic. Recovery still restores the original
+     * outcome-unknown operation instead of deleting it.
+     */
+    rejectStagedSubmission(
+        eventGeneration: number,
+        submissionToken: string,
+    ): HistoryOtSessionResult {
+        const generationResult = this.checkGeneration(eventGeneration);
+        if (generationResult !== undefined) {
+            return generationResult;
         }
-        return this.result('staged-cancelled');
+        if (this.pending === undefined
+            || this.pending.submissionToken !== submissionToken) {
+            throw new HistoryOtSessionError(
+                'STAGED_SUBMISSION_MISMATCH',
+                'Rejection token does not match the exact staged History OT submission',
+            );
+        }
+        return this.rollbackStagedSubmission('staged-rejected');
     }
 
     reconnect(nextGeneration: number): HistoryOtSessionResult {

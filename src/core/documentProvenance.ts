@@ -542,6 +542,31 @@ export class DocumentProvenanceStore {
         });
     }
 
+    /** Atomically replace one exact pending marker without changing its recovery bytes. */
+    async replacePendingWrite(
+        recordName: string,
+        expectedPendingWrite: JsonValue,
+        nextPendingWrite: JsonValue,
+    ): Promise<DocumentProvenanceRecord> {
+        if (!isJsonValue(expectedPendingWrite) || !isJsonValue(nextPendingWrite)) {
+            throw new Error('pendingWrite markers must be JSON-compatible');
+        }
+        return this.enqueue(async () => {
+            const current = this.requireValidCurrent(recordName, await this.readRecord(recordName));
+            if (current.pendingWrite === undefined
+                || JSON.stringify(current.pendingWrite) !== JSON.stringify(expectedPendingWrite)) {
+                throw new Error(`Cannot replace provenance record ${recordName}: pending-write mismatch`);
+            }
+            const updated: DocumentProvenanceRecord = {
+                ...current,
+                updatedAt: nextTimestamp(this.now, current.updatedAt),
+                pendingWrite: nextPendingWrite,
+            };
+            await this.writeRecord(updated);
+            return updated;
+        });
+    }
+
     /**
      * Preserve later dirty editor text without changing the immutable pending
      * wire intent. This is recovery data only; it does not manufacture OT

@@ -90,6 +90,8 @@ type ManualSourceSync = PendingSourceSync & {
 };
 
 type CapturedCompileSourceSync = PendingSourceSync & {
+    automaticCompileSource: true,
+    sourceDocument: vscode.TextDocument,
     sourceUri: vscode.Uri,
     sourceDocumentVersion: number,
     selectionLine: number,
@@ -1074,19 +1076,22 @@ export class CompileManager {
     private async captureCompileSourceSync(): Promise<CapturedCompileSourceSync | undefined> {
         const editor = vscode.window.activeTextEditor;
         if (!editor) { return undefined; }
-        const sourceUri = editor.document.uri;
+        const sourceDocument = editor.document;
+        const sourceUri = sourceDocument.uri;
         if (sourceUri.scheme !== ROOT_NAME || !sourceUri.path.toLowerCase().endsWith('.tex')) {
             return undefined;
         }
         const selectionLine = editor.selection.active.line;
         const selectionCharacter = editor.selection.active.character;
-        const sourceDocumentVersion = editor.document.version;
+        const sourceDocumentVersion = sourceDocument.version;
         const source = await this.resolveSourceSync(sourceUri, {
             line: selectionLine,
             character: selectionCharacter,
         });
         return source && {
             ...source,
+            automaticCompileSource: true,
+            sourceDocument,
             sourceUri,
             sourceDocumentVersion,
             selectionLine,
@@ -1098,8 +1103,10 @@ export class CompileManager {
         const editor = vscode.window.activeTextEditor;
         return Boolean(
             editor &&
+            editor.document === source.sourceDocument &&
             editor.document.uri.toString() === source.sourceUri.toString() &&
             editor.document.version === source.sourceDocumentVersion &&
+            vscode.workspace.textDocuments.includes(source.sourceDocument) &&
             editor.selection.active.line === source.selectionLine &&
             editor.selection.active.character === source.selectionCharacter
         );
@@ -1108,6 +1115,7 @@ export class CompileManager {
     private isManualSourceSync(source: PendingSourceSync): source is ManualSourceSync {
         const candidate = source as Partial<ManualSourceSync>;
         return Boolean(
+            (candidate as Partial<CapturedCompileSourceSync>).automaticCompileSource !== true &&
             candidate.sourceDocument &&
             candidate.sourceUri &&
             Number.isSafeInteger(candidate.sourceDocumentVersion)

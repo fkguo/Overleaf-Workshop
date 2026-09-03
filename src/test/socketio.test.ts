@@ -1277,6 +1277,50 @@ describe('SocketIOAPI project protocol', () => {
             'socket ACK only witnesses queue acceptance; the coordinator owns session mutation',
         );
 
+        const errorAckSession = new HistoryOtSession('doc-id', witness.generation, {
+            level: 'review',
+            userId: 'user-a',
+        });
+        errorAckSession.acceptJoin(witness.generation, {
+            snapshot: {content: 'a'},
+            version: 4,
+            operations: [],
+            ranges: {},
+            otType: 'history-ot',
+        });
+        const errorAckStage = errorAckSession.stage(witness.generation, {
+            operation: [{textOperation: [1, {
+                i: 'e',
+                tracking: {
+                    type: 'insert',
+                    userId: 'user-a',
+                    ts: '2026-08-31T00:00:00.000Z',
+                },
+            }]}],
+            meta: {tc: 'error-ack-seed'},
+            intent,
+            publicId: witness.publicId,
+        });
+        const beforeErrorAck = writes().length;
+        const errorAckWrite = socket.applyHistoryOtUpdate(
+            'doc-id',
+            errorAckStage.envelope!,
+            intent,
+            errorAckStage.submissionToken!,
+            errorAckSession,
+            witness,
+        );
+        await waitForEmission(transport, 'applyOtUpdate', beforeErrorAck + 1);
+        assert.equal(errorAckSession.getState().pendingWireAttempted, true);
+        transport.acknowledge('applyOtUpdate', {message: 'permission denied'});
+        await assert.rejects(
+            errorAckWrite,
+            (error: unknown) => error instanceof SocketRequestError
+                && error.code === 'server_error'
+                && error.outcomeUnknown === false,
+        );
+        assert.equal(errorAckSession.getState().pendingWireAttempted, true);
+
         const acceptedWriteCount = writes().length;
         const rejected: Array<Promise<void>> = [
             socket.applyHistoryOtUpdate(

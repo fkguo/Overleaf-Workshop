@@ -204,7 +204,7 @@ class TestTextDocument {
     isClosed = false;
     version = 1;
     saveHandler?: () => Promise<boolean>;
-    private lastChange?: {rangeOffset: number, rangeLength: number, text: string};
+    private lastChanges: Array<{rangeOffset: number, rangeLength: number, text: string}> = [];
 
     constructor(readonly uri: TestUri, private text: string) {}
 
@@ -227,11 +227,11 @@ class TestTextDocument {
                 && before[before.length - suffix - 1] === text[text.length - suffix - 1]) {
                 suffix += 1;
             }
-            this.lastChange = {
+            this.lastChanges = [{
                 rangeOffset: prefix,
                 rangeLength: before.length - prefix - suffix,
                 text: text.slice(prefix, text.length - suffix),
-            };
+            }];
             this.text = text;
             this.version += 1;
         }
@@ -243,15 +243,26 @@ class TestTextDocument {
         this.isDirty = false;
     }
 
+    setProviderTextWithChanges(
+        text: string,
+        changes: Array<{rangeOffset: number, rangeLength: number, text: string}>,
+        versionAdvance = 1,
+    ): void {
+        this.text = text;
+        this.version += versionAdvance;
+        this.lastChanges = changes.map(change => ({...change}));
+        this.isDirty = false;
+    }
+
     markClean(): void {
         this.isDirty = false;
-        this.lastChange = undefined;
+        this.lastChanges = [];
     }
 
     takeContentChanges(): Array<{rangeOffset: number, rangeLength: number, text: string}> {
-        const change = this.lastChange;
-        this.lastChange = undefined;
-        return change ? [change] : [];
+        const changes = this.lastChanges;
+        this.lastChanges = [];
+        return changes;
     }
 
     positionAt(offset: number): number {
@@ -412,6 +423,8 @@ function makeHarness(options: HarnessOptions = {}): Harness {
         unboundEditorIncarnations: new WeakSet(),
         editorSaveReceipts: new Map(),
         recoveryNotifications: new Set(),
+        freshConnectionRequested: false,
+        wasDocumentOpenBeforeProviderRead: () => true,
         provenanceStore: store,
         notify: () => {},
         socket: {
@@ -419,6 +432,7 @@ function makeHarness(options: HarnessOptions = {}): Harness {
             isConnected: true,
             isUsingAlternativeConnectionScheme: false,
             fatalError: undefined,
+            init: () => {},
             projectSession: {
                 publicId: 'public-1',
                 permissionsLevel: 'owner',
@@ -452,6 +466,7 @@ function makeHarness(options: HarnessOptions = {}): Harness {
             return {doc, content: remoteText};
         },
         showDocumentRecovery: () => {},
+        startInitialization: async () => undefined,
     });
     vfs.startRemoteCausality(docId, remoteVersion, remoteText, 1);
     const identity: DocumentProvenanceIdentity = {
@@ -531,8 +546,18 @@ function makeHistoryWriteHarness(
         submissionToken: string,
     }> = [];
     let nextSubmissionMode:
-        'success' | 'deterministic-reject' | 'unknown-unapplied' | 'unknown-applied' = 'success';
+        'success' | 'deterministic-reject' | 'deterministic-wire-reject' | 'permission-downgrade'
+        | 'unknown-unapplied' | 'unknown-applied' = 'success';
     const appliedSources = new Set<string>();
+    let beforeNextAck: (() => Promise<void> | void) | undefined;
+    let afterNextAck: (() => Promise<void> | void) | undefined;
+    let joinCount = 0;
+    const recoveryReasons: string[] = [];
+    harness.vfs.showDocumentRecovery = (
+        _uri: TestUri,
+        _content: Uint8Array,
+        reason: string,
+    ) => { recoveryReasons.push(reason); };
     harness.vfs.socket.applyHistoryOtUpdate = async (
         docId: string,
         envelope: any,
@@ -545,6 +570,15 @@ function makeHistoryWriteHarness(
         assert.strictEqual(submittedSession, session);
         const mode = nextSubmissionMode;
         nextSubmissionMode = 'success';
+        if (mode === 'permission-downgrade') {
+            submittedSession.updatePermission(sender.generation, {
+                level: 'readOnly',
+                userId: 'user-1',
+            });
+            harness.vfs.permissionsLevel = 'readOnly';
+            harness.vfs.socket.projectSession.permissionsLevel = 'readOnly';
+            throw new SocketRequestError('server_error', 'History permission changed', false);
+        }
         if (mode === 'deterministic-reject') {
             throw new SocketRequestError('server_error', 'History write rejected', false);
         }
@@ -560,6 +594,9 @@ function makeHistoryWriteHarness(
             intent: JSON.parse(JSON.stringify(intent)),
             submissionToken,
         });
+        if (mode === 'deterministic-wire-reject') {
+            throw new SocketRequestError('server_error', 'History write rejected by ACK', false);
+        }
         const source = envelope.meta.source as string;
         const duplicate = Array.isArray(envelope.dupIfSource)
             && envelope.dupIfSource.some((item: string) => appliedSources.has(item));
@@ -577,12 +614,19 @@ function makeHistoryWriteHarness(
         if (mode !== 'success') {
             throw new SocketRequestError('timeout', 'History outcome unknown', true);
         }
+        const beforeAck = beforeNextAck;
+        beforeNextAck = undefined;
+        await beforeAck?.();
         await harness.vfs.applyHistoryOtDocumentUpdate(
             {doc: 'doc-1', v: acknowledgedBase},
             sender,
         );
+        const afterAck = afterNextAck;
+        afterNextAck = undefined;
+        await afterAck?.();
     };
     harness.vfs.joinFreshDocumentSession = async () => {
+        joinCount += 1;
         const generation = harness.vfs.socket.generation;
         const joined = session.acceptJoin(generation, {
             snapshot: serializeHistoryOtSnapshot(remoteSnapshot),
@@ -606,8 +650,18 @@ function makeHistoryWriteHarness(
         historySubmissions: submissions,
         getRemoteSnapshot: () => serializeHistoryOtSnapshot(remoteSnapshot),
         setNextSubmissionMode: (
-            mode: 'success' | 'deterministic-reject' | 'unknown-unapplied' | 'unknown-applied',
+            mode: 'success' | 'deterministic-reject' | 'deterministic-wire-reject'
+            | 'permission-downgrade'
+            | 'unknown-unapplied' | 'unknown-applied',
         ) => { nextSubmissionMode = mode; },
+        setBeforeNextAck: (hook: () => Promise<void> | void) => {
+            beforeNextAck = hook;
+        },
+        setAfterNextAck: (hook: () => Promise<void> | void) => {
+            afterNextAck = hook;
+        },
+        getJoinCount: () => joinCount,
+        recoveryReasons,
         reconnectForRecovery: (
             generation = 2,
             publicId = 'public-2',
@@ -651,7 +705,23 @@ function makeHistoryWriteHarness(
                 v: baseVersion,
                 op: operation,
                 meta: {source},
-            }, {publicId: 'public-1', generation: 1});
+            }, {
+                publicId: harness.vfs.socket.projectSession.publicId,
+                generation: harness.vfs.socket.generation,
+            });
+        },
+        advanceRemoteWithoutEvent: (operation: unknown) => {
+            remoteSnapshot = applyHistoryOtOperations(
+                remoteSnapshot,
+                parseHistoryOtOperations(operation),
+            );
+            remoteVersion += 1;
+            harness.setRemoteVersion(remoteVersion);
+            harness.setRemoteText(getVisibleHistoryOtText(remoteSnapshot));
+        },
+        replaceRemoteSnapshotWithoutVersion: (snapshot: unknown) => {
+            remoteSnapshot = parseHistoryOtSnapshot(snapshot);
+            harness.setRemoteText(getVisibleHistoryOtText(remoteSnapshot));
         },
     };
 }
@@ -674,6 +744,25 @@ function observeDirtyChange(harness: Harness): void {
     const contentChanges = harness.document.takeContentChanges();
     assert.equal(contentChanges.length, 1, 'the fixture must expose one actual editor change');
     harness.vfs.observeChangedTextDocument({document: harness.document, contentChanges});
+}
+
+async function applyFirstWorkspaceReplacement(
+    harness: Harness,
+    edit: WorkspaceEditStub,
+): Promise<boolean> {
+    const replacement = edit.replacements[0];
+    assert.ok(replacement);
+    const before = harness.document.getText();
+    harness.document.setDirtyText(
+        before.slice(0, replacement.range.start)
+        + replacement.text
+        + before.slice(replacement.range.end),
+    );
+    harness.vfs.observeChangedTextDocument({
+        document: harness.document,
+        contentChanges: harness.document.takeContentChanges(),
+    });
+    return true;
 }
 
 async function confirmBase(harness: Harness, text: string): Promise<string> {
@@ -1231,6 +1320,12 @@ describe('History OT VFS join gate', () => {
         const bufferId = harness.vfs.editorBufferIds.get(harness.document);
         assert.equal(harness.document.getText(), 'abc');
         assert.equal(harness.vfs.historyCleanEditorRefreshMap().has(bufferId), true);
+        harness.vfs.stageProviderRead(harness.uri, harness.doc, 'aRbc');
+        assert.equal(
+            harness.vfs.pendingReadTickets.get(harness.uri.toString())
+                ?.requiresExplicitConfirmation,
+            false,
+        );
         harness.document.setProviderText('aRbc');
         harness.vfs.observeChangedTextDocument({
             document: harness.document,
@@ -1244,6 +1339,604 @@ describe('History OT VFS join gate', () => {
         assert.equal(harness.document.isDirty, false);
         assert.equal(harness.doc.localCache, 'aRbc');
         assert.equal(harness.vfs.historyCleanEditorRefreshMap().has(bufferId), false);
+
+        harness.document.setDirtyText('aRbcL');
+        observeDirtyChange(harness);
+        harness.vfs.observeWillSaveTextDocument(harness.document);
+        await harness.vfs.writeFileNow(
+            harness.uri,
+            new TextEncoder().encode('aRbcL'),
+            false,
+            true,
+        );
+        assert.equal(harness.getRemoteText(), 'aRbcL');
+    });
+
+    for (const cleanReload of [
+        {
+            label: 'line replacement',
+            changes: [{rangeOffset: 0, rangeLength: 3, text: 'aRbc'}],
+            versionAdvance: 1,
+        },
+        {
+            label: 'full setValue',
+            changes: [{rangeOffset: 0, rangeLength: 7, text: 'aRbc\ndef'}],
+            versionAdvance: 1,
+        },
+        {
+            label: 'empty change list',
+            changes: [],
+            versionAdvance: 1,
+        },
+        {
+            label: 'document version jump',
+            changes: [{rangeOffset: 1, rangeLength: 0, text: 'R'}],
+            versionAdvance: 4,
+        },
+    ]) {
+        it(`accepts a clean History provider reload reported as ${cleanReload.label}`, async () => {
+            const harness = makeHistoryWriteHarness({remoteText: 'abc\ndef'});
+            await confirmBase(harness, 'abc\ndef');
+            await harness.applyCollaborator([{textOperation: [1, 'R', 6]}]);
+            const bufferId = harness.vfs.editorBufferIds.get(harness.document);
+
+            harness.document.setProviderTextWithChanges(
+                'aRbc\ndef',
+                cleanReload.changes,
+                cleanReload.versionAdvance,
+            );
+            harness.vfs.observeChangedTextDocument({
+                document: harness.document,
+                contentChanges: harness.document.takeContentChanges(),
+            });
+
+            const active = harness.vfs.activeEditorBases.get(bufferId);
+            assert.equal(active.historyCausality.valid, true);
+            assert.equal(active.historyCausality.remoteVersion, 6);
+            assert.equal(active.historyCausality.documentVersion, harness.document.version);
+            assert.equal(harness.vfs.historyCleanEditorRefreshMap().has(bufferId), false);
+        });
+    }
+
+    it('rejects a clean History provider callback with the wrong final text', async () => {
+        const harness = makeHistoryWriteHarness();
+        await confirmBase(harness, 'abc');
+        await harness.applyCollaborator([{textOperation: [1, 'R', 2]}]);
+        const bufferId = harness.vfs.editorBufferIds.get(harness.document);
+
+        harness.document.setProviderTextWithChanges(
+            'wrong',
+            [{rangeOffset: 0, rangeLength: 3, text: 'wrong'}],
+        );
+        harness.vfs.observeChangedTextDocument({
+            document: harness.document,
+            contentChanges: harness.document.takeContentChanges(),
+        });
+
+        assert.equal(
+            harness.vfs.activeEditorBases.get(bufferId).historyCausality.valid,
+            false,
+        );
+        assert.equal(harness.vfs.historyCleanEditorRefreshMap().has(bufferId), false);
+    });
+
+    it('rejects a History provider refresh if the editor became dirty', async () => {
+        const harness = makeHistoryWriteHarness();
+        await confirmBase(harness, 'abc');
+        await harness.applyCollaborator([{textOperation: [1, 'R', 2]}]);
+        const bufferId = harness.vfs.editorBufferIds.get(harness.document);
+
+        harness.document.setDirtyText('aRbc');
+        harness.vfs.observeChangedTextDocument({
+            document: harness.document,
+            contentChanges: harness.document.takeContentChanges(),
+        });
+
+        assert.equal(
+            harness.vfs.activeEditorBases.get(bufferId).historyCausality.valid,
+            false,
+        );
+    });
+
+    it('rejects a History clean refresh after active-buffer or sender-generation rebinding', async () => {
+        for (const mutation of ['active', 'generation'] as const) {
+            const harness = makeHistoryWriteHarness();
+            await confirmBase(harness, 'abc');
+            await harness.applyCollaborator([{textOperation: [1, 'R', 2]}]);
+            const bufferId = harness.vfs.editorBufferIds.get(harness.document);
+            if (mutation === 'active') {
+                const active = harness.vfs.activeEditorBases.get(bufferId);
+                harness.vfs.activeEditorBases.set(bufferId, {...active});
+            } else {
+                harness.vfs.socket.generation += 1;
+            }
+            harness.document.setProviderText('aRbc');
+            harness.vfs.observeChangedTextDocument({
+                document: harness.document,
+                contentChanges: harness.document.takeContentChanges(),
+            });
+            assert.equal(
+                harness.vfs.activeEditorBases.get(bufferId).historyCausality.valid,
+                false,
+                mutation,
+            );
+        }
+    });
+
+    it('keeps dirty History WorkspaceEdit feedback shape-strict', async () => {
+        const harness = makeHistoryWriteHarness();
+        await confirmBase(harness, 'abc');
+        harness.document.setDirtyText('abcL');
+        observeDirtyChange(harness);
+        const originalApplyEdit = vscodeStub.workspace.applyEdit;
+        try {
+            vscodeStub.workspace.applyEdit = async (edit: WorkspaceEditStub) => {
+                const replacement = edit.replacements[0];
+                assert.ok(replacement);
+                const before = harness.document.getText();
+                const after = before.slice(0, replacement.range.start)
+                    + replacement.text
+                    + before.slice(replacement.range.end);
+                harness.document.setProviderTextWithChanges(after, [{
+                    rangeOffset: 0,
+                    rangeLength: before.length,
+                    text: after,
+                }]);
+                harness.document.isDirty = true;
+                harness.vfs.observeChangedTextDocument({
+                    document: harness.document,
+                    contentChanges: harness.document.takeContentChanges(),
+                });
+                return true;
+            };
+            await harness.applyCollaborator([{textOperation: [1, 'R', 2]}]);
+        } finally {
+            vscodeStub.workspace.applyEdit = originalApplyEdit;
+        }
+
+        const bufferId = harness.vfs.editorBufferIds.get(harness.document);
+        assert.equal(
+            harness.vfs.activeEditorBases.get(bufferId).historyCausality.valid,
+            false,
+        );
+    });
+
+    it('reconciles a confirmed History write through a contiguous advanced fresh join', async () => {
+        const harness = makeHistoryWriteHarness();
+        const bufferId = await confirmBase(harness, 'abc');
+        harness.document.setDirtyText('abcL');
+        observeDirtyChange(harness);
+        harness.vfs.observeWillSaveTextDocument(harness.document);
+        harness.setAfterNextAck(() => harness.applyCollaborator([
+            {textOperation: ['R', 4]},
+        ]));
+        const originalApplyEdit = vscodeStub.workspace.applyEdit;
+        try {
+            vscodeStub.workspace.applyEdit = async (edit: WorkspaceEditStub) =>
+                applyFirstWorkspaceReplacement(harness, edit);
+            await harness.vfs.writeFileNow(
+                harness.uri,
+                new TextEncoder().encode('abcL'),
+                false,
+                true,
+            );
+        } finally {
+            vscodeStub.workspace.applyEdit = originalApplyEdit;
+        }
+
+        const active = harness.vfs.activeEditorBases.get(bufferId);
+        assert.equal(harness.historySubmissions.length, 1);
+        assert.equal(harness.getJoinCount(), 1);
+        assert.equal(harness.getRemoteText(), 'RabcL');
+        assert.equal(harness.document.getText(), 'RabcL');
+        assert.equal(harness.vfs.pendingDocumentUpdates.has(bufferId), false);
+        assert.equal(active.historyCausality.valid, true);
+        assert.equal(active.historyCausality.authority, 'ready');
+        assert.equal(active.historyCausality.remoteVersion, 7);
+        assert.deepEqual(harness.recoveryReasons, []);
+        const record = await harness.store.resolveCurrentRecord(active.recordName, {
+            identity: active.identity,
+            bufferIncarnationId: bufferId,
+            baseVersion: 7,
+            baseText: 'RabcL',
+            dirtyText: 'RabcL',
+        });
+        assert.equal(record.kind, 'valid');
+        if (record.kind === 'valid') {
+            assert.equal(record.record.pendingWrite, undefined);
+        }
+
+        harness.vfs.observeWillSaveTextDocument(harness.document);
+        await harness.vfs.writeFileNow(
+            harness.uri,
+            new TextEncoder().encode('RabcL'),
+            false,
+            true,
+        );
+        assert.equal(harness.historySubmissions.length, 1);
+    });
+
+    it('hands a post-join History update across the durable reconciliation barrier exactly once', async () => {
+        const harness = makeHistoryWriteHarness();
+        const bufferId = await confirmBase(harness, 'abc');
+        harness.document.setDirtyText('abcL');
+        observeDirtyChange(harness);
+        harness.vfs.observeWillSaveTextDocument(harness.document);
+
+        const store = harness.store as any;
+        const originalReplacePendingWrite = store.replacePendingWrite.bind(store);
+        let releaseMarker!: () => void;
+        let markerEntered!: () => void;
+        const markerGate = new Promise<void>(resolve => { releaseMarker = resolve; });
+        const entered = new Promise<void>(resolve => { markerEntered = resolve; });
+        store.replacePendingWrite = async (...args: any[]) => {
+            const record = await originalReplacePendingWrite(...args);
+            markerEntered();
+            await markerGate;
+            return record;
+        };
+
+        const originalApplyEdit = vscodeStub.workspace.applyEdit;
+        try {
+            vscodeStub.workspace.applyEdit = async (edit: WorkspaceEditStub) =>
+                applyFirstWorkspaceReplacement(harness, edit);
+            const writePromise = harness.vfs.writeFileNow(
+                harness.uri,
+                new TextEncoder().encode('abcL'),
+                false,
+                true,
+            );
+            await entered;
+            const activeAtMarker = harness.vfs.activeEditorBases.get(bufferId);
+            const markerRecord = await harness.store.resolveCurrentRecord(activeAtMarker.recordName, {
+                identity: activeAtMarker.identity,
+                bufferIncarnationId: bufferId,
+                baseVersion: 5,
+                baseText: 'abc',
+                dirtyText: 'abcL',
+            });
+            assert.equal(markerRecord.kind, 'valid');
+            if (markerRecord.kind === 'valid') {
+                assert.equal((markerRecord.record.pendingWrite as any)?.state, 'confirmed-reconciling');
+                assert.equal(
+                    (markerRecord.record.pendingWrite as any)?.historyConfirmationVersion,
+                    5,
+                );
+            }
+
+            await harness.applyCollaborator([{textOperation: ['R', 4]}]);
+            releaseMarker();
+            await writePromise;
+        } finally {
+            releaseMarker();
+            vscodeStub.workspace.applyEdit = originalApplyEdit;
+            store.replacePendingWrite = originalReplacePendingWrite;
+        }
+
+        const active = harness.vfs.activeEditorBases.get(bufferId);
+        assert.equal(harness.historySubmissions.length, 1);
+        assert.equal(harness.getJoinCount(), 1);
+        assert.equal(harness.getRemoteText(), 'RabcL');
+        assert.equal(harness.document.getText(), 'RabcL');
+        assert.equal(harness.doc.version, 7);
+        assert.equal(active.historyCausality.remoteVersion, 7);
+        assert.equal(active.historyCausality.authority, 'ready');
+        assert.equal(harness.vfs.pendingDocumentUpdates.has(bufferId), false);
+        const record = await harness.store.resolveCurrentRecord(active.recordName, {
+            identity: active.identity,
+            bufferIncarnationId: bufferId,
+            baseVersion: 7,
+            baseText: 'RabcL',
+            dirtyText: 'RabcL',
+        });
+        assert.equal(record.kind, 'valid');
+        if (record.kind === 'valid') {
+            assert.equal(record.record.pendingWrite, undefined);
+        }
+    });
+
+    it('persists local dirty text against the new marker when marker replacement is in flight', async () => {
+        const harness = makeHistoryWriteHarness();
+        const bufferId = await confirmBase(harness, 'abc');
+        harness.document.setDirtyText('abcL');
+        observeDirtyChange(harness);
+        harness.vfs.observeWillSaveTextDocument(harness.document);
+
+        const store = harness.store as any;
+        const originalReplacePendingWrite = store.replacePendingWrite.bind(store);
+        const originalReconcilePendingWrite = store.reconcilePendingWrite.bind(store);
+        let releaseReplace!: () => void;
+        let replaceEntered!: () => void;
+        let releaseReconcile!: () => void;
+        let reconcileEntered!: () => void;
+        const replaceGate = new Promise<void>(resolve => { releaseReplace = resolve; });
+        const replaceStarted = new Promise<void>(resolve => { replaceEntered = resolve; });
+        const reconcileGate = new Promise<void>(resolve => { releaseReconcile = resolve; });
+        const reconcileStarted = new Promise<void>(resolve => { reconcileEntered = resolve; });
+        store.replacePendingWrite = async (...args: any[]) => {
+            replaceEntered();
+            await replaceGate;
+            return originalReplacePendingWrite(...args);
+        };
+        store.reconcilePendingWrite = async (...args: any[]) => {
+            reconcileEntered();
+            await reconcileGate;
+            return originalReconcilePendingWrite(...args);
+        };
+
+        let writePromise!: Promise<void>;
+        try {
+            writePromise = harness.vfs.writeFileNow(
+                harness.uri,
+                new TextEncoder().encode('abcL'),
+                false,
+                true,
+            );
+            void writePromise.catch(() => {});
+            await replaceStarted;
+            harness.document.setDirtyText('abcL!');
+            observeDirtyChange(harness);
+            releaseReplace();
+            await reconcileStarted;
+
+            const activeAtMarker = harness.vfs.activeEditorBases.get(bufferId);
+            const markerRecord = await harness.store.resolveCurrentRecord(activeAtMarker.recordName, {
+                identity: activeAtMarker.identity,
+                bufferIncarnationId: bufferId,
+                baseVersion: 5,
+                baseText: 'abc',
+                dirtyText: 'abcL!',
+            });
+            assert.equal(markerRecord.kind, 'valid');
+            if (markerRecord.kind === 'valid') {
+                assert.equal((markerRecord.record.pendingWrite as any)?.state, 'confirmed-reconciling');
+                assert.equal(
+                    (markerRecord.record.pendingWrite as any)?.historyConfirmationVersion,
+                    5,
+                );
+            }
+            harness.document.setDirtyText('abcL!?');
+            observeDirtyChange(harness);
+            releaseReconcile();
+            await writePromise;
+        } finally {
+            releaseReplace();
+            releaseReconcile();
+            store.replacePendingWrite = originalReplacePendingWrite;
+            store.reconcilePendingWrite = originalReconcilePendingWrite;
+        }
+
+        const active = harness.vfs.activeEditorBases.get(bufferId);
+        assert.equal(harness.historySubmissions.length, 1);
+        assert.equal(harness.getJoinCount(), 1);
+        assert.equal(harness.getRemoteText(), 'abcL');
+        assert.equal(harness.document.getText(), 'abcL!?');
+        assert.equal(active.historyCausality.remoteVersion, 6);
+        assert.ok(active.historyCausality.pending);
+        assert.equal(harness.vfs.pendingDocumentUpdates.has(bufferId), false);
+        const record = await harness.store.resolveCurrentRecord(active.recordName, {
+            identity: active.identity,
+            bufferIncarnationId: bufferId,
+            baseVersion: 6,
+            baseText: 'abcL',
+            dirtyText: 'abcL!?',
+        });
+        assert.equal(record.kind, 'valid');
+        if (record.kind === 'valid') {
+            assert.equal(record.record.pendingWrite, undefined);
+        }
+    });
+
+    for (const gapCase of ['missing-first', 'missing-middle'] as const) {
+        it(`retires a confirmed History write with ${gapCase} collaborator ancestry`, async () => {
+            const harness = makeHistoryWriteHarness();
+            const bufferId = await confirmBase(harness, 'abc');
+            harness.document.setDirtyText('abcL');
+            observeDirtyChange(harness);
+            harness.vfs.observeWillSaveTextDocument(harness.document);
+            if (gapCase === 'missing-first') {
+                harness.setAfterNextAck(() => {
+                    harness.advanceRemoteWithoutEvent([{textOperation: [4, 'X']}]);
+                });
+            } else {
+                harness.setAfterNextAck(async () => {
+                    await harness.applyCollaborator([{textOperation: [4, 'X']}], 'remote-one');
+                    harness.advanceRemoteWithoutEvent([{textOperation: [5, 'Y']}]);
+                    await harness.applyCollaborator([{textOperation: [6, 'Z']}], 'remote-two');
+                });
+            }
+
+            await assert.rejects(
+                harness.vfs.writeFileNow(
+                    harness.uri,
+                    new TextEncoder().encode('abcL'),
+                    false,
+                    true,
+                ),
+                /missing revision|incomplete collaborator ancestry/,
+            );
+
+            const active = harness.vfs.activeEditorBases.get(bufferId);
+            const joinedVersion = harness.doc.version as number;
+            const joinedText = harness.getRemoteText();
+            assert.equal(harness.historySubmissions.length, 1);
+            assert.equal(harness.getJoinCount(), 1);
+            assert.equal(harness.document.getText(), 'abcL');
+            assert.equal(harness.vfs.pendingDocumentUpdates.has(bufferId), false);
+            assert.equal(active.historyCausality.valid, false);
+            assert.equal(harness.recoveryReasons.length, 1);
+            const record = await harness.store.resolveCurrentRecord(active.recordName, {
+                identity: active.identity,
+                bufferIncarnationId: bufferId,
+                baseVersion: joinedVersion,
+                baseText: joinedText,
+                dirtyText: 'abcL',
+            });
+            assert.equal(record.kind, 'valid');
+            if (record.kind === 'valid') {
+                assert.equal(record.record.pendingWrite, undefined);
+            }
+
+            harness.vfs.observeWillSaveTextDocument(harness.document);
+            await assert.rejects(harness.vfs.writeFileNow(
+                harness.uri,
+                new TextEncoder().encode('abcL'),
+                false,
+                true,
+            ));
+            assert.equal(harness.historySubmissions.length, 1);
+            assert.equal(harness.getJoinCount(), 1);
+        });
+    }
+
+    it('retires a confirmed History write when replayed ancestry mismatches the fresh snapshot', async () => {
+        const harness = makeHistoryWriteHarness();
+        const bufferId = await confirmBase(harness, 'abc');
+        harness.document.setDirtyText('abcL');
+        observeDirtyChange(harness);
+        harness.vfs.observeWillSaveTextDocument(harness.document);
+        harness.setAfterNextAck(async () => {
+            await harness.applyCollaborator([{textOperation: [4, 'X']}]);
+            harness.replaceRemoteSnapshotWithoutVersion({content: 'different'});
+        });
+
+        await assert.rejects(
+            harness.vfs.writeFileNow(
+                harness.uri,
+                new TextEncoder().encode('abcL'),
+                false,
+                true,
+            ),
+            /does not match the fresh snapshot/,
+        );
+
+        const active = harness.vfs.activeEditorBases.get(bufferId);
+        assert.equal(harness.historySubmissions.length, 1);
+        assert.equal(harness.getJoinCount(), 1);
+        assert.equal(harness.vfs.pendingDocumentUpdates.has(bufferId), false);
+        assert.equal(active.historyCausality.valid, false);
+        assert.equal(harness.recoveryReasons.length, 1);
+        const record = await harness.store.resolveCurrentRecord(active.recordName, {
+            identity: active.identity,
+            bufferIncarnationId: bufferId,
+            baseVersion: 7,
+            baseText: 'different',
+            dirtyText: 'abcL',
+        });
+        assert.equal(record.kind, 'valid');
+        if (record.kind === 'valid') {
+            assert.equal(record.record.pendingWrite, undefined);
+        }
+    });
+
+    it('retires confirmed History recovery without grafting it onto a reopened editor', async () => {
+        const harness = makeHistoryWriteHarness();
+        const oldBufferId = await confirmBase(harness, 'abc');
+        harness.document.setDirtyText('abcL');
+        observeDirtyChange(harness);
+        harness.vfs.observeWillSaveTextDocument(harness.document);
+        const oldActive = harness.vfs.activeEditorBases.get(oldBufferId);
+        await harness.store.flush();
+        let replacement: TestTextDocument | undefined;
+        harness.setAfterNextAck(async () => {
+            await harness.applyCollaborator([{textOperation: ['R', 4]}]);
+            closeHarnessDocument(harness);
+            replacement = new TestTextDocument(harness.uri, 'replacement sentinel');
+            openTextDocuments.push(replacement);
+            harness.vfs.observeOpenedTextDocument(replacement);
+        });
+
+        await assert.rejects(
+            harness.vfs.writeFileNow(
+                harness.uri,
+                new TextEncoder().encode('abcL'),
+                false,
+                true,
+            ),
+            /lost its original editor incarnation/,
+        );
+
+        assert.ok(replacement);
+        const newBufferId = harness.vfs.editorBufferIds.get(replacement);
+        assert.notEqual(newBufferId, oldBufferId);
+        assert.equal(replacement.getText(), 'replacement sentinel');
+        assert.equal(replacement.isDirty, false);
+        assert.equal(harness.vfs.activeEditorBases.has(newBufferId), false);
+        assert.equal(harness.vfs.pendingDocumentUpdates.has(oldBufferId), false);
+        assert.equal(harness.historySubmissions.length, 1);
+        assert.equal(harness.recoveryReasons.length, 1);
+        const retired = await harness.store.resolveCurrentRecord(oldActive.recordName, {
+            identity: oldActive.identity,
+            bufferIncarnationId: oldBufferId,
+            baseVersion: 7,
+            baseText: 'RabcL',
+            dirtyText: 'abcL',
+        });
+        assert.equal(retired.kind, 'valid');
+        if (retired.kind === 'valid') {
+            assert.equal(retired.record.pendingWrite, undefined);
+        }
+    });
+
+    it('rebases a post-submit History edit through the advanced join and sends only the remainder', async () => {
+        const harness = makeHistoryWriteHarness();
+        const bufferId = await confirmBase(harness, 'abc');
+        harness.document.setDirtyText('abcL');
+        observeDirtyChange(harness);
+        harness.vfs.observeWillSaveTextDocument(harness.document);
+        harness.setBeforeNextAck(() => {
+            harness.document.setDirtyText('abcL!');
+            observeDirtyChange(harness);
+        });
+        harness.setAfterNextAck(() => harness.applyCollaborator([
+            {textOperation: ['R', 4]},
+        ]));
+        const originalApplyEdit = vscodeStub.workspace.applyEdit;
+        try {
+            vscodeStub.workspace.applyEdit = async (edit: WorkspaceEditStub) =>
+                applyFirstWorkspaceReplacement(harness, edit);
+            await harness.vfs.writeFileNow(
+                harness.uri,
+                new TextEncoder().encode('abcL'),
+                false,
+                true,
+            );
+        } finally {
+            vscodeStub.workspace.applyEdit = originalApplyEdit;
+        }
+
+        let active = harness.vfs.activeEditorBases.get(bufferId);
+        assert.equal(harness.historySubmissions.length, 1);
+        assert.equal(harness.getRemoteText(), 'RabcL');
+        assert.equal(harness.document.getText(), 'RabcL!');
+        assert.equal(active.historyCausality.valid, true);
+        assert.equal(active.historyCausality.remoteVersion, 7);
+        assert.ok(active.historyCausality.pending);
+        let record = await harness.store.resolveCurrentRecord(active.recordName, {
+            identity: active.identity,
+            bufferIncarnationId: bufferId,
+            baseVersion: 7,
+            baseText: 'RabcL',
+            dirtyText: 'RabcL!',
+        });
+        assert.equal(record.kind, 'valid');
+        if (record.kind === 'valid') {
+            assert.equal(record.record.pendingWrite, undefined);
+        }
+
+        harness.vfs.observeWillSaveTextDocument(harness.document);
+        await harness.vfs.writeFileNow(
+            harness.uri,
+            new TextEncoder().encode('RabcL!'),
+            false,
+            true,
+        );
+        active = harness.vfs.activeEditorBases.get(bufferId);
+        assert.equal(harness.historySubmissions.length, 2);
+        assert.equal(harness.historySubmissions[1].envelope.v, 7);
+        assert.equal(harness.getRemoteText(), 'RabcL!');
+        assert.equal(active.historyCausality.remoteVersion, 8);
+        assert.equal(active.historyCausality.pending, undefined);
     });
 
     for (const firstOutcome of ['unknown-unapplied', 'unknown-applied'] as const) {
@@ -1319,6 +2012,146 @@ describe('History OT VFS join gate', () => {
         assert.equal(active.historyCausality.inflightWire, undefined);
         assert.ok(active.historyCausality.pending);
         assert.equal(harness.document.getText(), 'abcL');
+        assert.equal(harness.getRemoteText(), 'abc');
+    });
+
+    it('clears an unsent History intent without resurrecting downgraded permission', async () => {
+        const harness = makeHistoryWriteHarness();
+        const bufferId = await confirmBase(harness, 'abc');
+        harness.document.setDirtyText('abcL');
+        observeDirtyChange(harness);
+        harness.vfs.observeWillSaveTextDocument(harness.document);
+        harness.setNextSubmissionMode('permission-downgrade');
+
+        await assert.rejects(
+            harness.vfs.writeFileNow(
+                harness.uri,
+                new TextEncoder().encode('abcL'),
+                false,
+                true,
+            ),
+            (error: unknown) => error instanceof SocketRequestError && !error.outcomeUnknown,
+        );
+
+        const active = harness.vfs.activeEditorBases.get(bufferId);
+        const sessionState = harness.historySession.getState();
+        assert.equal(harness.historySubmissions.length, 0);
+        assert.equal(sessionState.hasPendingOperation, false);
+        assert.equal(sessionState.phase, 'rejoin-required');
+        assert.equal(sessionState.permission, 'readOnly');
+        assert.equal(harness.vfs.pendingDocumentUpdates.has(bufferId), false);
+        assert.equal(active.historyCausality.valid, true);
+        const record = await harness.store.resolveCurrentRecord(active.recordName, {
+            identity: active.identity,
+            bufferIncarnationId: bufferId,
+            baseVersion: 5,
+            baseText: 'abc',
+            dirtyText: 'abcL',
+        });
+        assert.equal(record.kind, 'valid');
+        if (record.kind === 'valid') {
+            assert.equal(record.record.pendingWrite, undefined);
+        }
+        assert.equal(harness.getRemoteText(), 'abc');
+    });
+
+    it('rolls back an exact History error ACK after the wire attempt', async () => {
+        const harness = makeHistoryWriteHarness();
+        const bufferId = await confirmBase(harness, 'abc');
+        harness.document.setDirtyText('abcL');
+        observeDirtyChange(harness);
+        harness.vfs.observeWillSaveTextDocument(harness.document);
+        harness.setNextSubmissionMode('deterministic-wire-reject');
+
+        await assert.rejects(
+            harness.vfs.writeFileNow(
+                harness.uri,
+                new TextEncoder().encode('abcL'),
+                false,
+                true,
+            ),
+            (error: unknown) => error instanceof SocketRequestError && !error.outcomeUnknown,
+        );
+
+        const active = harness.vfs.activeEditorBases.get(bufferId);
+        assert.equal(harness.historySubmissions.length, 1);
+        assert.equal(harness.vfs.pendingDocumentUpdates.has(bufferId), false);
+        assert.equal(harness.historySession.getState().hasPendingOperation, false);
+        assert.equal(active.historyCausality.valid, true);
+        assert.equal(active.historyCausality.inflightWire, undefined);
+        assert.ok(active.historyCausality.pending);
+        const record = await harness.store.resolveCurrentRecord(active.recordName, {
+            identity: active.identity,
+            bufferIncarnationId: bufferId,
+            baseVersion: 5,
+            baseText: 'abc',
+            dirtyText: 'abcL',
+        });
+        assert.equal(record.kind, 'valid');
+        if (record.kind === 'valid') {
+            assert.equal(record.record.pendingWrite, undefined);
+        }
+        assert.equal(harness.getRemoteText(), 'abc');
+    });
+
+    it('restores the original History pending intent after a rejected recovery error ACK', async () => {
+        const harness = makeHistoryWriteHarness();
+        const bufferId = await confirmBase(harness, 'abc');
+        harness.document.setDirtyText('abcL');
+        observeDirtyChange(harness);
+        harness.vfs.observeWillSaveTextDocument(harness.document);
+        harness.setNextSubmissionMode('unknown-unapplied');
+        await assert.rejects(
+            harness.vfs.writeFileNow(
+                harness.uri,
+                new TextEncoder().encode('abcL'),
+                false,
+                true,
+            ),
+            (error: unknown) => error instanceof SocketRequestError && error.outcomeUnknown,
+        );
+        const originalPending = harness.vfs.pendingDocumentUpdates.get(bufferId);
+        assert.ok(originalPending);
+        const active = harness.vfs.activeEditorBases.get(bufferId);
+        const originalRecord = await harness.store.resolveCurrentRecord(active.recordName, {
+            identity: active.identity,
+            bufferIncarnationId: bufferId,
+            baseVersion: 5,
+            baseText: 'abc',
+            dirtyText: 'abcL',
+        });
+        assert.equal(originalRecord.kind, 'valid');
+        assert.ok(originalRecord.kind === 'valid');
+        const originalPayload = originalRecord.record.pendingWrite;
+
+        harness.reconnectForRecovery();
+        harness.vfs.observeWillSaveTextDocument(harness.document);
+        harness.setNextSubmissionMode('deterministic-wire-reject');
+        await assert.rejects(
+            harness.vfs.writeFileNow(
+                harness.uri,
+                new TextEncoder().encode('abcL'),
+                false,
+                true,
+            ),
+            (error: unknown) => error instanceof SocketRequestError && !error.outcomeUnknown,
+        );
+
+        assert.equal(harness.historySubmissions.length, 2);
+        assert.deepEqual(harness.historySubmissions[1].envelope.dupIfSource, ['public-1']);
+        const restoredPending = harness.vfs.pendingDocumentUpdates.get(bufferId);
+        assert.deepEqual(restoredPending.submittedPublicIds, ['public-1']);
+        assert.deepEqual(restoredPending.update, originalPending.update);
+        const restoredRecord = await harness.store.resolveCurrentRecord(active.recordName, {
+            identity: active.identity,
+            bufferIncarnationId: bufferId,
+            baseVersion: 5,
+            baseText: 'abc',
+            dirtyText: 'abcL',
+        });
+        assert.equal(restoredRecord.kind, 'valid');
+        assert.ok(restoredRecord.kind === 'valid');
+        assert.deepEqual(restoredRecord.record.pendingWrite, originalPayload);
         assert.equal(harness.getRemoteText(), 'abc');
     });
 });
@@ -1944,6 +2777,11 @@ describe('remote document exact-base write gate', () => {
             advanced = true;
             harness.document.setDirtyText('hello world + next local edit');
             observeDirtyChange(harness);
+            assert.equal(
+                harness.vfs.pendingDocumentUpdates.get(bufferId)?.durablePendingWriteTransition,
+                undefined,
+                'ShareJS cleanup must not inherit the History durability barrier',
+            );
         };
 
         await harness.vfs.writeFileNow(

@@ -5,6 +5,7 @@ import {
     applyUtf16TextOperations,
     beginHistorySubmission,
     beginLocalEditorSubmission,
+    commitHistoryCleanRemoteEditorTransaction,
     commitHistoryRemoteEditorTransaction,
     commitRemoteEditorTransaction,
     confirmLocalEditorSubmission,
@@ -846,6 +847,36 @@ describe('realtime editor bridge', () => {
         );
         assert.equal(emptyCommitted.valid, true);
         assert.equal(emptyCommitted.remoteVersion, 14);
+    });
+
+    it('commits an exact clean History reload independently of provider callback shape', () => {
+        const base = createHistoryRealtimeEditorBridgeState({
+            socketGeneration: 4,
+            remoteEpoch: 'history-epoch',
+            remoteVersion: 12,
+            remoteSnapshot: {content: 'abc'},
+            documentVersion: 7,
+            editorContent: 'abc',
+        });
+        const transaction = prepareHistoryRemoteEditorTransaction(
+            base,
+            'clean-provider-reload',
+            12,
+            [{textOperation: [1, 'R', 2]}],
+        );
+        const committed = commitHistoryCleanRemoteEditorTransaction(
+            base,
+            transaction,
+            11,
+            'aRbc',
+        );
+        assert.equal(committed.valid, true);
+        assert.equal(committed.remoteVersion, 13);
+        assert.equal(committed.documentVersion, 11);
+        assert.equal(
+            commitHistoryCleanRemoteEditorTransaction(base, transaction, 11, 'wrong').valid,
+            false,
+        );
     });
 
     it('rejects History local and remote operations that split a surrogate pair', () => {

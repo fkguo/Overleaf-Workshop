@@ -642,6 +642,57 @@ describe('HistoryOtSession ordering and recovery', () => {
         assert.notEqual(nextRetry.submissionToken, cancelledRetry.submissionToken);
     });
 
+    it('retires an exact wire-attempted submission after a proven server rejection', () => {
+        const session = readySession();
+        const staged = session.stage(1, {
+            operation: [{textOperation: [1, 'X', 2]}],
+            intent: {kind: 'plain-write'},
+            publicId: 'source-one',
+        });
+        assert.ok(staged.submissionToken);
+        session.markWireAttempted(1, staged.submissionToken);
+        session.updatePermission(1, {level: 'future-permission'});
+
+        assert.throws(
+            () => session.rejectStagedSubmission(1, `${staged.submissionToken}-other`),
+            (error: unknown) => error instanceof HistoryOtSessionError
+                && error.code === 'STAGED_SUBMISSION_MISMATCH',
+        );
+        const rejected = session.rejectStagedSubmission(1, staged.submissionToken);
+        assert.equal(rejected.kind, 'staged-rejected');
+        assert.equal(rejected.state.hasPendingOperation, false);
+        assert.equal(rejected.state.phase, 'rejoin-required');
+        assert.equal(rejected.state.permission, undefined);
+    });
+
+    it('restores the original outcome-unknown intent after a rejected recovery wire attempt', () => {
+        const session = readySession();
+        const originalStage = session.stage(1, {
+            operation: [{textOperation: [1, 'X', 2]}],
+            intent: {kind: 'plain-write'},
+            publicId: 'source-old',
+        });
+        assert.ok(originalStage.submissionToken);
+        session.markWireAttempted(1, originalStage.submissionToken);
+        session.markQueueAccepted(1, originalStage.submissionToken);
+        session.reconnect(2);
+        session.acceptJoin(2, join({content: 'abc'}, 5));
+
+        const rejectedRetry = session.prepareRecovery(2, 'source-rejected');
+        assert.ok(rejectedRetry.submissionToken);
+        session.markWireAttempted(2, rejectedRetry.submissionToken);
+        const rejected = session.rejectStagedSubmission(2, rejectedRetry.submissionToken);
+        assert.equal(rejected.kind, 'staged-rejected');
+        assert.equal(rejected.state.phase, 'recovery-ready');
+        assert.equal(rejected.state.hasPendingOperation, true);
+        assert.equal(rejected.state.pendingWireAttempted, false);
+
+        const nextRetry = session.prepareRecovery(2, 'source-new');
+        assert.deepEqual((nextRetry.envelope as any).dupIfSource, ['source-old']);
+        assert.equal((nextRetry.envelope as any).meta.source, 'source-new');
+        assert.notEqual(nextRetry.submissionToken, rejectedRetry.submissionToken);
+    });
+
     it('applies two concurrent collaborator updates only once and in version order', () => {
         const session = readySession();
         const first = session.receiveApplied(1, fullUpdate(5, [

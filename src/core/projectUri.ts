@@ -53,7 +53,11 @@ export function parseProjectUri(
 
     const pathParts = path.split('/');
     const projectName = decodeURIComponent(pathParts[1] ?? '');
-    const identifier = `${userId}/${projectId}/${projectName}`;
+    // This value is used only as an opaque in-process project key. Include the
+    // authority and preserve component boundaries so two authenticated
+    // projects on different Overleaf hosts cannot share compile/PDF or
+    // completion-provider state.
+    const identifier = JSON.stringify([authority, userId, projectId, projectName]);
     return {
         userId,
         projectId,
