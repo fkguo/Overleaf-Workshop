@@ -9,6 +9,9 @@ on:
 
 jobs:
   publish:
+    # Fork releases must not implicitly publish to shared extension registries.
+    # Fork owners can still opt in through an explicit manual workflow run.
+    if: github.repository == 'overleaf-workshop/Overleaf-Workshop' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
 
     steps:
