@@ -1,5 +1,7 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import { strict as assert } from 'assert';
+import { readFileSync } from 'fs';
+import * as path from 'path';
 import type {
     ProjectHistoryResponseSchema,
     ProjectUpdateMeta,
@@ -100,6 +102,24 @@ function update(
 }
 
 describe('history view model', () => {
+    it('keeps the history view and its navigation commands available in historical diffs', () => {
+        const manifest = JSON.parse(readFileSync(path.join(__dirname, '../../package.json'), 'utf8'));
+        const views = manifest.contributes.views.explorer as {id: string, when: string}[];
+        const commands = manifest.contributes.commands as {command: string, enablement?: string}[];
+        const historyView = views.find(view => view.id === 'overleaf-workshop.projectHistory');
+        const allowedSchemes = ['overleaf-workshop', 'overleaf-workshop-diff'];
+        const expectedCondition = allowedSchemes.map(scheme => `resourceScheme == ${scheme}`).join(' || ');
+
+        assert.equal(historyView?.when, expectedCondition,
+            'Opening a read-only history diff must not hide the version list');
+        for (const command of ['refresh', 'revealHistoryView']) {
+            const contribution = commands.find(item =>
+                item.command === `overleaf-workshop.projectHistory.${command}`);
+            assert.equal(contribution?.enablement, expectedCondition,
+                `${command} must remain enabled while browsing historical versions`);
+        }
+    });
+
     it('accepts empty update pages without inventing a current version', () => {
         const record = historyRecord();
         historyModule.mergeHistoryPage(record, {updates: [], nextBeforeTimestamp: 0});

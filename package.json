@@ -276,7 +276,7 @@
         "command": "overleaf-workshop.projectHistory.refresh",
         "title": "%commands.projectHistory.refresh.title%",
         "icon": "$(refresh)",
-        "enablement": "resourceScheme == overleaf-workshop",
+        "enablement": "resourceScheme == overleaf-workshop || resourceScheme == overleaf-workshop-diff",
         "category": "%extension.displayName%"
       },
       {
@@ -328,7 +328,7 @@
       {
         "command": "overleaf-workshop.projectHistory.revealHistoryView",
         "title": "%commands.projectHistory.revealHistoryView.title%",
-        "enablement": "resourceScheme == overleaf-workshop",
+        "enablement": "resourceScheme == overleaf-workshop || resourceScheme == overleaf-workshop-diff",
         "category": "%extension.displayName%"
       },
       {
@@ -564,7 +564,7 @@
           "icon": "$(history)",
           "name": "%views.explorer.overleaf-workshop.projectHistory%",
           "contextualTitle": "%views.explorer.overleaf-workshop.contextualTitle%",
-          "when": "resourceScheme == overleaf-workshop"
+          "when": "resourceScheme == overleaf-workshop || resourceScheme == overleaf-workshop-diff"
         },
         {
           "type": "webview",
