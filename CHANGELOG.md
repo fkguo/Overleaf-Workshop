@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Include required runtime dependencies and PDF.js assets in the installable extension.
 
 ### Compatibility
+- Accepting or rejecting tracked changes from the extension is not yet enabled; use the Overleaf web editor for those review actions.
 - Text updates containing NUL or non-BMP characters are rejected locally because the supported Overleaf text protocol cannot store them; the editor text is retained for recovery.
 - Ambiguous or unconfirmed saves remain blocked rather than overwriting remote content.
 
