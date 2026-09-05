@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] - 2026-09-05
+### Added
+- Synchronize editor text while typing, without requiring an explicit save for every collaboration update.
+- Support History OT document editing and Track Changes data when the server exposes the supported protocol.
+- Preserve local recovery copies and pending-write records when a save cannot be safely confirmed.
+
+### Fixed
+- Apply collaborator changes to open editors while preserving causally recorded local edits.
+- Handle rapid typing, deletion, acknowledgements, and reconnects without replaying an uncertain write as a new edit.
+- Receive Chinese and other Unicode deletion operations without corrupting their text through an extra decoding step.
+- Keep collaborator cursor positions aligned during backspace operations.
+- Accept safe, witnessed bibliography updates from other extensions without requiring an extension-specific dependency.
+- Protect local replicas from overwriting existing local files or sending changes without a proven synchronization base.
+- Preserve explicit recompile requests and navigate PDF previews using the source position associated with the completed build.
+- Reuse available output during project startup without occupying the server compile slot; missing diagnostic logs no longer invalidate an otherwise successful PDF.
+- Include required runtime dependencies and PDF.js assets in the installable extension.
+
+### Compatibility
+- Text updates containing NUL or non-BMP characters are rejected locally because the supported Overleaf text protocol cannot store them; the editor text is retained for recovery.
+- Ambiguous or unconfirmed saves remain blocked rather than overwriting remote content.
+
 ## [0.15.14] - 2026-09-01
 ### Fixed
 - Bind document saves to the exact editor buffer and acknowledged Overleaf revision that produced them.

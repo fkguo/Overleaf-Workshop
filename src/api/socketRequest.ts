@@ -171,7 +171,10 @@ export function requestWithAck<T extends any[]>(
             fail(new SocketRequestError(
                 'server_error',
                 `Failed to send ${event}: ${errorMessage(error)}`,
-                false,
+                // The transport may throw after it has accepted or partially
+                // queued the packet. Without an acknowledgement there is no
+                // proof that an effectful request was not applied.
+                true,
                 error,
             ));
         }

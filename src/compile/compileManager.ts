@@ -217,6 +217,12 @@ class CompileDiagnosticProvider {
         return hasError;
     }
 
+    clearDiagnostics(isCurrent: () => boolean = () => true) {
+        if (isCurrent()) {
+            this.diagnosticCollection.clear();
+        }
+    }
+
     get triggers() {
         return [
             this.diagnosticCollection,
@@ -246,6 +252,11 @@ export class CompileManager {
     private pendingCompileForce?: boolean;
     private pendingCompileRequestKind?: CompileRequestKind;
     private pendingCompileUri?: vscode.Uri;
+    private pendingCompileSourcePromise?: Promise<CapturedCompileSourceSync | undefined>;
+    private activePdfTransition?: {
+        identifier: string,
+        transition: PdfCompileTransition,
+    };
     private suppressCompileOnSave = 0;
 
     constructor(
@@ -387,7 +398,7 @@ export class CompileManager {
     }
 
     async update(
-        status: CompileStatus|'compiling'|'alert',
+        status: CompileStatus|'compiling'|'idle'|'alert',
         projectUri?: vscode.Uri,
         isCurrent: () => boolean = () => true,
     ) {
@@ -399,6 +410,11 @@ export class CompileManager {
             const compilerName = vfs.getCompiler()?.name || '';
             this.status.tooltip = new vscode.MarkdownString();
             switch (status) {
+                case 'idle':
+                    this.status.text = `${compilerName}`;
+                    this.status.tooltip.appendMarkdown(`\`${rootDocName}\``);
+                    this.status.backgroundColor = undefined;
+                    break;
                 case 'success':
                     this.status.text = `${compilerName}`;
                     this.status.tooltip.appendMarkdown(`\`${rootDocName}\` **${vscode.l10n.t('Compile Success')}**`);
@@ -510,12 +526,25 @@ export class CompileManager {
         }
         let hasDiagnosticError = false;
         if (outcome.outputsUpdated && outcome.hasLog) {
-            hasDiagnosticError = await vscode.commands.executeCommand<boolean>(
-                `${ROOT_NAME}.compileManager.compileErrorCheck`,
-                compileUri,
-                isCurrent,
-            ) ?? false;
+            try {
+                hasDiagnosticError = await vscode.commands.executeCommand<boolean>(
+                    `${ROOT_NAME}.compileManager.compileErrorCheck`,
+                    compileUri,
+                    isCurrent,
+                ) ?? false;
+            } catch (error) {
+                // Diagnostics are auxiliary. A missing or expired output.log
+                // must not turn a successful PDF into a failed compile or start
+                // another server compile during project startup.
+                this.diagnosticProvider.clearDiagnostics(isCurrent);
+                console.warn('Unable to load Overleaf compile diagnostics.', error);
+            }
             if (!isCurrent()) { return; }
+        } else if (outcome.outputsUpdated) {
+            // The current attempt published a new output set without a log.
+            // Diagnostics from an earlier build no longer have a trustworthy
+            // source artifact and must not remain visible.
+            this.diagnosticProvider.clearDiagnostics(isCurrent);
         }
 
         const displayStatus: CompileStatus = outcome.successful ?
@@ -798,6 +827,7 @@ export class CompileManager {
             this.pendingCompileForce = undefined;
             this.pendingCompileRequestKind = undefined;
             this.pendingCompileUri = undefined;
+            this.pendingCompileSourcePromise = undefined;
         }
     }
 
@@ -822,8 +852,14 @@ export class CompileManager {
         force:boolean=false,
         trigger:CompileTrigger='command',
         requestedUri?: vscode.Uri,
+        requestedSourcePromise?: Promise<CapturedCompileSourceSync | undefined>,
     ) {
         const requestKind = compileRequestKindForTrigger(trigger);
+        // Snapshot the source at the trigger boundary. A manual request which
+        // occupies the single pending slot must retain the cursor which was
+        // clicked, not whichever editor is active when that slot later runs.
+        const capturedSourcePromise = requestedSourcePromise ??
+            this.captureCompileSourceSync().catch(() => undefined);
         if (this.compileRunGate.active || this.stoppingCompile) {
             // Coalesce every trigger which arrives during an active run. In
             // particular, a save during the initial cache probe must result in
@@ -836,14 +872,10 @@ export class CompileManager {
             );
             if (requestKind === 'manual' || previousRequestKind !== 'manual') {
                 this.pendingCompileUri = requestedUri;
+                this.pendingCompileSourcePromise = capturedSourcePromise;
             }
             return;
         }
-
-        // Start the snapshot before the first awaited compile lookup. This is
-        // the TeX cursor which triggered the build, not whichever editor is
-        // active after the PDF has refreshed.
-        const capturedSourcePromise = this.captureCompileSourceSync().catch(() => undefined);
 
         await this.compileRunGate.run(async (isCurrent) => {
             let uri: vscode.Uri | undefined;
@@ -861,7 +893,9 @@ export class CompileManager {
                 // refresh is committed. Invalidate requests from the previous
                 // build at run start so a delayed response cannot be resolved
                 // against the new build and delivered to the old PDF.
-                pdfTransition = this.invalidateCompiledPdf(parseUri(compileUri).identifier);
+                const identifier = parseUri(compileUri).identifier;
+                pdfTransition = this.invalidateCompiledPdf(identifier);
+                this.activePdfTransition = {identifier, transition: pdfTransition};
 
                 // On project open, probe the last successful server build before
                 // saveAll. Otherwise the save event is suppressed by this active
@@ -898,7 +932,7 @@ export class CompileManager {
                             this.compileStopOnFirstError,
                             rootDocId,
                             isCurrent,
-                        );
+                    );
                     if (!isCurrent()) { return; }
                     if (cachedOutcome) {
                         try {
@@ -909,18 +943,37 @@ export class CompileManager {
                                 pdfTransition,
                                 capturedSourcePromise,
                             );
-                            return;
                         } catch (error) {
+                            console.error('Cached compile adoption failed unexpectedly.', error);
                             if (!isCurrent()) { return; }
-                            console.warn(
-                                'Cached Overleaf compile output is unavailable; running a fresh compile.',
-                                error,
-                            );
+                            try {
+                                // Cached startup is read-only and has no safe
+                                // reason to fall through to a fresh compile.
+                                // Invalidate any partially published PDF work.
+                                this.invalidateCompiledPdf(identifier);
+                            } catch (invalidationError) {
+                                console.error(
+                                    'Unable to invalidate PDF state after cached compile failure.',
+                                    invalidationError,
+                                );
+                            }
+                            try {
+                                await this.update('error', compileUri, isCurrent);
+                            } catch (statusError) {
+                                console.error(
+                                    'Unable to update cached compile failure status.',
+                                    statusError,
+                                );
+                            }
                         }
+                    } else {
+                        this.restorePdfSyncability(identifier, pdfTransition);
+                        await this.update('idle', compileUri, isCurrent);
                     }
-                    await this.saveAllForCompile();
-                    if (!isCurrent()) { return; }
-                    this.discardPendingSaveCoveredByCurrentRun();
+                    // Opening a project is read-only initialization. Never
+                    // occupy the server compile slot before the user saves,
+                    // changes compile settings, or explicitly requests a build.
+                    return;
                 }
                 const result = await vfs.compile(
                     force,
@@ -963,6 +1016,9 @@ export class CompileManager {
                     }
                 }
             } finally {
+                if (this.activePdfTransition?.transition === pdfTransition) {
+                    this.activePdfTransition = undefined;
+                }
                 if (this.activeCompileUri === uri) {
                     this.activeCompileUri = undefined;
                     this.activeCompileVfs = undefined;
@@ -979,14 +1035,17 @@ export class CompileManager {
         const pendingForce = this.pendingCompileForce;
         const pendingRequestKind = this.pendingCompileRequestKind;
         const pendingUri = this.pendingCompileUri;
+        const pendingSourcePromise = this.pendingCompileSourcePromise;
         this.pendingCompileForce = undefined;
         this.pendingCompileRequestKind = undefined;
         this.pendingCompileUri = undefined;
+        this.pendingCompileSourcePromise = undefined;
         if (pendingForce !== undefined) {
             await this.compile(
                 pendingForce,
                 pendingRequestKind === 'automatic' ? 'save' : 'command',
                 pendingUri,
+                pendingSourcePromise,
             );
         }
     }
@@ -1003,6 +1062,8 @@ export class CompileManager {
         const vfs = this.activeCompileVfs;
         const shouldStopServerCompile = this.activeServerCompile;
         if (uri) {
+            // The stop endpoint has no build/output fence. Keep every PDF from
+            // the cancelled run unsyncable until a later verified refresh.
             this.invalidateCompiledPdf(parseUri(uri).identifier);
         }
         try {

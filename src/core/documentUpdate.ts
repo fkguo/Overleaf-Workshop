@@ -48,7 +48,8 @@ export type ProvenDocumentUpdate =
             | 'missing-local-causality'
             | 'missing-remote-causality'
             | 'invalid-causal-operations'
-            | 'causal-conflict',
+            | 'causal-conflict'
+            | 'unsupported-text',
     };
 
 type EditFootprint =
@@ -62,6 +63,13 @@ type PositionMarker = {
 
 export function isSenderConfirmation(update: {op?: unknown[]}): boolean {
     return update.op === undefined;
+}
+
+/** Overleaf cannot store NUL or non-BMP characters; never let the server
+ * replace their code units after we have committed an exact OT operation. */
+export function hasUnsupportedOverleafTextInsertion(operations: TextOperation[]): boolean {
+    return operations.some(operation => operation.i !== undefined
+        && /[\u0000\uD800-\uDFFF]/.test(operation.i));
 }
 
 export function buildRecoveryUpdate<T extends object>(
@@ -118,36 +126,45 @@ export function applyTextOperations(snapshot: string, operations: TextOperation[
 
 /**
  * Convert one observed VS Code change event into the exact sequential ShareJS
- * operation which it caused. Multiple contentChanges are deliberately rejected:
- * the supported host API does not prove a portable cross-change ordering.
+ * operations which it caused. VS Code 1.86 applies and exposes the event's
+ * contentChanges in array order, so each range is interpreted against the text
+ * produced by the preceding change. The final snapshot remains the exact replay
+ * witness; inconsistent or malformed events are rejected.
  */
 export function operationsFromObservedTextChanges(
     before: string,
     changes: readonly ObservedTextChange[],
     after: string,
 ): TextOperation[] | undefined {
-    if (changes.length !== 1) { return undefined; }
-    const change = changes[0];
-    if (!Number.isInteger(change.rangeOffset)
-        || !Number.isInteger(change.rangeLength)
-        || change.rangeOffset < 0
-        || change.rangeLength < 0
-        || change.rangeOffset + change.rangeLength > before.length
-        || typeof change.text !== 'string') {
-        return undefined;
-    }
+    let current = before;
     const operations: TextOperation[] = [];
-    if (change.rangeLength > 0) {
-        operations.push({
-            p: change.rangeOffset,
-            d: before.slice(change.rangeOffset, change.rangeOffset + change.rangeLength),
-        });
-    }
-    if (change.text.length > 0) {
-        operations.push({p: change.rangeOffset, i: change.text});
-    }
     try {
-        return applyTextOperations(before, operations) === after ? operations : undefined;
+        for (const change of changes) {
+            if (!Number.isSafeInteger(change.rangeOffset)
+                || !Number.isSafeInteger(change.rangeLength)
+                || change.rangeOffset < 0
+                || change.rangeLength < 0
+                || change.rangeOffset + change.rangeLength > current.length
+                || typeof change.text !== 'string') {
+                return undefined;
+            }
+            const replacement: TextOperation[] = [];
+            if (change.rangeLength > 0) {
+                replacement.push({
+                    p: change.rangeOffset,
+                    d: current.slice(
+                        change.rangeOffset,
+                        change.rangeOffset + change.rangeLength,
+                    ),
+                });
+            }
+            if (change.text.length > 0) {
+                replacement.push({p: change.rangeOffset, i: change.text});
+            }
+            current = applyTextOperations(current, replacement);
+            operations.push(...replacement);
+        }
+        return current === after ? operations : undefined;
     } catch {
         return undefined;
     }
@@ -533,6 +550,9 @@ export function prepareProvenDocumentUpdate(
     }
     if (mergedContent !== localBranch) {
         return {status: 'blocked', reason: 'invalid-causal-operations'};
+    }
+    if (hasUnsupportedOverleafTextInsertion(localOperations)) {
+        return {status: 'blocked', reason: 'unsupported-text'};
     }
     const prepared: PreparedDocumentUpdate = {
         mergedContent,

@@ -19,6 +19,21 @@ const evidence = (
 ) => ({localOperations, remoteUpdates});
 
 describe('observed editor operations', () => {
+    it('blocks unsupported wire insertions, including cancelled intermediate inserts', () => {
+        for (const inserted of ['\u0000', '🙂', '\uD800', '\uDC00']) {
+            assert.deepEqual(prepareProvenDocumentUpdate(
+                base(1, 'abc'), 1, 'abc', `abc${inserted}`,
+                evidence([{p: 3, i: inserted}]),
+            ), {status: 'blocked', reason: 'unsupported-text'});
+            assert.deepEqual(prepareProvenDocumentUpdate(
+                base(1, 'abc'), 1, 'abc', 'abcL',
+                evidence([{p: 3, i: inserted}, {p: 3, d: inserted}, {p: 3, i: 'L'}]),
+            ), {status: 'blocked', reason: 'unsupported-text'});
+        }
+        assert.equal(prepareProvenDocumentUpdate(
+            base(1, 'abc'), 1, 'abc', 'abc中文', evidence([{p: 3, i: '中文'}]),
+        ).status, 'ready');
+    });
     it('records an exact insertion and replacement from one content change', () => {
         assert.deepEqual(
             operationsFromObservedTextChanges(
@@ -38,7 +53,37 @@ describe('observed editor operations', () => {
         );
     });
 
-    it('rejects an unordered multi-change transaction and a false replay', () => {
+    it('records a multi-change transaction in the exact host event order', () => {
+        assert.deepEqual(
+            operationsFromObservedTextChanges(
+                'abc',
+                [
+                    {rangeOffset: 3, rangeLength: 0, text: 'Y'},
+                    {rangeOffset: 0, rangeLength: 0, text: 'X'},
+                ],
+                'XabcY',
+            ),
+            [{p: 3, i: 'Y'}, {p: 0, i: 'X'}],
+        );
+        assert.deepEqual(
+            operationsFromObservedTextChanges(
+                'abcdef',
+                [
+                    {rangeOffset: 4, rangeLength: 2, text: 'XY'},
+                    {rangeOffset: 1, rangeLength: 2, text: 'Q'},
+                ],
+                'aQdXY',
+            ),
+            [
+                {p: 4, d: 'ef'},
+                {p: 4, i: 'XY'},
+                {p: 1, d: 'bc'},
+                {p: 1, i: 'Q'},
+            ],
+        );
+    });
+
+    it('rejects a multi-change transaction whose event order cannot replay the snapshot', () => {
         assert.equal(
             operationsFromObservedTextChanges(
                 'abc',
@@ -50,6 +95,9 @@ describe('observed editor operations', () => {
             ),
             undefined,
         );
+    });
+
+    it('rejects a false single-change replay', () => {
         assert.equal(
             operationsFromObservedTextChanges(
                 'abc',

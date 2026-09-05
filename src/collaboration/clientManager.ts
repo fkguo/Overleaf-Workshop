@@ -65,6 +65,7 @@ export class ClientManager implements vscode.Disposable {
     private readonly localPublicIds = new Set<string>();
     private connectedUsersRefresh = 0;
     private presenceRevision = 0;
+    private localCursorRevision = 0;
     private readonly clientPresenceRevisions = new Map<string, number>();
     /** Timestamp when connection was lost; used for grace period before clearing user list */
     private disconnectedAt: number = 0;
@@ -84,7 +85,15 @@ export class ClientManager implements vscode.Disposable {
                 this.presenceRevision += 1;
                 this.clientPresenceRevisions.set(user.id, this.presenceRevision);
                 if (!this.localPublicIds.has(user.id)) { this.setStatusActive(user.id); }
-                this.updatePosition(user.id, user.doc_id, user.row, user.column, user);
+                void this.updatePosition(
+                    user.id,
+                    user.doc_id,
+                    user.row,
+                    user.column,
+                    user,
+                ).catch(error => {
+                    console.warn('Unable to update an Overleaf collaborator cursor', error);
+                });
             },
             onClientDisconnected: (id:string) => {
                 if (this.disposed) { return; }
@@ -140,9 +149,9 @@ export class ClientManager implements vscode.Disposable {
             user_id: user.user_id,
             name: [user.first_name, user.last_name].filter(Boolean).join(' '),
             email: user.email,
-            doc_id: user.cursorData?.doc_id || '',
-            row: user.cursorData?.row || 0,
-            column: user.cursorData?.column || 0,
+            doc_id: user.cursorData?.doc_id,
+            row: user.cursorData?.row,
+            column: user.cursorData?.column,
             last_updated_at: Number(user.last_updated_at),
         };
     }
@@ -197,7 +206,8 @@ export class ClientManager implements vscode.Disposable {
                 Object.keys(this.onlineUsers).map(clientId => {
                     const user = this.onlineUsers[clientId];
                     const docPath = user.doc_id ? this.vfs._resolveById(user.doc_id)?.path.slice(1) : undefined;
-                    const cursorInfo = user.row ? vscode.l10n.t('At {docPath}, Line {row}', {docPath, row:user.row+1}) : undefined;
+                    const cursorInfo = user.row !== undefined && docPath ?
+                        vscode.l10n.t('At {docPath}, Line {row}', {docPath, row:user.row+1}) : undefined;
 
                     return {
                         label: user.name,
@@ -214,13 +224,22 @@ export class ClientManager implements vscode.Disposable {
         }
 
         const user = this.onlineUsers[id];
+        const row = user.row;
+        const column = user.column;
+        if (!user.doc_id
+            || typeof row !== 'number'
+            || typeof column !== 'number'
+            || !Number.isSafeInteger(row)
+            || !Number.isSafeInteger(column)
+            || row < 0
+            || column < 0) { return; }
         const docPath = this.vfs._resolveById(user.doc_id)?.path;
         if (docPath === undefined) { return; }
 
         const uri = (vscode.workspace.workspaceFolders?.[0].uri.scheme===ROOT_NAME) ?
                     this.vfs.pathToUri(docPath) : await LocalReplicaSCMProvider.pathToUri(docPath);
         uri && vscode.window.showTextDocument(uri, {
-            selection: new vscode.Selection(user.row, user.column, user.row, user.column),
+            selection: new vscode.Selection(row, column, row, column),
             preview: false,
         });
     }
@@ -230,6 +249,7 @@ export class ClientManager implements vscode.Disposable {
     private refreshDecorations(visibleTextEditors: readonly vscode.TextEditor[]) {
         Object.values(this.onlineUsers).forEach(async user => {
             if (this.disposed) { return; }
+            if (!user.doc_id) { return; }
             const docPath = this.vfs._resolveById(user.doc_id)?.path;
             if (docPath === undefined) { return; }
 
@@ -242,7 +262,13 @@ export class ClientManager implements vscode.Disposable {
         });
     }
 
-    private async updatePosition(clientId:string, docId: string, row: number, column: number, details?:UpdateUserSchema) {
+    private async updatePosition(
+        clientId: string,
+        docId: string | undefined,
+        row: number | undefined,
+        column: number | undefined,
+        details?: UpdateUserSchema,
+    ) {
         if (this.disposed || this.localPublicIds.has(clientId)) { return; }
 
         // update record
@@ -261,6 +287,21 @@ export class ClientManager implements vscode.Disposable {
         }
 
         const selection = this.onlineUsers[clientId].selection;
+        const hasCursor = typeof docId === 'string'
+            && docId.length > 0
+            && Number.isSafeInteger(row)
+            && Number.isSafeInteger(column)
+            && row! >= 0
+            && column! >= 0;
+        if (!hasCursor) {
+            if (selection) {
+                selection.ranges = [];
+                vscode.window.visibleTextEditors.forEach(editor => {
+                    editor.setDecorations(selection.decoration, []);
+                });
+            }
+            return;
+        }
         // remove decoration
         const oldDoc = previousDocId && this.vfs._resolveById(previousDocId);
         if (oldDoc && oldDoc.fileEntity._id !== docId && selection) {
@@ -273,7 +314,7 @@ export class ClientManager implements vscode.Disposable {
         }
 
         // update decoration
-        const newDoc = this.vfs._resolveById(docId);
+        const newDoc = this.vfs._resolveById(docId!);
         if (newDoc === undefined) { return; }
         const newUri = (vscode.workspace.workspaceFolders?.[0].uri.scheme===ROOT_NAME) ?
                     this.vfs.pathToUri(newDoc.path) : await LocalReplicaSCMProvider.pathToUri(newDoc.path);
@@ -294,7 +335,7 @@ export class ClientManager implements vscode.Disposable {
                 decoration,
                 hoverMessage,
                 ranges: [{
-                    range: new vscode.Range(row, column, row, column),
+                    range: new vscode.Range(row!, column!, row!, column!),
                     hoverMessage: hoverMessage,
                 }],
             };
@@ -302,7 +343,7 @@ export class ClientManager implements vscode.Disposable {
             newEditor?.setDecorations(_selection.decoration, _selection.ranges);
         } else {
             selection.ranges = [{
-                range: new vscode.Range(row, column, row, column),
+                range: new vscode.Range(row!, column!, row!, column!),
                 hoverMessage: selection.hoverMessage,
             }];
             newEditor?.setDecorations(selection.decoration, selection.ranges);
@@ -320,7 +361,7 @@ export class ClientManager implements vscode.Disposable {
                 this.inactivateTask = undefined;
             }
         }
-        const doc = this.vfs._resolveById(user.doc_id);
+        const doc = user.doc_id ? this.vfs._resolveById(user.doc_id) : undefined;
         // const uri = this.vfs.pathToUri(doc.path);
         const uri = doc && (vscode.workspace.workspaceFolders?.[0].uri.scheme===ROOT_NAME ?
                     this.vfs.pathToUri(doc.path) : await LocalReplicaSCMProvider.pathToUri(doc.path));
@@ -506,7 +547,12 @@ export class ClientManager implements vscode.Disposable {
             ...this.chatViewer.triggers,
             // update this client's position
             vscode.window.onDidChangeTextEditorSelection(async e => {
-                if (e.kind===undefined) { return; }
+                // Typing and Vim/IME edits can move the selection without a
+                // reported kind. Those positions still belong to the editor
+                // snapshot and must supersede older queued cursor updates.
+                if (e.selections.length === 0) { return; }
+                const revision = ++this.localCursorRevision;
+                const documentVersion = e.textEditor.document.version;
                 let uri = e.textEditor.document.uri;
                 // deal with local replica
                 if (uri.scheme==='file') {
@@ -521,6 +567,30 @@ export class ClientManager implements vscode.Disposable {
                 const doc = uri && await this.vfs._resolveUri(uri);
                 const docId = doc?.fileEntity?._id;
                 if (docId) {
+                    const stillCurrent = () => !this.disposed
+                        && revision === this.localCursorRevision
+                        && e.textEditor.document.version === documentVersion;
+                    if (!stillCurrent()) { return; }
+                    try {
+                        if (e.textEditor.document.uri.scheme === ROOT_NAME) {
+                            const position = e.selections[0].active;
+                            if (this.vfs.canPublishPendingDeletionCursor(
+                                e.textEditor.document,
+                                e.textEditor.document.offsetAt(position),
+                            )) {
+                                await this.socket.updatePosition(docId, position.line, position.character);
+                                if (!stillCurrent()) { return; }
+                            }
+                            if (!await this.vfs.flushEditorChangesForPresence(e.textEditor.document)) {
+                                return;
+                            }
+                        }
+                    } catch {
+                        // Unconfirmed text must not publish coordinates from
+                        // a different snapshot. The write path retains recovery.
+                        return;
+                    }
+                    if (!stillCurrent()) { return; }
                     void this.socket.updatePosition(docId, e.selections[0].active.line, e.selections[0].active.character).catch(() => {});
                 }
             }),

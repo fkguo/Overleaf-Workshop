@@ -71,6 +71,13 @@ class SynchronousAckSocket extends FakeSocket {
     }
 }
 
+class ThrowingEmitSocket extends FakeSocket {
+    emit(event: string, ...args: any[]): void {
+        super.emit(event, ...args);
+        throw new Error('transport threw after accepting the packet');
+    }
+}
+
 describe('requestWithAck', () => {
     it('does not buffer a request while disconnected', async () => {
         const socket = new FakeSocket();
@@ -135,6 +142,26 @@ describe('requestWithAck', () => {
             (error: unknown) => error instanceof SocketRequestError &&
                 error.code === 'disconnected' && error.outcomeUnknown,
         );
+    });
+
+    it('treats a synchronous emit exception as an unknown outcome', async () => {
+        const socket = new ThrowingEmitSocket();
+        await assert.rejects(
+            requestWithAck(
+                socket,
+                'applyOtUpdate',
+                ['doc-id', {v: 1, op: [{p: 0, i: 'x'}]}],
+                50,
+                3,
+                generation => generation === 3,
+            ),
+            (error: unknown) => error instanceof SocketRequestError
+                && error.code === 'server_error'
+                && error.outcomeUnknown,
+        );
+        assert.equal(socket.emitted.length, 1);
+        assert.equal(Object.keys(socket.acks).length, 0);
+        assert.equal(socket.listenerCount('disconnect'), 0);
     });
 
     it('keeps disconnect outcome-unknown when a server-error ACK closure runs late', async () => {

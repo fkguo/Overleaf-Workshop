@@ -20,6 +20,7 @@ const shownTextDocuments: any[][] = [];
 const documentChangeListeners = new Set<(event: any) => void>();
 const documentCloseListeners = new Set<(document: any) => void>();
 let executeCommand = async (_command: string, ..._args: unknown[]): Promise<unknown> => undefined;
+let diagnosticClears = 0;
 const vscodeStub = {
     DiagnosticSeverity: {Error: 0, Warning: 1, Information: 2},
     StatusBarAlignment: {Left: 1},
@@ -33,7 +34,11 @@ const vscodeStub = {
         ),
     },
     languages: {
-        createDiagnosticCollection: () => ({clear() {}, set() {}, dispose() {}}),
+        createDiagnosticCollection: () => ({
+            clear() { diagnosticClears += 1; },
+            set() {},
+            dispose() {},
+        }),
     },
     window: {
         activeTextEditor: undefined as any,
@@ -316,6 +321,7 @@ describe('CompileManager cached startup', () => {
         statusItems.length = 0;
         executedCommands.length = 0;
         shownTextDocuments.length = 0;
+        diagnosticClears = 0;
         executeCommand = async () => undefined;
         vscodeStub.window.activeTextEditor = undefined;
         vscodeStub.workspace.textDocuments = [];
@@ -331,7 +337,7 @@ describe('CompileManager cached startup', () => {
         }
     });
 
-    it('falls back to a real compile when a cached output cannot be downloaded', async () => {
+    it('keeps cached startup read-only when compile diagnostics are unavailable', async () => {
         const uri = projectFixture().compileUri;
         const cachedOutcome: CompileOutcome = {
             status: 'success',
@@ -363,8 +369,92 @@ describe('CompileManager cached startup', () => {
         await manager.compile(true, 'initial-project', uri as any);
 
         assert.equal(diagnosticChecks, 1);
-        assert.equal(liveCompiles, 1);
+        assert.equal(diagnosticClears, 1);
+        assert.equal(liveCompiles, 0);
         assert.equal(statusItems.at(-1)?.text, 'pdfLaTex');
+    });
+
+    it('does not start a server compile when no cached startup output exists', async () => {
+        const uri = projectFixture().compileUri;
+        let liveCompiles = 0;
+        const vfs = {
+            outputIdentityGeneration: 0,
+            getRootDocName: () => '/main.tex',
+            getCompiler: () => ({name: 'pdfLaTex'}),
+            adoptCachedCompile: async () => undefined,
+            compile: async () => {
+                liveCompiles += 1;
+                return undefined;
+            },
+        };
+        const manager = createManager(vfs);
+
+        await manager.compile(true, 'initial-project', uri as any);
+        assert.equal(liveCompiles, 0);
+        assert.equal(statusItems.at(-1)?.text, 'pdfLaTex');
+        assert.equal(statusItems.at(-1)?.text.includes('sync'), false);
+
+        await manager.compile(true, 'command', uri as any);
+        assert.equal(liveCompiles, 1);
+    });
+
+    it('clears old diagnostics when a successful output set has no log', async () => {
+        const uri = projectFixture().compileUri;
+        const vfs = {
+            outputIdentityGeneration: 0,
+            getRootDocName: () => '/main.tex',
+            getCompiler: () => ({name: 'pdfLaTex'}),
+            adoptCachedCompile: async () => successfulOutcome(),
+            compile: async () => undefined,
+        };
+        const manager = createManager(vfs);
+
+        await manager.compile(true, 'initial-project', uri as any);
+
+        assert.equal(diagnosticClears, 1);
+        assert.equal(statusItems.at(-1)?.text, 'pdfLaTex');
+    });
+
+    it('contains a non-diagnostic cached-output failure without starting a live compile', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        setActiveEditor(fixture.sourceUri);
+        let liveCompiles = 0;
+        let reverseCalls = 0;
+        const vfs = createVfs(successfulOutcome(), actions);
+        (vfs as any).adoptCachedCompile = async () => successfulOutcome();
+        (vfs as any).compile = async () => {
+            liveCompiles += 1;
+            return undefined;
+        };
+        vfs.syncPdf = async () => { reverseCalls += 1; return undefined; };
+        const manager = createManager(vfs);
+        const viewer = registerPdfViewer(fixture, actions);
+        (manager as any).scheduleCompiledPdfRefresh = () => {
+            throw new Error('cached PDF publication failed');
+        };
+        const errors: unknown[][] = [];
+        const originalConsoleError = console.error;
+        console.error = (...args: unknown[]) => { errors.push(args); };
+
+        try {
+            await manager.compile(true, 'initial-project', fixture.compileUri);
+            await manager.syncCode();
+            await manager.syncPdf(reverseSyncRequest(fixture, viewer));
+        } finally {
+            console.error = originalConsoleError;
+        }
+
+        assert.equal(liveCompiles, 0);
+        assert.equal(manager.inCompiling, false);
+        assert.match(statusItems.at(-1)?.text ?? '', /\$\(x\)/);
+        assert.equal(
+            errors.some(args => String(args[0]).includes('Cached compile adoption failed')),
+            true,
+        );
+        assert.deepEqual(actions, []);
+        assert.equal(reverseCalls, 0);
+        assert.deepEqual(viewer.messages, []);
     });
 });
 
@@ -373,6 +463,7 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
         statusItems.length = 0;
         executedCommands.length = 0;
         shownTextDocuments.length = 0;
+        diagnosticClears = 0;
         executeCommand = async () => undefined;
         vscodeStub.window.activeTextEditor = undefined;
         vscodeStub.workspace.textDocuments = [];
@@ -400,7 +491,7 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
         const manager = createManager(vfs);
         const viewer = registerPdfViewer(fixture, actions);
 
-        await manager.compile(true, 'command', fixture.compileUri);
+        await manager.compile(true, 'command');
         await flushAsync();
 
         assert.deepEqual(syncCalls, [['main.tex', 7, 9, false]]);
@@ -412,6 +503,79 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
         }]);
         assert.equal(vscodeStub.window.activeTextEditor, editor);
         assert.equal(executedCommands.includes('vscode.openWith'), false);
+    });
+
+    it('runs each completed manual compile and captures the cursor from each click', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        const compileCalls: any[][] = [];
+        const syncCalls: any[][] = [];
+        const editor = setActiveEditor(fixture.sourceUri, 1, 3, 1);
+        const vfs = createVfs(successfulOutcome(), actions, async (...args) => {
+            syncCalls.push(args);
+            return [{page: 1, h: 2, v: 3}];
+        });
+        vfs.compile = async (...args: any[]) => {
+            compileCalls.push(args);
+            return successfulOutcome();
+        };
+        const manager = createManager(vfs);
+        registerPdfViewer(fixture, actions);
+
+        await manager.compile(true, 'command');
+        await flushAsync();
+        editor.selection.active = {line: 8, character: 6};
+        await manager.compile(true, 'command');
+        await flushAsync();
+
+        assert.equal(compileCalls.length, 2);
+        assert.deepEqual(compileCalls.map(call => [call[0], call[4]]), [
+            [true, 'manual'],
+            [true, 'manual'],
+        ]);
+        assert.deepEqual(syncCalls, [
+            ['main.tex', 2, 3, false],
+            ['main.tex', 9, 6, false],
+        ]);
+    });
+
+    it('keeps at most one pending manual compile and uses its latest click cursor', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        const compileCalls: any[][] = [];
+        const syncCalls: any[][] = [];
+        const editor = setActiveEditor(fixture.sourceUri, 1, 1, 1);
+        let finishFirstCompile!: (outcome: CompileOutcome) => void;
+        const firstCompile = new Promise<CompileOutcome>(resolve => {
+            finishFirstCompile = resolve;
+        });
+        const vfs = createVfs(successfulOutcome(), actions, async (...args) => {
+            syncCalls.push(args);
+            return [{page: 1, h: 2, v: 3}];
+        });
+        vfs.compile = async (...args: any[]) => {
+            compileCalls.push(args);
+            return compileCalls.length === 1 ? firstCompile : successfulOutcome();
+        };
+        const manager = createManager(vfs);
+        registerPdfViewer(fixture, actions);
+
+        const compiling = manager.compile(true, 'command');
+        await flushAsync();
+        editor.selection.active = {line: 4, character: 2};
+        await manager.compile(true, 'command');
+        editor.selection.active = {line: 11, character: 7};
+        await manager.compile(true, 'command');
+        finishFirstCompile(successfulOutcome());
+        await compiling;
+        await flushAsync();
+
+        assert.equal(compileCalls.length, 2);
+        assert.deepEqual(compileCalls.map(call => [call[0], call[4]]), [
+            [true, 'manual'],
+            [true, 'manual'],
+        ]);
+        assert.deepEqual(syncCalls, [['main.tex', 12, 7, false]]);
     });
 
     it('keeps compile and PDF viewer state isolated across Overleaf authorities', async () => {
@@ -910,10 +1074,11 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
         assert.deepEqual(actions, ['refresh', 'refresh']);
     });
 
-    it('does not commit refresh or sync from a cancelled compile run', async () => {
+    it('keeps the old PDF unsyncable after stop even when output identity has not changed yet', async () => {
         const fixture = projectFixture();
         const actions: string[] = [];
         setActiveEditor(fixture.sourceUri);
+        let reverseCalls = 0;
         let finishCompile!: (outcome: CompileOutcome) => void;
         const compileResult = new Promise<CompileOutcome>(resolve => {
             finishCompile = resolve;
@@ -924,17 +1089,62 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
             return compileResult;
         };
         vfs.stopCompile = async () => true;
+        vfs.syncPdf = async () => { reverseCalls += 1; return undefined; };
         const manager = createManager(vfs);
-        registerPdfViewer(fixture, actions);
+        const viewer = registerPdfViewer(fixture, actions);
 
         const compiling = manager.compile(true, 'command', fixture.compileUri);
         await flushAsync();
         await manager.stopCompile();
+        await manager.syncCode();
+        await manager.syncPdf(reverseSyncRequest(fixture, viewer));
         finishCompile(successfulOutcome());
         await compiling;
         await flushAsync();
 
         assert.deepEqual(actions, []);
+        assert.equal(reverseCalls, 0);
+        assert.deepEqual(viewer.messages, []);
+    });
+
+    it('keeps the old PDF unsyncable when output identity changes before stop', async () => {
+        const fixture = projectFixture();
+        const actions: string[] = [];
+        setActiveEditor(fixture.sourceUri);
+        let finishCompile!: (outcome: CompileOutcome) => void;
+        const compileResult = new Promise<CompileOutcome>(resolve => {
+            finishCompile = resolve;
+        });
+        let reverseCalls = 0;
+        const vfs = createVfs(successfulOutcome(), actions);
+        vfs.compile = async (...args: any[]) => {
+            args[6]?.();
+            return compileResult;
+        };
+        vfs.stopCompile = async () => true;
+        vfs.syncPdf = async () => { reverseCalls += 1; return undefined; };
+        const manager = createManager(vfs);
+        const viewer = registerPdfViewer(fixture, actions, {
+            refresh: async () => {
+                actions.push('recovery-refresh-failed');
+                return new Uint8Array();
+            },
+        });
+
+        const compiling = manager.compile(true, 'command', fixture.compileUri);
+        await flushAsync();
+        vfs.outputIdentityGeneration += 1;
+        await manager.stopCompile();
+        await flushAsync();
+        await manager.syncCode();
+        await manager.syncPdf(reverseSyncRequest(fixture, viewer));
+        finishCompile(successfulOutcome());
+        await compiling;
+        await flushAsync();
+
+        assert.deepEqual(actions, []);
+        assert.equal(reverseCalls, 0);
+        assert.deepEqual(viewer.messages, []);
     });
 
     it('invalidates an old pending SyncTeX response as soon as a newer compile starts', async () => {

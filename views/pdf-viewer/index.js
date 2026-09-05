@@ -201,6 +201,10 @@
         });
     }
 
+    // Match the pinned Overleaf PDF preview: reveal the first SyncTeX
+    // highlight and use the same viewBox-height correction as util/highlights.ts.
+    // https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/web/frontend/js/features/pdf-preview/components/pdf-js-viewer.tsx#L367-L377
+    // https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/web/frontend/js/features/pdf-preview/util/highlights.ts#L10-L27
     function revealSyncCode(pdf) {
         if (
             readyPdfGeneration !== pdfLoadGeneration ||
@@ -253,7 +257,7 @@
         }
     }
 
-    //Reference: https://github.com/overleaf/overleaf/blob/main/services/web/frontend/js/features/pdf-preview/util/pdf-js-wrapper.js#L163
+    // Reference: https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/web/frontend/js/features/pdf-preview/util/pdf-js-wrapper.ts
     function syncPdf(pageElem, pageNum, clientX, clientY, innerText) {
         if (!OverleafPdfSyncGeneration.isReadyPdfGeneration(
             readyPdfGeneration,

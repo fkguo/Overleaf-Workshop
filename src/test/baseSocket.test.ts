@@ -53,6 +53,7 @@ describe('BaseAPI realtime transport configuration', () => {
 
     it('puts projectId on the real 0.9 handshake and exposes a 502 as an error', async () => {
         let handshakeUrl = '';
+        const handshakeHeaders: Record<string, string> = {};
         class FakeXHR {
             readyState = 0;
             status = 0;
@@ -64,7 +65,9 @@ describe('BaseAPI realtime transport configuration', () => {
             }
 
             setDisableHeaderCheck() {}
-            setRequestHeader(_key: string, _value: string) {}
+            setRequestHeader(key: string, value: string) {
+                handshakeHeaders[key] = value;
+            }
             getAllResponseHeaders() { return ''; }
 
             send() {
@@ -87,6 +90,8 @@ describe('BaseAPI realtime transport configuration', () => {
         const parsed = new URL(handshakeUrl);
         assert.equal(parsed.searchParams.get('projectId'), '0123456789abcdef01234567');
         assert.ok(parsed.searchParams.has('t'));
+        assert.equal(handshakeHeaders.Origin, 'https://www.overleaf.com');
+        assert.equal(handshakeHeaders.Cookie, identity.cookies);
         assert.equal(socket.socket.options.reconnect, false);
     });
 });

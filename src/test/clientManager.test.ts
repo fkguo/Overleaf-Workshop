@@ -14,6 +14,7 @@ function deferred<T>(): Deferred<T> {
 }
 
 const statusItems: any[] = [];
+let selectionHandler: (event: any) => Promise<void>;
 const vscodeMock = {
     StatusBarAlignment: {Left: 1},
     DecorationRangeBehavior: {OpenClosed: 1},
@@ -23,7 +24,15 @@ const vscodeMock = {
         supportHtml = false;
         appendMarkdown() {}
     },
-    Range: class Range { constructor(..._args: any[]) {} },
+    Range: class Range {
+        constructor(...args: any[]) {
+            if (args.length === 4 && args.some(value =>
+                !Number.isSafeInteger(value) || value < 0
+            )) {
+                throw new Error('Invalid arguments');
+            }
+        }
+    },
     Selection: class Selection { constructor(..._args: any[]) {} },
     Uri: {parse: (value: string) => ({toString: () => value})},
     l10n: {t: (value: string) => value},
@@ -33,6 +42,11 @@ const vscodeMock = {
         getConfiguration: () => ({get: (_key: string, fallback: unknown) => fallback}),
     },
     window: {
+        onDidChangeTextEditorSelection: (handler: typeof selectionHandler) => {
+            selectionHandler = handler;
+            return {dispose() {}};
+        },
+        onDidChangeVisibleTextEditors: () => ({dispose() {}}),
         visibleTextEditors: [],
         createStatusBarItem: () => {
             const status = {show() {}, dispose() {}};
@@ -115,15 +129,87 @@ describe('ClientManager presence snapshots', () => {
         }
     });
 
-    function createManager(socket: FakeSocket, publicId = 'P.local') {
+    function createManager(socket: FakeSocket, publicId = 'P.local', resolveDocument = false) {
         const vfs = {
             isReady: true,
-            _resolveById: () => undefined,
+            canPublishPendingDeletionCursor: () => false,
+            _resolveById: (docId: string) => resolveDocument && docId === 'doc-id' ? {
+                path: '/main.tex',
+                fileEntity: {_id: 'doc-id'},
+            } : undefined,
             pathToUri: () => ({toString: () => ''}),
         };
         const context = {extensionUri: {}};
         return new ClientManager(vfs, context, publicId, socket);
     }
+
+    for (const kind of [1, undefined]) {
+    it(`sends only the latest cursor after its text is acknowledged (kind=${kind})`, async () => {
+        const socket = new FakeSocket() as any;
+        const manager = createManager(socket);
+        const sync = deferred<boolean>();
+        const sent: number[] = [];
+        manager.vfs._resolveUri = async () => ({fileEntity: {_id: 'doc-id'}});
+        manager.vfs.flushEditorChangesForPresence = () => sync.promise;
+        socket.updatePosition = async (_id: string, _row: number, column: number) => { sent.push(column); };
+        void manager.triggers;
+        const document = {uri: {scheme: 'overleaf-workshop'}, version: 1, offsetAt: () => 0};
+        const event = (column: number) => ({kind, textEditor: {document}, selections: [{active: {line: 0, character: column}}]});
+        try {
+            const first = selectionHandler(event(8));
+            document.version = 2;
+            const last = selectionHandler(event(3));
+            await flushAsyncWork();
+            assert.deepEqual(sent, []);
+            sync.resolve(true);
+            await Promise.all([first, last]);
+            assert.deepEqual(sent, [3]);
+        } finally { manager.dispose(); }
+    });
+    }
+
+    it('does not publish cursor coordinates for unconfirmed or changed text', async () => {
+        const socket = new FakeSocket() as any;
+        const manager = createManager(socket);
+        let sent = 0;
+        manager.vfs._resolveUri = async () => ({fileEntity: {_id: 'doc-id'}});
+        socket.updatePosition = async () => { sent++; };
+        void manager.triggers;
+        const document = {uri: {scheme: 'overleaf-workshop'}, version: 1, offsetAt: () => 0};
+        const event = {kind: 1, textEditor: {document}, selections: [{active: {line: 0, character: 3}}]};
+        try {
+            manager.vfs.flushEditorChangesForPresence = async () => false;
+            await selectionHandler(event);
+            manager.vfs.flushEditorChangesForPresence = async () => { document.version++; return true; };
+            await selectionHandler(event);
+            manager.vfs.flushEditorChangesForPresence = async () => { throw new Error('unconfirmed'); };
+            await selectionHandler(event);
+            assert.equal(sent, 0);
+        } finally { manager.dispose(); }
+    });
+
+    it('publishes a proven deletion prefix before flushing text, then confirms the final caret', async () => {
+        const socket = new FakeSocket() as any;
+        const manager = createManager(socket);
+        const sync = deferred<boolean>();
+        const order: string[] = [];
+        manager.vfs._resolveUri = async () => ({fileEntity: {_id: 'doc-id'}});
+        manager.vfs.canPublishPendingDeletionCursor = (_document: unknown, offset: number) => offset === 3;
+        manager.vfs.flushEditorChangesForPresence = () => { order.push('flush'); return sync.promise; };
+        socket.updatePosition = async (_id: string, row: number, column: number) => {
+            order.push(`cursor:${row}:${column}`);
+        };
+        void manager.triggers;
+        const document = {uri: {scheme: 'overleaf-workshop'}, version: 2, offsetAt: () => 3};
+        try {
+            const pending = selectionHandler({textEditor: {document}, selections: [{active: {line: 0, character: 3}}]});
+            await flushAsyncWork();
+            assert.deepEqual(order, ['cursor:0:3', 'flush']);
+            sync.resolve(true);
+            await pending;
+            assert.deepEqual(order, ['cursor:0:3', 'flush', 'cursor:0:3']);
+        } finally { manager.dispose(); }
+    });
 
     it('clears stale sessions without overwriting live events received during the snapshot', async () => {
         const socket = new FakeSocket();
@@ -173,6 +259,37 @@ describe('ClientManager presence snapshots', () => {
         await flushAsyncWork();
 
         assert.deepEqual(Object.keys((manager as any).onlineUsers), ['P.other-window']);
+        manager.dispose();
+    });
+
+    it('keeps a collaborator online when cursor coordinates are absent and accepts a later position', async () => {
+        const socket = new FakeSocket();
+        const initial = deferred<OnlineUserSchema[]>();
+        socket.snapshots.push(initial);
+        const manager = createManager(socket, 'P.local', true);
+        initial.resolve([]);
+        await flushAsyncWork();
+
+        await (manager as any).updatePosition(
+            'P.remote',
+            'doc-id',
+            undefined,
+            undefined,
+            {
+                id: 'P.remote',
+                user_id: 'remote',
+                name: 'Remote User',
+                email: 'remote@example.test',
+                doc_id: 'doc-id',
+            } satisfies UpdateUserSchema,
+        );
+        assert.equal((manager as any).onlineUsers['P.remote'].selection, undefined);
+
+        await (manager as any).updatePosition('P.remote', 'doc-id', 4, 5);
+        const remote = (manager as any).onlineUsers['P.remote'];
+        assert.equal(remote.row, 4);
+        assert.equal(remote.column, 5);
+        assert.equal(remote.selection.ranges.length, 1);
         manager.dispose();
     });
 });

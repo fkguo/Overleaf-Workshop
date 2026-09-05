@@ -14,6 +14,7 @@ import {
     prepareHistoryRemoteEditorTransaction,
     prepareRemoteEditorTransaction,
     rebindHistorySubmissionForRecovery,
+    rebindLocalEditorPendingOperations,
     reconcileHistoryEditorAfterJoin,
     recordHistoryLocalEditorChange,
     recordLocalEditorChange,
@@ -47,6 +48,34 @@ function bound(content = 'abc') {
 }
 
 describe('realtime editor bridge', () => {
+    it('rebinds pending operations only when they exactly reproduce the editor text', () => {
+        const exact = rebindLocalEditorPendingOperations(
+            bound('aRbc'),
+            7,
+            'aRbcL',
+            [{p: 4, i: 'L'}],
+        );
+        const contradictory = rebindLocalEditorPendingOperations(
+            bound('aRbc'),
+            7,
+            'aRbcL',
+            [{p: 0, i: 'X'}],
+        );
+        const wrongDocumentVersion = rebindLocalEditorPendingOperations(
+            bound('aRbc'),
+            8,
+            'aRbcL',
+            [{p: 4, i: 'L'}],
+        );
+
+        assert.equal(exact.valid, true);
+        assert.deepEqual(exact.pendingOperations, [{p: 4, i: 'L'}]);
+        assert.deepEqual(exact.localOperations, [{p: 4, i: 'L'}]);
+        assert.equal(exact.inflightWire, undefined);
+        assert.equal(contradictory.valid, false);
+        assert.equal(wrongDocumentVersion.valid, false);
+    });
+
     it('rebases a local insertion while applying a collaborator insertion to a dirty buffer', () => {
         const dirty = recordLocalEditorChange(
             bound(),
@@ -209,7 +238,7 @@ describe('realtime editor bridge', () => {
         );
     });
 
-    it('invalidates missed or multi-change local causality with zero usable OT', () => {
+    it('records exact multi-change local causality but invalidates a missed version', () => {
         const missed = recordLocalEditorChange(
             bound(),
             9,
@@ -222,15 +251,41 @@ describe('realtime editor bridge', () => {
             bound(),
             8,
             [
-                {rangeOffset: 0, rangeLength: 0, text: 'L'},
                 {rangeOffset: 3, rangeLength: 0, text: 'R'},
+                {rangeOffset: 0, rangeLength: 0, text: 'L'},
             ],
             'LabcR',
         );
-        assert.equal(multi.valid, false);
-        assert.throws(
-            () => prepareRemoteEditorTransaction(multi, 'blocked', 12, [{p: 0, i: 'X'}]),
-            /no exact remote\/local base/,
+        assert.equal(multi.valid, true);
+        assert.deepEqual(multi.pendingOperations, [{p: 3, i: 'R'}, {p: 0, i: 'L'}]);
+        assert.equal(
+            applyTextOperations(multi.remoteContent, multi.localOperations),
+            multi.editorContent,
+        );
+    });
+
+    it('keeps insert-then-delete input causally valid when the visible text returns to base', () => {
+        const inserted = recordLocalEditorChange(
+            bound(),
+            8,
+            [{rangeOffset: 3, rangeLength: 0, text: 'XYZ'}],
+            'abcXYZ',
+        );
+        const deleted = recordLocalEditorChange(
+            inserted,
+            9,
+            [{rangeOffset: 3, rangeLength: 3, text: ''}],
+            'abc',
+        );
+
+        assert.equal(deleted.valid, true);
+        assert.deepEqual(deleted.pendingOperations, [
+            {p: 3, i: 'XYZ'},
+            {p: 3, d: 'XYZ'},
+        ]);
+        assert.equal(
+            applyTextOperations(deleted.remoteContent, deleted.localOperations),
+            deleted.editorContent,
         );
     });
 
@@ -546,6 +601,61 @@ describe('realtime editor bridge', () => {
                 },
             ],
         });
+    });
+
+    it('records one exact multi-change event for a History OT document', () => {
+        const base = createHistoryRealtimeEditorBridgeState({
+            socketGeneration: 4,
+            remoteEpoch: 'history-epoch',
+            remoteVersion: 12,
+            remoteSnapshot: {content: 'abc'},
+            documentVersion: 7,
+            editorContent: 'abc',
+        });
+        const changed = recordHistoryLocalEditorChange(
+            base,
+            8,
+            [
+                {rangeOffset: 3, rangeLength: 0, text: 'Y'},
+                {rangeOffset: 0, rangeLength: 0, text: 'X'},
+            ],
+            'XabcY',
+        );
+
+        assert.equal(changed.valid, true);
+        assert.ok(changed.pending);
+        assert.equal(
+            getVisibleHistoryOtText(
+                applyHistoryOtOperations(changed.remoteSnapshot, changed.pending),
+            ),
+            'XabcY',
+        );
+    });
+
+    it('fails closed when rejoin-required History state has no sender commit witness', () => {
+        const base = createHistoryRealtimeEditorBridgeState({
+            socketGeneration: 4,
+            remoteEpoch: 'history-epoch',
+            remoteVersion: 12,
+            remoteSnapshot: {content: 'ab'},
+            documentVersion: 7,
+            editorContent: 'ab',
+        });
+        const malformed = {
+            ...base,
+            authority: 'rejoin-required' as const,
+            senderCommitWitness: undefined,
+        };
+
+        const changed = recordHistoryLocalEditorChange(
+            malformed,
+            8,
+            [{rangeOffset: 1, rangeLength: 0, text: 'L'}],
+            'aLb',
+        );
+
+        assert.equal(changed.valid, false);
+        assert.equal(changed.pending, undefined);
     });
 
     it('keeps History wire immutable through a remote interleave and later local input', () => {
@@ -985,6 +1095,79 @@ describe('realtime editor bridge', () => {
         assert.equal(reconciled.remoteVersion, 13);
         assert.equal(reconciled.socketGeneration, 5);
         assert.equal(reconciled.senderCommitWitness, undefined);
+        assert.ok(reconciled.pending);
+        assert.equal(
+            getVisibleHistoryOtText(
+                applyHistoryOtOperations(reconciled.remoteSnapshot, reconciled.pending),
+            ),
+            'aLb!',
+        );
+    });
+
+    it('preserves a History edit made after sender ACK while the fresh join is pending', () => {
+        const descriptor = {
+            kind: 'tracked-write' as const,
+            tracking: {userId: 'local-user', ts: historyTimestamp},
+        };
+        const base = createHistoryRealtimeEditorBridgeState({
+            socketGeneration: 4,
+            remoteEpoch: 'history-epoch',
+            remoteVersion: 12,
+            remoteSnapshot: {content: 'ab'},
+            documentVersion: 7,
+            editorContent: 'ab',
+        });
+        const dirty = recordHistoryLocalEditorChange(
+            base,
+            8,
+            [{rangeOffset: 1, rangeLength: 0, text: 'L'}],
+            'aLb',
+            descriptor,
+        );
+        const submitted = beginHistorySubmission(
+            dirty,
+            'sender-token',
+            dirty.pending!,
+            descriptor,
+        );
+        const acknowledged = acknowledgeHistorySubmission(
+            submitted,
+            'sender-token',
+            12,
+        );
+        const later = recordHistoryLocalEditorChange(
+            acknowledged,
+            9,
+            [{rangeOffset: 3, rangeLength: 0, text: '!'}],
+            'aLb!',
+            descriptor,
+        );
+
+        assert.equal(later.valid, true);
+        assert.equal(later.authority, 'rejoin-required');
+        assert.deepEqual(later.pendingWriteDescriptor, descriptor);
+        assert.ok(later.pending);
+        assert.equal(
+            getVisibleHistoryOtText(applyHistoryOtOperations(
+                later.senderCommitWitness!.predictedRemoteSnapshot,
+                later.pending,
+            )),
+            'aLb!',
+        );
+
+        const reconciled = reconcileHistoryEditorAfterJoin(later, {
+            socketGeneration: 5,
+            remoteEpoch: 'history-epoch-2',
+            remoteVersion: 13,
+            remoteSnapshot: serializeHistoryOtSnapshot(
+                later.senderCommitWitness!.predictedRemoteSnapshot,
+            ),
+            documentVersion: 9,
+            editorContent: 'aLb!',
+        });
+        assert.equal(reconciled.valid, true);
+        assert.equal(reconciled.authority, 'ready');
+        assert.deepEqual(reconciled.pendingWriteDescriptor, descriptor);
         assert.ok(reconciled.pending);
         assert.equal(
             getVisibleHistoryOtText(

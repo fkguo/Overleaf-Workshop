@@ -589,6 +589,7 @@ export function recordHistoryLocalEditorChange(
     descriptorInput?: HistoryEditorWriteDescriptor,
 ): HistoryRealtimeEditorBridgeState {
     const state = cloneHistoryState(stateInput);
+    const senderCommitWitness = state.senderCommitWitness;
     let descriptor: HistoryEditorWriteDescriptor;
     try {
         descriptor = normalizeWriteDescriptor(descriptorInput);
@@ -596,7 +597,8 @@ export function recordHistoryLocalEditorChange(
         return {...state, documentVersion, editorContent, valid: false};
     }
     if (!state.valid
-        || state.authority !== 'ready'
+        || (state.authority !== 'ready' && state.authority !== 'rejoin-required')
+        || (state.authority === 'rejoin-required' && senderCommitWitness === undefined)
         || !hasExactHistoryState(state)
         || documentVersion !== state.documentVersion + 1
         || !isWellFormedUtf16(editorContent)
@@ -626,10 +628,18 @@ export function recordHistoryLocalEditorChange(
         if (!prepared.mergeApplied || prepared.operation === undefined) {
             return {...state, documentVersion, editorContent, valid: false};
         }
-        const pendingBase = applyHistoryOtOperations(
-            state.remoteSnapshot,
-            state.inflightView ?? [],
-        );
+        let pendingBase: ParsedHistoryOtSnapshot;
+        if (state.authority === 'rejoin-required') {
+            if (senderCommitWitness === undefined) {
+                return {...state, documentVersion, editorContent, valid: false};
+            }
+            pendingBase = senderCommitWitness.predictedRemoteSnapshot;
+        } else {
+            pendingBase = applyHistoryOtOperations(
+                state.remoteSnapshot,
+                state.inflightView ?? [],
+            );
+        }
         const pending = state.pending === undefined
             ? cloneHistoryOperations(prepared.operation)!
             : composeHistoryOtOperationsWithSnapshot(
@@ -653,6 +663,41 @@ export function recordHistoryLocalEditorChange(
     } catch {
         return {...state, documentVersion, editorContent, valid: false};
     }
+}
+
+/**
+ * Rebind exact unsent operations to one freshly-authoritative clean base.
+ * The returned state is invalid unless the operations reproduce editorContent.
+ */
+export function rebindLocalEditorPendingOperations(
+    stateInput: RealtimeEditorBridgeState,
+    documentVersion: number,
+    editorContent: string,
+    operationsInput: readonly TextOperation[],
+): RealtimeEditorBridgeState {
+    const state = cloneState(stateInput);
+    let operations: TextOperation[];
+    try {
+        operations = operationsInput.map(cloneOperation);
+    } catch {
+        return {...state, documentVersion, editorContent, valid: false};
+    }
+    if (!state.valid
+        || !hasExactLocalState(state)
+        || state.inflightWire !== undefined
+        || state.pendingOperations.length !== 0
+        || documentVersion !== state.documentVersion
+        || operations.length === 0) {
+        return {...state, documentVersion, editorContent, valid: false};
+    }
+    const next: RealtimeEditorBridgeState = {
+        ...state,
+        documentVersion,
+        editorContent,
+        pendingOperations: operations.map(cloneOperation),
+        localOperations: operations.map(cloneOperation),
+    };
+    return hasExactLocalState(next) ? next : {...next, valid: false};
 }
 
 export function prepareHistoryRemoteEditorTransaction(
@@ -1213,6 +1258,21 @@ function oneReplacement(before: string, after: string): ObservedTextChange | und
         rangeLength: beforeEnd - prefix,
         text: after.slice(prefix, afterEnd),
     };
+}
+
+/**
+ * Derive one conservative replacement from two exact UTF-16 snapshots. This is
+ * suitable only when the caller owns a read witness for `before`; it does not
+ * infer ancestry from two otherwise unrelated strings.
+ */
+export function operationsFromContentSnapshots(
+    before: string,
+    after: string,
+): TextOperation[] | undefined {
+    if (!isWellFormedUtf16(before) || !isWellFormedUtf16(after)) { return undefined; }
+    const replacement = oneReplacement(before, after);
+    if (!replacement) { return before === after ? [] : undefined; }
+    return operationsFromObservedTextChanges(before, [replacement], after);
 }
 
 export function prepareRemoteEditorTransaction(

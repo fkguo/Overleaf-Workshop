@@ -19,6 +19,7 @@ import type {
     HistoryOtWriteIntent,
 } from '../core/historyOtSession';
 import {parseHistoryOtRealtimeEnvelope} from '../core/historyOtSession';
+import {hasUnsupportedOverleafTextInsertion} from '../core/documentUpdate';
 
 function decodePackedUtf8(text: string): string {
     return Buffer.from(text, 'latin1').toString('utf-8');
@@ -29,9 +30,9 @@ export interface UpdateUserSchema {
     user_id: string,
     name: string,
     email: string,
-    doc_id: string,
-    row: number,
-    column: number,
+    doc_id?: string,
+    row?: number,
+    column?: number,
     last_updated_at?: number, //unix timestamp
 }
 
@@ -40,9 +41,9 @@ export interface OnlineUserSchema {
     client_id: string,
     connected: boolean,
     cursorData?: {
-        column: number,
-        doc_id: string,
-        row: number,
+        column?: number,
+        doc_id?: string,
+        row?: number,
     },
     email: string,
     first_name: string,
@@ -1425,6 +1426,13 @@ export class SocketIOAPI {
         update:UpdateSchema,
         expectedSender: ProjectSenderWitness,
     ) {
+        if (hasUnsupportedOverleafTextInsertion(update.op ?? [])) {
+            throw new SocketRequestError(
+                'server_error',
+                'Overleaf cannot store NUL or non-BMP characters in text updates',
+                false,
+            );
+        }
         const activeScheme = this._socketInitScheme ?? this.scheme;
         if (this.projectSession?.protocolVersion !== SUPPORTED_PLAIN_OT_PROTOCOL_VERSION) {
             throw new SocketRequestError(
