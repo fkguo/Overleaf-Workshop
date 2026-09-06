@@ -847,7 +847,19 @@ export class BaseAPI {
         return this.request('POST', `project/${projectId}/settings`, setting);
     }
 
-    async getFileFromClsi(identity:Identity, url:string, compileGroup:string, clsiServerId?:string, pdfDownloadDomain?:string) {
+    async getFileFromClsi(identity:Identity, url:string, compileGroup:string, clsiServerId?:string, pdfDownloadDomain?:string, downloadURL?:string) {
+        // Cached outputs outlive the compilation VM. Overleaf provides a
+        // build-specific download route for them; url may still target an
+        // expired VM and must not be preferred over that durable route.
+        if (downloadURL) {
+            const downloadUrl = new URL(downloadURL, this.url);
+            if (downloadUrl.origin !== new URL(this.url).origin || downloadUrl.username || downloadUrl.password) {
+                throw new Error('Invalid compile download URL: expected the configured Overleaf origin');
+            }
+            this.setIdentity(identity);
+            const content = await this._downloadAbsolute(downloadUrl.href, true);
+            return {type: 'success' as const, content: new Uint8Array(content)};
+        }
         // If we have a CDN download domain, construct the full URL with required query params.
         // The CDN is cross-origin, so we must NOT send web frontend cookies.
         if (pdfDownloadDomain && clsiServerId) {

@@ -44,6 +44,7 @@
     const pdfLifecycle = OverleafPdfLifecycle.createController(PDFViewerApplication, {
         onError: (error, phase, generation) => {
             console.error(`PDF ${phase} failed for generation ${generation}`, error);
+            document.getElementById('overleaf-pdf-load-error').hidden = false;
         },
         onFatal: () => {
             vscode.postMessage({type: 'pdfLifecycleFatal'});
@@ -190,6 +191,7 @@
             backupPdfViewerState();
         }
         pdfLoadGeneration = generation;
+        document.getElementById('overleaf-pdf-load-error').hidden = true;
         readyPdfGeneration = 0;
         loadingPdfGeneration = 0;
         loadingPdfDocument = undefined;
@@ -269,12 +271,14 @@
         }
         const pdfGeneration = readyPdfGeneration;
         const pageCanvas = pageElem.querySelector('canvas');
+        const viewport = PDFViewerApplication.pdfViewer.getPageView(pageNum - 1)?.viewport;
+        if (!pageCanvas || !viewport) { return; }
         const pageRect = pageCanvas.getBoundingClientRect();
-        const {viewport} = PDFViewerApplication.pdfViewer.getPageView(pageNum - 1);
         const dx = clientX - pageRect.left;
         const dy = clientY - pageRect.top;
         let [left, top] = viewport.convertToPdfPoint(dx, dy);
         top = viewport.viewBox[3] - top;
+        if (!Number.isFinite(left) || !Number.isFinite(top)) { return; }
         vscode.postMessage({
             type: 'syncPdf',
             content: {
@@ -309,9 +313,15 @@
         });
 
         // add message listener
+        document.getElementById('overleaf-pdf-retry').addEventListener('click', () => {
+            vscode.postMessage({type: 'retryPdfDownload'});
+        });
         window.addEventListener('message', async (e) => {
             const message = e.data;
             switch (message.type) {
+                case 'pdfLoadError':
+                    document.getElementById('overleaf-pdf-load-error').hidden = message.failed !== true;
+                    break;
                 case 'update':
                     updatePdf(message.content, message.pdfGeneration);
                     break;
@@ -336,12 +346,14 @@
 
         // add mouse double click listener
         window.addEventListener('dblclick', (e) => {
-            const pageElem = e.target.parentElement.parentElement;
-            const pageNum = pageElem.getAttribute('data-page-number');
-            if (pageNum === null || pageNum === undefined) {
-                return;
-            }
-            syncPdf(pageElem, pageNum, e.clientX, e.clientY, e.target.innerText);
+            const target = e.target instanceof Element ? e.target : e.target?.parentElement;
+            // PDF.js text spans can be nested in marked-content wrappers;
+            // whitespace and canvas clicks have a different ancestor depth.
+            const pageElem = target?.closest('.page[data-page-number]');
+            if (!pageElem) { return; }
+            const pageNum = Number(pageElem.getAttribute('data-page-number'));
+            if (!Number.isSafeInteger(pageNum) || pageNum <= 0) { return; }
+            syncPdf(pageElem, pageNum, e.clientX, e.clientY, target.innerText ?? '');
         });
 
         window.addEventListener('pagehide', () => {

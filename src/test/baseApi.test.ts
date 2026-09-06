@@ -37,6 +37,53 @@ class DocumentResponseAPI extends BaseAPI {
 describe('BaseAPI route construction', () => {
     const identity = {csrfToken: 'csrf', cookies: 'session=cookie'};
 
+    it('uses the server-provided cached download route instead of an expired compile VM', async () => {
+        const api = new BaseAPI('https://www.overleaf.com/');
+        const requests: unknown[] = [];
+        (api as any)._downloadAbsolute = async (url: string, cookies: boolean) => {
+            requests.push({url, cookies});
+            return Buffer.from('%PDF-1.5\n');
+        };
+        const download = '/download/project/p/build/editor-build/output/cached/output.pdf';
+        const result = await api.getFileFromClsi(identity, '/expired/output.pdf', 'priority', 'expired-vm',
+            'https://compiles.overleafusercontent.com/zone/d', download);
+        assert.deepEqual(requests, [{url: `https://www.overleaf.com${download}`, cookies: true}]);
+        assert.equal(Buffer.from(result.content).toString(), '%PDF-1.5\n');
+    });
+
+    it('preserves the legacy CDN route without sending frontend cookies when downloadURL is absent', async () => {
+        const api = new BaseAPI('https://www.overleaf.com/');
+        const requests: unknown[] = [];
+        (api as any)._downloadAbsolute = async (url: string, cookies: boolean) => {
+            requests.push({url, cookies});
+            return Buffer.from('pdf');
+        };
+        await api.getFileFromClsi(identity, '/output.pdf', 'priority', 'vm', 'https://cdn.example.test');
+        assert.deepEqual(requests, [{
+            url: 'https://cdn.example.test/output.pdf?compileGroup=priority&clsiserverid=vm&enable_pdf_caching=true',
+            cookies: false,
+        }]);
+    });
+
+    it('keeps same-origin build and query information on self-hosted download routes', async () => {
+        const api = new BaseAPI('https://latex.example.test/sub/');
+        let requested: string | undefined;
+        (api as any)._downloadAbsolute = async (url: string) => { requested = url; return Buffer.from('pdf'); };
+        await api.getFileFromClsi(identity, '/vm', 'standard', undefined, undefined,
+            '/sub/download/project/p/build/b/output/cached/output.pdf?download=1');
+        assert.equal(requested, 'https://latex.example.test/sub/download/project/p/build/b/output/cached/output.pdf?download=1');
+    });
+
+    for (const downloadURL of ['https://other.test/pdf', '//other.test/pdf', 'http://www.overleaf.com/pdf',
+        'https://user:secret@www.overleaf.com/pdf', 'file:///pdf']) {
+        it(`rejects an unsafe supplied compile download URL: ${new URL(downloadURL, 'https://www.overleaf.com').protocol}`, async () => {
+            const api = new BaseAPI('https://www.overleaf.com/');
+            (api as any)._downloadAbsolute = async () => { throw new Error('Must not download'); };
+            await assert.rejects(api.getFileFromClsi(identity, '/vm', 'standard', undefined, undefined, downloadURL),
+                /expected the configured Overleaf origin/);
+        });
+    }
+
     it('does not classify a manual compile as an automatic compile', async () => {
         const api = new CapturingAPI('https://www.overleaf.com/');
         await api.compile(identity, 'project', 'main.tex', false, false, 'editor', false);

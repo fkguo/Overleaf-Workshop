@@ -391,9 +391,13 @@ describe('stale-buffer rollback safety', () => {
             _type: 'outputs',
             path: 'output.pdf',
             url: '/build/editor-build/output/output.pdf',
+            downloadURL: '/download/project/p/build/editor-build/output/cached/output.pdf',
         };
         harness.vfs._resolveUri = async () => ({fileType: 'outputs', fileEntity: outputEntity});
-        harness.vfs.api.getFileFromClsi = async () => ({type: 'success', content: undefined});
+        harness.vfs.api.getFileFromClsi = async (...args: any[]) => {
+            assert.equal(args[5], outputEntity.downloadURL, 'The cached route must reach the download API');
+            return {type: 'success', content: undefined};
+        };
         const {EventBus: eventBus} = require('../utils/eventBus') as typeof import('../utils/eventBus');
         const opened: unknown[] = [];
         const listener = eventBus.on('fileWillOpenEvent', event => opened.push(event.uri));
@@ -1202,6 +1206,240 @@ describe('stale-buffer rollback safety', () => {
         assert.equal(server.text(PROJECT_A), merged);
         harness.dispose();
     });
+
+    for (const scenario of ['missing-will-remote', 'outdated-will-remote', 'missing-will-local']) {
+        it(`completes an entry-bound save after live advancement: ${scenario}`, async () => {
+            const server = new DeterministicRealtimeServer();
+            addProject(server, 'abc', PROJECT_A, scenario, 5);
+            const harness = await createEventWiredProviderProject({
+                server,
+                storage: new HarnessStorage(),
+                windowId: scenario,
+                projectId: PROJECT_A,
+            });
+            try {
+                assert.equal(new TextDecoder().decode(await harness.provider.readFile(harness.uri)), 'abc');
+                const editor = new SimulatedDirtyEditor(harness.uri, 'abc');
+                editor.openClean(harness.events);
+                editor.editThroughEvents('abcL', harness.events);
+                if (scenario === 'outdated-will-remote') {
+                    harness.events.fireWillSave(editor.document);
+                    editor.editThroughEvents('abcLOCAL', harness.events);
+                }
+                const snapshot = editor.text;
+                const bufferId = harness.vfs.editorBufferIds.get(editor.document);
+                const originalWrite = harness.vfs.writeFile.bind(harness.vfs);
+                let advanced = false;
+                harness.vfs.writeFile = async (...args: unknown[]) => {
+                    if (!advanced && args[4] === bufferId) {
+                        advanced = true;
+                        if (scenario === 'missing-will-local') {
+                            editor.editThroughEvents(`${snapshot}ATER`, harness.events);
+                        } else {
+                            server.collaboratorUpdate(PROJECT_A, [{p: 0, i: 'Y'}]);
+                        }
+                    }
+                    return originalWrite(...args);
+                };
+                let recoveryPrompts = 0;
+                const originalRecovery = harness.vfs.showDocumentRecovery.bind(harness.vfs);
+                harness.vfs.showDocumentRecovery = (...args: unknown[]) => {
+                    recoveryPrompts += 1;
+                    return originalRecovery(...args);
+                };
+
+                await harness.provider.writeFile(
+                    harness.uri, new TextEncoder().encode(snapshot), {create: false, overwrite: true},
+                );
+
+                const expected = scenario === 'missing-will-local' ? `${snapshot}ATER` : `Y${snapshot}`;
+                assert.equal(advanced, true);
+                assert.equal(editor.text, expected);
+                assert.equal(server.text(PROJECT_A), expected);
+                assert.equal(server.capturedUpdates.length, 1, 'never send the obsolete whole-file snapshot');
+                assert.equal(recoveryPrompts, 0);
+                assert.equal(harness.vfs.pendingDocumentUpdates.size, 0);
+
+                // This call's entry proof is not permission to save the same stale
+                // bytes again (for example from workspace.fs or a second caller).
+                await assert.rejects(harness.provider.writeFile(
+                    harness.uri, new TextEncoder().encode(snapshot), {create: false, overwrite: true},
+                ), /no unique confirmed editor buffer/);
+                assert.equal(server.text(PROJECT_A), expected);
+                assert.equal(server.capturedUpdates.length, 1);
+            } finally {
+                harness.dispose();
+            }
+        });
+    }
+
+    for (const boundary of ['invalid-causality', 'pending-outcome', 'reopened-editor', 'dirty-alias', 'changed-session']) {
+        it(`rejects an entry-bound snapshot after ${boundary}`, async () => {
+            const server = new DeterministicRealtimeServer();
+            addProject(server, 'abc', PROJECT_A, boundary, 5);
+            const harness = await createEventWiredProviderProject({
+                server, storage: new HarnessStorage(), windowId: boundary, projectId: PROJECT_A,
+            });
+            try {
+                await harness.provider.readFile(harness.uri);
+                const editor = new SimulatedDirtyEditor(harness.uri, 'abc');
+                editor.openClean(harness.events);
+                editor.editThroughEvents('abcL', harness.events);
+                const bufferId = harness.vfs.editorBufferIds.get(editor.document);
+                const originalFlush = harness.vfs.flushLiveEditorSubmissionForUri.bind(harness.vfs);
+                harness.vfs.flushLiveEditorSubmissionForUri = async (...args: unknown[]) => {
+                    editor.editThroughEvents('abcLATER', harness.events);
+                    await originalFlush(...args);
+                    if (boundary === 'invalid-causality') {
+                        harness.vfs.activeEditorBases.get(bufferId).causality.valid = false;
+                    } else if (boundary === 'pending-outcome') {
+                        harness.vfs.pendingDocumentUpdates.set(bufferId, {docId: 'same-doc-id'});
+                    } else if (boundary === 'reopened-editor') {
+                        editor.closeThroughEvents(harness.events);
+                        const replacement = new SimulatedDirtyEditor(harness.uri, editor.text);
+                        replacement.attach();
+                    } else if (boundary === 'dirty-alias') {
+                        await harness.provider.readFile(harness.encodedUri);
+                        const alias = new SimulatedDirtyEditor(harness.encodedUri, 'unconfirmed draft');
+                        alias.attach();
+                    } else {
+                        const sender = harness.vfs.currentSenderWitness();
+                        harness.vfs.currentSenderWitness = () => ({...sender, generation: sender.generation + 1});
+                    }
+                };
+
+                await assert.rejects(harness.provider.writeFile(
+                    harness.uri, new TextEncoder().encode('abcL'), {create: false, overwrite: true},
+                ), /no unique confirmed editor buffer|multiple dirty editor buffers/);
+                assert.equal(server.text(PROJECT_A), 'abcLATER');
+                assert.equal(server.capturedUpdates.length, 1, 'only the proven live update may be sent');
+                assert.equal(editor.dirty, true, 'provider failure must not mark the editor saved');
+            } finally {
+                harness.dispose();
+            }
+        });
+    }
+
+    for (const willSave of [false, true]) {
+        it(`does not claim an old entry snapshot was saved after an explicit remote-base reset (willSave=${willSave})`, async () => {
+            const server = new DeterministicRealtimeServer();
+            addProject(server, 'abc', PROJECT_A, 'Entry Reset', 5);
+            const harness = await createEventWiredProviderProject({
+                server, storage: new HarnessStorage(), windowId: 'entry-reset', projectId: PROJECT_A,
+            });
+            try {
+                await harness.provider.readFile(harness.uri);
+                const editor = new SimulatedDirtyEditor(harness.uri, 'abc');
+                editor.openClean(harness.events);
+                editor.editThroughEvents('abcL', harness.events);
+                if (willSave) { harness.events.fireWillSave(editor.document); }
+                const originalFlush = harness.vfs.flushLiveEditorSubmissionForUri.bind(harness.vfs);
+                harness.vfs.flushLiveEditorSubmissionForUri = async (...args: unknown[]) => {
+                    // Model an explicit confirmed reload while Cmd+S is waiting.
+                    // The discarded local L was not sent, so the older save must
+                    // not report success merely because the new base is synced.
+                    editor.refreshThroughEvents('abc', harness.events);
+                    assert.equal(await harness.vfs.confirmEditorBase(editor.document), true);
+                    return originalFlush(...args);
+                };
+                await assert.rejects(harness.provider.writeFile(
+                    harness.uri, new TextEncoder().encode('abcL'), {create: false, overwrite: true},
+                ), /no unique confirmed editor buffer/);
+                assert.equal(server.text(PROJECT_A), 'abc');
+                assert.equal(server.capturedUpdates.length, 0);
+            } finally {
+                harness.dispose();
+            }
+        });
+    }
+
+    it('completes an entry-bound save with further typing while the first ACK is pending', async () => {
+        const server = new DeterministicRealtimeServer();
+        addProject(server, 'abc', PROJECT_A, 'Entry Pending Ack', 5);
+        const harness = await createEventWiredProviderProject({
+            server, storage: new HarnessStorage(), windowId: 'entry-pending-ack', projectId: PROJECT_A,
+        });
+        let releaseAck!: () => void;
+        let reachAck!: () => void;
+        const ackGate = new Promise<void>(resolve => { releaseAck = resolve; });
+        const ackReached = new Promise<void>(resolve => { reachAck = resolve; });
+        try {
+            await harness.provider.readFile(harness.uri);
+            const editor = new SimulatedDirtyEditor(harness.uri, 'abc');
+            editor.openClean(harness.events);
+            editor.editThroughEvents('abcL', harness.events);
+            const originalApply = harness.socket.applyOtUpdate.bind(harness.socket);
+            let holdAck = true;
+            harness.socket.applyOtUpdate = async (...args: Parameters<typeof originalApply>) => {
+                await originalApply(...args);
+                if (holdAck) {
+                    holdAck = false;
+                    reachAck();
+                    await ackGate;
+                }
+            };
+            let recoveryPrompts = 0;
+            const originalRecovery = harness.vfs.showDocumentRecovery.bind(harness.vfs);
+            harness.vfs.showDocumentRecovery = (...args: unknown[]) => {
+                recoveryPrompts += 1;
+                return originalRecovery(...args);
+            };
+
+            const saving = harness.provider.writeFile(
+                harness.uri, new TextEncoder().encode('abcL'), {create: false, overwrite: true},
+            );
+            await ackReached;
+            // The queue ACK and the authoritative application are separate
+            // fixture phases; let the queued operation commit while its ACK
+            // remains withheld from the provider.
+            await settleAsyncWork();
+            assert.equal(server.text(PROJECT_A), 'abcL');
+            editor.editThroughEvents('abcLATER', harness.events);
+            releaseAck();
+            await saving;
+
+            assert.equal(server.text(PROJECT_A), 'abcLATER');
+            assert.equal(editor.text, 'abcLATER');
+            assert.equal(server.capturedUpdates.length, 2);
+            assert.deepEqual(server.capturedUpdates[1].update.op, [{p: 4, i: 'ATER'}]);
+            assert.equal(harness.vfs.pendingDocumentUpdates.size, 0);
+            assert.equal(recoveryPrompts, 0);
+        } finally {
+            releaseAck();
+            harness.dispose();
+        }
+    });
+
+    for (const committed of [false, true]) {
+        it(`does not complete an entry-bound save on a lost ACK (committed=${committed})`, async () => {
+            const server = new DeterministicRealtimeServer();
+            addProject(server, 'abc', PROJECT_A, 'Entry Lost Ack', 5);
+            const harness = await createEventWiredProviderProject({
+                server, storage: new HarnessStorage(), windowId: 'entry-lost-ack', projectId: PROJECT_A,
+            });
+            try {
+                await harness.provider.readFile(harness.uri);
+                const editor = new SimulatedDirtyEditor(harness.uri, 'abc');
+                editor.openClean(harness.events);
+                editor.editThroughEvents('abcL', harness.events);
+                if (committed) { server.loseNextAckAfterCommit(); }
+                else { server.loseNextAckBeforeCommit(); }
+
+                await assert.rejects(harness.provider.writeFile(
+                    harness.uri, new TextEncoder().encode('abcL'), {create: false, overwrite: true},
+                ), (error: any) => error instanceof SocketRequestError && error.outcomeUnknown);
+
+                assert.equal(editor.dirty, true);
+                assert.equal(editor.text, 'abcL');
+                assert.equal(server.text(PROJECT_A), committed ? 'abcL' : 'abc');
+                assert.equal(server.capturedUpdates.length, 1, 'the uncertain update must not be resent');
+                assert.equal(harness.vfs.pendingDocumentUpdates.size, 1);
+                await settleAsyncWork();
+            } finally {
+                harness.dispose();
+            }
+        });
+    }
 
     it('keeps a failed background live write silent but lets Cmd+S own recovery UI', async () => {
         const base = 'abc';

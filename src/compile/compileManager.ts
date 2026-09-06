@@ -37,6 +37,7 @@ type PdfViewRecord = {
     webviewPanel: vscode.WebviewPanel,
     ready: boolean,
     syncableGeneration?: number,
+    reloadRequested?: boolean,
 };
 
 const pdfViewRecord: {
@@ -96,6 +97,10 @@ type CapturedCompileSourceSync = PendingSourceSync & {
     sourceDocumentVersion: number,
     selectionLine: number,
     selectionCharacter: number,
+    sourceDocuments: ReadonlyArray<{
+        document: vscode.TextDocument,
+        version: number,
+    }>,
 };
 
 type PdfCompileTransition = {
@@ -116,6 +121,7 @@ type PendingCompiledPdfRefresh = {
     autoSourceGeneration?: number,
     refreshGeneration?: number,
     refreshRecord?: PdfViewRecord,
+    refreshPromise?: Promise<void>,
 };
 
 const pendingCompiledPdfRefresh: {
@@ -603,12 +609,16 @@ export class CompileManager {
             pendingCompiledPdfRefresh[identifier] !== pendingRefresh ||
             !compiledPdfBuildRequests.isCurrent(identifier, pendingRefresh.buildGeneration)
         ) { return; }
+        if (pendingRefresh.refreshRecord === record && pendingRefresh.refreshPromise) {
+            return pendingRefresh.refreshPromise;
+        }
+        record.reloadRequested = false;
         pendingRefresh.refreshRecord = record;
         const pdfPath = `${OUTPUT_FOLDER_NAME}/output.pdf`;
         const recordKey = pdfRecordKey(identifier, pdfPath);
         const refreshGeneration = pdfRefreshRequests.begin(recordKey);
         pendingRefresh.refreshGeneration = refreshGeneration;
-        void this.refreshCompiledPdf(
+        const refreshing = this.refreshCompiledPdf(
             identifier,
             record,
             refreshGeneration,
@@ -626,8 +636,11 @@ export class CompileManager {
             ) {
                 delete pendingSourceSync[recordKey];
                 pendingRefresh.refreshGeneration = undefined;
+                pendingRefresh.refreshPromise = undefined;
             }
         });
+        pendingRefresh.refreshPromise = refreshing;
+        return refreshing;
     }
 
     private async refreshCompiledPdf(
@@ -674,23 +687,27 @@ export class CompileManager {
         // Source resolution is optional navigation work and must not extend the
         // compile run. The generation, record and editor witnesses below keep
         // the detached request bound to this exact PDF refresh.
-        void capturedSourcePromise.then(capturedSource => {
-            if (
-                !capturedSource ||
-                capturedSource.identifier !== identifier ||
-                pdfViewRecord[identifier]?.[pdfPath] !== record ||
-                !isPdfGenerationSyncable(record, pdfGeneration) ||
-                !compiledPdfBuildRequests.isCurrent(identifier, pendingRefresh.buildGeneration) ||
-                !pdfRefreshRequests.isCurrent(recordKey, refreshGeneration) ||
-                !sourceSyncRequests.isCurrent(recordKey, requestGeneration) ||
-                !this.isCapturedCompileSourceStillApplicable(capturedSource)
-            ) { return; }
-            return this.requestSourceSync(capturedSource, {
-                requestGeneration,
-                expectedRecord: record,
-                expectedPdfGeneration: pdfGeneration,
-                isStillApplicable: () => this.isCapturedCompileSourceStillApplicable(capturedSource),
-            });
+        void capturedSourcePromise.then(async capturedSource => {
+            if (!capturedSource || capturedSource.identifier !== identifier) { return; }
+            const isCurrent = () => pdfViewRecord[identifier]?.[pdfPath] === record
+                && isPdfGenerationSyncable(record, pdfGeneration)
+                && compiledPdfBuildRequests.isCurrent(identifier, pendingRefresh.buildGeneration)
+                && pdfRefreshRequests.isCurrent(recordKey, refreshGeneration)
+                && sourceSyncRequests.isCurrent(recordKey, requestGeneration);
+            // Choose the current viewport, not the cursor captured before the
+            // build. One follow-up handles navigation during the SyncTeX read;
+            // never poll continuously or supersede a newer manual request.
+            for (let attempt = 0; attempt < 2 && isCurrent(); attempt += 1) {
+                const source = await this.refreshCompileSourceSync(capturedSource);
+                if (!source || !isCurrent()) { return; }
+                await this.requestSourceSync(source, {
+                    requestGeneration,
+                    expectedRecord: record,
+                    expectedPdfGeneration: pdfGeneration,
+                    isStillApplicable: () => this.isCapturedCompileSourceStillApplicable(source),
+                });
+                if (this.isCapturedCompileSourceStillApplicable(source)) { return; }
+            }
         }).catch(error => {
             // SyncTeX is an optional navigation aid. A missing map or transient
             // proxy failure must not turn a successful compile into a failure.
@@ -855,12 +872,14 @@ export class CompileManager {
         requestedSourcePromise?: Promise<CapturedCompileSourceSync | undefined>,
     ) {
         const requestKind = compileRequestKindForTrigger(trigger);
-        // Snapshot the source at the trigger boundary. A manual request which
-        // occupies the single pending slot must retain the cursor which was
-        // clicked, not whichever editor is active when that slot later runs.
-        const capturedSourcePromise = requestedSourcePromise ??
-            this.captureCompileSourceSync().catch(() => undefined);
+        // Pin source identities at the trigger boundary, including queued runs.
+        // The viewport is selected later, after this build's PDF is refreshed.
+        let capturedSourcePromise = requestedSourcePromise ??
+            this.captureCompileSourceSync(requestedUri).catch(() => undefined);
         if (this.compileRunGate.active || this.stoppingCompile) {
+            // Prefetch can emit initial-project during a read-only preview
+            // restore. Never turn that notification into a queued save/build.
+            if (trigger === 'initial-project') { return; }
             // Coalesce every trigger which arrives during an active run. In
             // particular, a save during the initial cache probe must result in
             // a fresh build after that probe finishes.
@@ -975,6 +994,10 @@ export class CompileManager {
                     // changes compile settings, or explicitly requests a build.
                     return;
                 }
+                // Save participants may have changed the source before the
+                // request. Pin the clean document versions actually submitted,
+                // without allowing a reopened editor to inherit an old identity.
+                capturedSourcePromise = this.pinCompileSourceVersions(capturedSourcePromise);
                 const result = await vfs.compile(
                     force,
                     this.compileAsDraft,
@@ -1028,6 +1051,84 @@ export class CompileManager {
         });
 
         await this.runPendingCompile();
+        await this.resumeRequestedPdfReloads();
+    }
+
+    private async resumeRequestedPdfReloads() {
+        if (this.inCompiling || this.stoppingCompile) { return; }
+        for (const records of Object.values(pdfViewRecord)) {
+            for (const record of Object.values(records)) {
+                if (record.reloadRequested) { await this.refreshPdf(record.doc); }
+            }
+        }
+    }
+
+    /** Restore a preview without saving editors or starting a server compile. */
+    async refreshPdf(doc: PdfDocument): Promise<void> {
+        if (doc?.uri?.scheme !== ROOT_NAME) { return; }
+        const {identifier, pathParts} = parseUri(doc.uri);
+        const filePath = pathParts.join('/');
+        if (filePath !== `${OUTPUT_FOLDER_NAME}/output.pdf`) { return; }
+        const record = pdfViewRecord[identifier]?.[filePath];
+        if (!record || record.doc !== doc) { return; }
+        const pending = pendingCompiledPdfRefresh[identifier];
+        if (pending?.refreshRecord === record && pending.refreshPromise) {
+            await pending.refreshPromise;
+            // Readiness can arrive while the first startup download is still
+            // running. If it fails, retry that verified build once in this tab.
+            if (pdfViewRecord[identifier]?.[filePath] === record
+                && pendingCompiledPdfRefresh[identifier] === pending
+                && compiledPdfBuildRequests.isCurrent(identifier, pending.buildGeneration)) {
+                await this.startCompiledPdfRefresh(identifier, record, pending);
+            }
+            return;
+        }
+        // Startup/cache adoption and a real compile own the output identity
+        // while running. Defer, rather than racing or turning this into a save.
+        if (this.inCompiling || this.stoppingCompile) {
+            record.reloadRequested = true;
+            return;
+        }
+        record.reloadRequested = false;
+        await this.compileRunGate.run(async isRunCurrent => {
+            const isCurrent = () => isRunCurrent() && pdfViewRecord[identifier]?.[filePath] === record;
+            if (!isCurrent()) { return; }
+            const queued = pendingCompiledPdfRefresh[identifier];
+            if (queued && compiledPdfBuildRequests.isCurrent(identifier, queued.buildGeneration)) {
+                await this.startCompiledPdfRefresh(identifier, record, queued);
+                return;
+            }
+            const transition = this.invalidateCompiledPdf(identifier);
+            try {
+                const vfs = await this.vfsm.prefetch(doc.uri);
+                if (!isCurrent()) { return; }
+                this.captureOutputIdentityWitness(transition, vfs);
+                // Dirty/hot-exit TeX does not prevent displaying a remote PDF;
+                // preserve source dirt and never claim it is that draft's build.
+                const hasCurrentBuild = !transition.priorBuildUnverified
+                    && transition.previousSyncableGeneration !== undefined
+                    && vfs.outputIdentityGeneration > 0;
+                // A known current build is stronger than an optional cache
+                // endpoint, which can still lag a just-completed compilation.
+                const cached = hasCurrentBuild ? undefined : await vfs.adoptCachedCompile(
+                    this.compileAsDraft, this.compileStopOnFirstError, undefined, isCurrent, false,
+                );
+                if (!isCurrent()) { return; }
+                if (cached?.successful || (hasCurrentBuild && this.isOutputIdentityUnchanged(transition))) {
+                    this.scheduleCompiledPdfRefresh(identifier, transition.buildGeneration,
+                        transition.autoSourceGeneration, undefined);
+                    await pendingCompiledPdfRefresh[identifier]?.refreshPromise;
+                } else {
+                    console.warn('Overleaf PDF restore: no verified compiled output is available; compile the project to create one.');
+                }
+            } catch (error) {
+                // Keep old bytes visible but never attach an unverified build's
+                // coordinates. A later reload can retry the read-only probe.
+                console.warn('Unable to restore the Overleaf PDF preview.', error);
+            }
+        });
+        await this.runPendingCompile();
+        await this.resumeRequestedPdfReloads();
     }
 
     private async runPendingCompile() {
@@ -1134,16 +1235,48 @@ export class CompileManager {
         return this.isManualSourceStillApplicable(capturedSource) ? capturedSource : undefined;
     }
 
-    private async captureCompileSourceSync(): Promise<CapturedCompileSourceSync | undefined> {
-        const editor = vscode.window.activeTextEditor;
+    private compileSourceEditor(identifier?: string, preferred?: vscode.TextDocument): vscode.TextEditor | undefined {
+        const isTex = (editor: vscode.TextEditor) => editor.document.uri.scheme === ROOT_NAME
+            && editor.document.uri.path.toLowerCase().endsWith('.tex');
+        const active = vscode.window.activeTextEditor;
+        // Do not move another project's PDF while the user is working in TeX.
+        if (active?.document.uri.scheme === ROOT_NAME && identifier
+            && parseUri(active.document.uri).identifier !== identifier) { return undefined; }
+        if (active && isTex(active)) {
+            return !identifier || parseUri(active.document.uri).identifier === identifier ? active : undefined;
+        }
+        const visible = vscode.window.visibleTextEditors.filter(editor => isTex(editor)
+            && (!identifier || parseUri(editor.document.uri).identifier === identifier));
+        const preferredEditors = visible.filter(editor => editor.document === preferred);
+        return preferredEditors.length === 1 ? preferredEditors[0] : visible.length === 1 ? visible[0] : undefined;
+    }
+
+    private visibleSourcePosition(editor: vscode.TextEditor): {line: number, character: number} {
+        const position = editor.selection.active;
+        const ranges = editor.visibleRanges;
+        if (!ranges?.length || ranges.some(range =>
+            (position.line > range.start.line || (position.line === range.start.line && position.character >= range.start.character))
+            && (position.line < range.end.line || (position.line === range.end.line && position.character <= range.end.character))
+        )) { return {line: position.line, character: position.character}; }
+        const first = ranges[0];
+        const lastLine = first.end.line > first.start.line && first.end.character === 0 ? first.end.line - 1 : first.end.line;
+        return {line: Math.floor((first.start.line + lastLine) / 2), character: 0};
+    }
+
+    private async captureCompileSourceSync(requestedUri?: vscode.Uri): Promise<CapturedCompileSourceSync | undefined> {
+        const identifier = requestedUri?.scheme === ROOT_NAME ? parseUri(requestedUri).identifier : undefined;
+        const editor = this.compileSourceEditor(identifier);
         if (!editor) { return undefined; }
         const sourceDocument = editor.document;
         const sourceUri = sourceDocument.uri;
-        if (sourceUri.scheme !== ROOT_NAME || !sourceUri.path.toLowerCase().endsWith('.tex')) {
-            return undefined;
-        }
-        const selectionLine = editor.selection.active.line;
-        const selectionCharacter = editor.selection.active.character;
+        const sourceIdentifier = parseUri(sourceUri).identifier;
+        const sourceDocuments = vscode.workspace.textDocuments.filter(document =>
+            document.uri.scheme === ROOT_NAME && document.uri.path.toLowerCase().endsWith('.tex')
+            && parseUri(document.uri).identifier === sourceIdentifier,
+        ).map(document => ({document, version: document.version}));
+        const position = this.visibleSourcePosition(editor);
+        const selectionLine = position.line;
+        const selectionCharacter = position.character;
         const sourceDocumentVersion = sourceDocument.version;
         const source = await this.resolveSourceSync(sourceUri, {
             line: selectionLine,
@@ -1157,19 +1290,53 @@ export class CompileManager {
             sourceDocumentVersion,
             selectionLine,
             selectionCharacter,
+            sourceDocuments,
         };
     }
 
+    private pinCompileSourceVersions(sourcePromise: Promise<CapturedCompileSourceSync | undefined>) {
+        const versions = new Map(vscode.workspace.textDocuments.filter(document => !document.isDirty && !document.isClosed)
+            .map(document => [document, document.version]));
+        return sourcePromise.then(source => source && ({
+            ...source,
+            sourceDocuments: source.sourceDocuments.filter(entry => versions.has(entry.document))
+                .map(entry => ({document: entry.document, version: versions.get(entry.document)!})),
+        }));
+    }
+
+    private async refreshCompileSourceSync(source: CapturedCompileSourceSync): Promise<CapturedCompileSourceSync | undefined> {
+        const editor = this.compileSourceEditor(source.identifier, source.sourceDocument);
+        const witness = editor && source.sourceDocuments.find(entry => entry.document === editor.document);
+        if (!editor || !witness || editor.document.isClosed || editor.document.isDirty
+            || editor.document.version !== witness.version
+            || !vscode.workspace.textDocuments.includes(editor.document)) {
+            console.debug('Overleaf automatic PDF sync skipped: no visible source with an unchanged compiled version.');
+            return undefined;
+        }
+        const position = this.visibleSourcePosition(editor);
+        const location = await this.resolveSourceSync(editor.document.uri, position);
+        return location && location.identifier === source.identifier ? {
+            ...source, ...location,
+            sourceDocument: editor.document,
+            sourceUri: editor.document.uri,
+            sourceDocumentVersion: witness.version,
+            selectionLine: position.line,
+            selectionCharacter: position.character,
+        } : undefined;
+    }
+
     private isCapturedCompileSourceStillApplicable(source: CapturedCompileSourceSync): boolean {
-        const editor = vscode.window.activeTextEditor;
+        const editor = this.compileSourceEditor(source.identifier, source.sourceDocument);
+        const position = editor && this.visibleSourcePosition(editor);
         return Boolean(
             editor &&
             editor.document === source.sourceDocument &&
+            !editor.document.isClosed && !editor.document.isDirty &&
             editor.document.uri.toString() === source.sourceUri.toString() &&
             editor.document.version === source.sourceDocumentVersion &&
             vscode.workspace.textDocuments.includes(source.sourceDocument) &&
-            editor.selection.active.line === source.selectionLine &&
-            editor.selection.active.character === source.selectionCharacter
+            position?.line === source.selectionLine &&
+            position.character === source.selectionCharacter
         );
     }
 
@@ -1349,12 +1516,11 @@ export class CompileManager {
         await this.requestSourceSync(source);
     }
 
-    private _revealSelectionInEditor(editor: vscode.TextEditor, targetLine: number, identifier: string) {
-        const _identifier = identifier.replace(/\s+/g, '\\s+');
+    private _revealSelectionInEditor(editor: vscode.TextEditor, targetLine: number, identifier?: string) {
         // targetLine is 1-based from the syncTeX result
         const lineIndex = targetLine - 1;
 
-        if (lineIndex < 0 || lineIndex >= editor.document.lineCount) {
+        if (!Number.isSafeInteger(targetLine) || lineIndex < 0 || lineIndex >= editor.document.lineCount) {
             console.warn(`${ELEGANT_NAME}: Invalid line number ${targetLine} for revealing in editor. Document has ${editor.document.lineCount} lines.`);
             // Optionally, just focus the editor if the line is invalid
             vscode.window.showTextDocument(editor.document, { viewColumn: editor.viewColumn, preserveFocus: false });
@@ -1362,7 +1528,11 @@ export class CompileManager {
         }
 
         const lineText = editor.document.lineAt(lineIndex).text;
-        const match = lineText.match(_identifier);
+        // PDF text is a literal hint, not a regular expression. SyncTeX's line
+        // remains usable when a formula/blank area has no matching text hint.
+        const pattern = typeof identifier === 'string' ? identifier
+            .replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+') : '';
+        const match = pattern ? lineText.match(new RegExp(pattern)) : undefined;
         const matchIndex = match?.index ?? 0;
 
         let newSelections: vscode.Selection[];
@@ -1406,10 +1576,19 @@ export class CompileManager {
             );
             if (!isCurrentPdf()) { return; }
 
+            // A double-click is a new navigation intent, just like Jump to PDF.
+            // Neither an older forward response nor an older double-click may
+            // move the user back after this request.
+            const recordKey = pdfRecordKey(identifier, filePath);
+            const requestGeneration = sourceSyncRequests.begin(recordKey);
+            delete pendingSourceSync[recordKey];
+            delete pendingPdfSync[recordKey];
+            const isCurrentRequest = () => isCurrentPdf()
+                && sourceSyncRequests.isCurrent(recordKey, requestGeneration);
             const vfs = await this.vfsm.prefetch(r.uri);
-            if (!isCurrentPdf()) { return; }
+            if (!isCurrentRequest()) { return; }
             const res = await vfs.syncPdf(r.page, r.h, r.v);
-            if (!res || !isCurrentPdf()) { return; }
+            if (!res || !isCurrentRequest()) { return; }
 
             const { file, line } = res;
             const normalizedFile = normalizeSynctexResultPath(file);
@@ -1426,12 +1605,12 @@ export class CompileManager {
             const viewColumnToUse = existingEditor?.viewColumn ??
                 vscode.window.visibleTextEditors.at(-1)?.viewColumn ?? vscode.ViewColumn.Beside;
 
-            if (!isCurrentPdf()) { return; }
+            if (!isCurrentRequest()) { return; }
             const openedEditor = await vscode.window.showTextDocument(
                 fileUri,
                 {viewColumn: viewColumnToUse, preserveFocus: false},
             );
-            if (openedEditor && isCurrentPdf()) {
+            if (openedEditor && isCurrentRequest()) {
                 this._revealSelectionInEditor(openedEditor, line, r.identifier);
             }
         } catch (error) {
@@ -1541,6 +1720,7 @@ export class CompileManager {
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.viewPdf`, () =>  this.openPdf()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.syncCode`, () => this.syncCode()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.syncPdf`, (r) => this.syncPdf(r)),
+            vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.refreshPdf`, (doc: PdfDocument) => this.refreshPdf(doc)),
             vscode.commands.registerCommand(`${ROOT_NAME}.compilerManager.settings`, ()=> this.compileSettings()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.setCompiler`, () => this.setCompiler()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.setRootDoc`, () => this.setRootDoc()),

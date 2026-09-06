@@ -32,6 +32,11 @@ export function activate(context: vscode.ExtensionContext) {
     const langIntellisenseProvider = new LangIntellisenseProvider(context, remoteFileSystemProvider);
     context.subscriptions.push( ...langIntellisenseProvider.triggers );
 
+    // Start only after the PDF provider and compile commands are registered.
+    // Do not await restoration from activate: VS Code may need activation to
+    // finish before it can resolve an existing custom editor.
+    context.subscriptions.push(pdfViewEditorProvider.restoreOpenEditors());
+
     // activate vfs for local replica
     LocalReplicaSCMProvider.readSettings()
     .then(async setting => {

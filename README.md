@@ -1,15 +1,37 @@
 # Overleaf Workshop
 
-[![GitHub Repo stars](https://img.shields.io/github/stars/overleaf-workshop/Overleaf-Workshop)](https://github.com/overleaf-workshop/Overleaf-Workshop)
-[![version](https://vsmarketplacebadges.dev/version-short/iamhyc.overleaf-workshop.jpg)](https://marketplace.visualstudio.com/items?itemName=iamhyc.overleaf-workshop)
-[![installs](https://vsmarketplacebadges.dev/installs-short/iamhyc.overleaf-workshop.jpg)](https://marketplace.visualstudio.com/items?itemName=iamhyc.overleaf-workshop)
-[![rating](https://vsmarketplacebadges.dev/rating-short/iamhyc.overleaf-workshop.jpg)](https://marketplace.visualstudio.com/items?itemName=iamhyc.overleaf-workshop&ssr=false#review-details)
+[![Fork release](https://img.shields.io/github/v/release/fkguo/Overleaf-Workshop)](https://github.com/fkguo/Overleaf-Workshop/releases/latest)
 
-Open Overleaf (ShareLatex) projects in VSCode, with full collaboration support.
+Open Overleaf (ShareLaTeX) projects in VS Code and Cursor, with realtime collaborative editing and integrated PDF previews.
+
+This is the [fkguo fork](https://github.com/fkguo/Overleaf-Workshop) of [Overleaf Workshop](https://github.com/overleaf-workshop/Overleaf-Workshop), with modifications last updated on 2026-09-06. Its GitHub releases are separate from upstream and the Marketplace extension; they are not endorsed by upstream or Overleaf.
+
+### Install this fork
+
+1. Download `overleaf-workshop-0.16.0.vsix` from the [fork release](https://github.com/fkguo/Overleaf-Workshop/releases/tag/v0.16.0). A SHA-256 checksum file is provided alongside it.
+2. In VS Code or Cursor, run **Extensions: Install from VSIX...** and select the downloaded file. This fork retains the extension ID `iamhyc.overleaf-workshop`, so it replaces that installation rather than installing a second extension.
+3. Preserve any unsaved work, then run **Developer: Reload Window**. If updating an earlier build of the same version, reinstall the new VSIX even though the displayed version is unchanged. From a terminal, `code --install-extension <path-to-vsix> --force` or `cursor --install-extension <path-to-vsix> --force` can force replacement.
+
+Disable automatic updates for this extension if you want to keep using the fork: a Marketplace update can replace it with the upstream build. See [CHANGELOG.md](./CHANGELOG.md) for changes in this fork.
+
+### Collaboration, history, and recovery
+
+- Text is synchronized while typing; an explicit save is not required for every collaboration update. Saves and realtime updates retain checks against stale or unconfirmed document state.
+- In **History**, open a version comparison and hover over a changed block to see participants and the change interval when the server supplies that information. A block's participant list is not necessarily authorship for every individual character. The History sidebar remains available while browsing comparisons.
+- History OT editing and Track Changes data are supported on compatible sessions. **Accepting or rejecting tracked changes is not enabled in this fork**; use the Overleaf web editor for those actions.
+- If a save is blocked, keep the local draft and use **Save Recovery Copy...** before replacing it. **Reload Remote** is offered only when the editor has a resolvable remote binding and the connection is ready; the target is checked again before replacement. An unbound restored draft can instead use **Compare with Remote** to inspect read-only snapshots, then save a local copy and explicitly confirm a reload. Reading or comparing remote text does not authorize uploading the draft.
+- Ambiguous or unconfirmed writes remain blocked. The supported text-update path also rejects NUL and non-BMP characters locally, retaining the editor text for recovery. Ordinary Chinese characters in the BMP are supported.
+
+### Compilation and PDF navigation
+
+- **Compile Project** requests a build even when the source is unchanged. **View Compiled PDF** opens the preview beside the source.
+- After compilation, automatic PDF navigation uses the visible, unchanged source associated with that build: the cursor when visible, otherwise a position in the visible source region. Double-click the PDF to jump back to the source. Navigation requires a valid PDF and its matching SyncTeX data.
+- Reloading a preview or restarting the extension host refreshes available compiled output and restores the source/PDF split without implicitly saving source files or starting a new compile. If no compiled output is available, run **Compile Project**.
+- A failed PDF download retains the last loaded preview and offers **Retry PDF download**. Unverified output is not used for SyncTeX navigation.
 
 ### User Guide
 
-The full user guide is available at [GitHub Wiki](https://github.com/overleaf-workshop/Overleaf-Workshop/wiki).
+The [upstream user guide](https://github.com/overleaf-workshop/Overleaf-Workshop/wiki) covers general usage. The fork-specific behavior and limitations are described above.
 
 ### Features
 
@@ -55,7 +77,7 @@ In an already logged-in browser (Firefox for example):
 
 ### Compatibility
 
-The following Overleaf (ShareLatex) Community Edition docker images provided on [Docker Hub](https://hub.docker.com/r/sharelatex/sharelatex) have been tested and verified to be compatible with this extension.
+The following is the upstream compatibility list for Overleaf (ShareLaTeX) Community Edition images on [Docker Hub](https://hub.docker.com/r/sharelatex/sharelatex). It is not a new certification of every fork feature on each server version; protocol-dependent features require server support.
 
 - [x] [sharelatex/sharelatex:5.0.4](https://hub.docker.com/layers/sharelatex/sharelatex/5.0.4/images/sha256-429f6c4c02d5028172499aea347269220fb3505cbba2680f5c981057ffa59316?context=explore) (verified by [@Mingbo-Lee](https://github.com/Mingbo-Lee))
 
@@ -78,6 +100,12 @@ The following Overleaf (ShareLatex) Community Edition docker images provided on 
 ### Development
 
 Please refer to the development guidance in [CONTRIBUTING.md](./CONTRIBUTING.md)
+
+### License and source
+
+This modified version is distributed under the [GNU Affero General Public License, version 3](./LICENSE), without warranty as described in that license. Existing copyright and license notices are retained; third-party components retain their own licenses and notices.
+
+Each [fork release](https://github.com/fkguo/Overleaf-Workshop/releases) links the source commit corresponding to its VSIX. The repository includes the extension source, dependency manifests, patches, and build scripts; follow [CONTRIBUTING.md](./CONTRIBUTING.md) to build it. See [CHANGELOG.md](./CHANGELOG.md) for the changes from upstream.
 
 ### References
 

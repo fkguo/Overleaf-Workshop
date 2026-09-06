@@ -5,6 +5,19 @@ html, body {
     height: 100%;
 }
 
+#overleaf-pdf-load-error:not([hidden]) {
+    position: absolute;
+    z-index: 10000;
+    top: 36px;
+    left: 8px;
+    right: 8px;
+    padding: 8px;
+    background: var(--vscode-inputValidation-warningBackground, #fff3cd);
+    color: var(--vscode-foreground, #333);
+    border: 1px solid var(--vscode-inputValidation-warningBorder, #806a00);
+    font: 13px sans-serif;
+}
+
 #pdf-viewer {
     display: block;
     border: none;

@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preserve local recovery copies and pending-write records when a save cannot be safely confirmed.
 
 ### Fixed
+- Keep History navigation visible when opening revision comparisons.
+- Avoid false save conflicts when an already-confirmed editor advances during its pending realtime flush, without reusing stale save permissions after a reload or disconnect.
+- Check recovery eligibility before offering Reload Remote; let unbound drafts compare read-only snapshots and require a local recovery copy before explicit replacement.
+- Follow the visible source position after compilation and handle reverse SyncTeX from nested PDF text, formulas, and blank areas without interpreting text as a regular expression.
+- Restore PDF previews and matching SyncTeX data after window or extension-host restarts, preserving the source/PDF split without an implicit source save or compile.
+- Download cached build output through the server-provided same-origin download route instead of an expired compilation VM URL.
+- Retain the last loaded PDF on download failure and provide a retry action.
 - Apply collaborator changes to open editors while preserving causally recorded local edits.
 - Handle rapid typing, deletion, acknowledgements, and reconnects without replaying an uncertain write as a new edit.
 - Receive Chinese and other Unicode deletion operations without corrupting their text through an extra decoding step.

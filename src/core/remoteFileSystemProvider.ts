@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import * as vscode from 'vscode';
+import { showRecoveryComparison } from './recoveryComparison';
 import {
     BaseAPI,
     ChangesUserSchema,
@@ -344,6 +345,8 @@ type EditorDocumentBase = {
     providerStat?: ProviderDocumentStat,
     causality: RealtimeEditorBridgeState,
     historyCausality?: HistoryRealtimeEditorBridgeState,
+    /** Survives proven save commits, but not reloads or invalidation. In memory only. */
+    saveLineage?: object,
 };
 
 type PendingRemoteEditorTransaction = {
@@ -421,6 +424,14 @@ type EditorBufferState = {
 type EditorBufferWitness = EditorBufferState & {
     documentVersion: number,
     content: string,
+};
+
+/** Call-local evidence, never retained as permission for a later provider write. */
+type EditorSaveEntrySnapshot = EditorBufferWitness & {
+    identity: DocumentProvenanceIdentity,
+    publicId: string,
+    socketGeneration: number,
+    lineage: object,
 };
 
 type EditorSaveReceipt = {
@@ -1061,6 +1072,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     private invalidateEditorBase(active: EditorDocumentBase): void {
+        active.saveLineage = undefined;
         active.causality = {...active.causality, valid: false};
         if (active.historyCausality) {
             active.historyCausality = {...active.historyCausality, valid: false};
@@ -2234,6 +2246,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                     content: receipt.content,
                     recordName: existing?.recordName,
                     persistence: existing?.persistence,
+                    saveLineage: existing?.causality.valid ? existing.saveLineage : undefined,
                     providerStat: this.snapshotDocumentProviderStat(
                         this.currentDocument(receipt.identity.docId),
                     ),
@@ -2439,11 +2452,42 @@ export class VirtualFileSystem extends vscode.Disposable {
         return true;
     }
 
+    private captureEditorSaveEntry(uri: vscode.Uri, content: string): EditorSaveEntrySnapshot | undefined {
+        const document = this.exactOpenDocument(uri);
+        if (!document || document.getText() !== content) { return undefined; }
+        const buffer = this.observeEditorBuffer(document);
+        if (!buffer) { return undefined; }
+        const active = this.activeEditorBases.get(buffer.bufferId);
+        const sender = this.currentSenderWitness();
+        const identity = this.documentProvenanceIdentity(buffer.docId, buffer);
+        // Only reuse a proven live ShareJS buffer. Reading matching bytes is not
+        // permission to bind a restored/third-party buffer or change OT modes.
+        if (!active || !sender || !identity
+            || identity.otType !== 'sharejs-text-ot'
+            || !this.sameDocumentProvenanceIdentity(active.identity, identity)
+            || !active.causality.valid
+            || active.causality.socketGeneration !== sender.generation
+            || active.causality.documentVersion !== document.version
+            || active.causality.editorContent !== content) {
+            return undefined;
+        }
+        const resolution = this.resolveWritingBuffer(uri, buffer.docId, content, false);
+        if (resolution.kind !== 'valid') { return undefined; }
+        return {
+            ...resolution.witness,
+            identity,
+            publicId: sender.publicId,
+            socketGeneration: sender.generation,
+            lineage: active.saveLineage ??= {},
+        };
+    }
+
     private resolveWritingBuffer(
         uri: vscode.Uri,
         docId: string,
         desiredContent: string,
         consumeSaveIntent = true,
+        saveEntry?: EditorSaveEntrySnapshot,
     ): {kind: 'valid', witness: EditorBufferWitness}
         | {kind: 'superseded'}
         | {kind: 'blocked', reason: string} {
@@ -2496,7 +2540,28 @@ export class VirtualFileSystem extends vscode.Disposable {
                 this.editorSaveIntents.delete(witness.bufferId);
             }
         } else {
-            const superseded = consumeSaveIntent ? matchingIntents.filter(intent => {
+            const supersedable = new Map(matchingIntents.map(intent => [intent.bufferId, intent]));
+            if (consumeSaveIntent && saveEntry
+                && saveEntry.canonicalEditorUri === canonicalEditorUri
+                && saveEntry.resourceKey === resourceKey
+                && openDocuments.has(saveEntry.document)) {
+                // A cached will-save intent must not bypass invalidation of
+                // this call's stronger entry proof (for example after reload).
+                supersedable.delete(saveEntry.bufferId);
+                const active = this.activeEditorBases.get(saveEntry.bufferId);
+                const sender = this.currentSenderWitness();
+                const identity = this.documentProvenanceIdentity(docId, saveEntry);
+                if (active && identity
+                    && active.saveLineage === saveEntry.lineage
+                    && this.sameDocumentProvenanceIdentity(saveEntry.identity, identity)
+                    && this.sameDocumentProvenanceIdentity(active.identity, identity)
+                    && sender?.publicId === saveEntry.publicId
+                    && sender.generation === saveEntry.socketGeneration
+                    && active.causality.socketGeneration === saveEntry.socketGeneration) {
+                    supersedable.set(saveEntry.bufferId, saveEntry);
+                }
+            }
+            const superseded = consumeSaveIntent ? [...supersedable.values()].filter(intent => {
                 const buffer = this.editorBuffers.get(intent.bufferId);
                 const active = this.activeEditorBases.get(intent.bufferId);
                 let current: DocumentEntity | undefined;
@@ -2509,6 +2574,8 @@ export class VirtualFileSystem extends vscode.Disposable {
                     && intent.content === desiredContent
                     && buffer?.document === intent.document
                     && this.bufferMatchesIncarnation(buffer)
+                    && buffer.document.version >= intent.documentVersion
+                    && !this.pendingDocumentUpdates.has(intent.bufferId)
                     && active !== undefined
                     && active.causality.valid
                     && active.causality.inflightWire === undefined
@@ -2803,7 +2870,8 @@ export class VirtualFileSystem extends vscode.Disposable {
         authoritativeContent: string,
         recordsToClear: string[] = [],
     ) {
-        const previousProviderStat = this.activeEditorBases.get(witness.bufferId)?.providerStat;
+        const previousActive = this.activeEditorBases.get(witness.bufferId);
+        const previousProviderStat = previousActive?.providerStat;
         if (!this.documentMatchesAuthority(doc, expectedVersion, authoritativeContent)
             || !this.bufferMatchesWitness(witness)
             || authoritativeContent !== witness.content) {
@@ -2839,6 +2907,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             recordName: record?.recordName,
             persistence: record ? Promise.resolve(record) : undefined,
             providerStat: previousProviderStat ?? this.snapshotDocumentProviderStat(doc),
+            saveLineage: previousActive?.causality.valid ? previousActive.saveLineage : undefined,
             causality: this.createLocalEditorCausality(
                 witness.document,
                 doc._id,
@@ -2905,6 +2974,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         const stillOriginalDocument = (): vscode.TextDocument | undefined => {
             const current = this.exactOpenDocument(uri);
             return current
+                && !current.isClosed
                 && current === originalDocument
                 && this.editorBufferIds.get(current) === originalBufferId ?
                 current : undefined;
@@ -2922,13 +2992,40 @@ export class VirtualFileSystem extends vscode.Disposable {
                 && buffer.resourceKey === key ?
                 buffer : undefined;
         };
+        // A URI locates today's file; it does not prove the ancestry of a
+        // restored dirty draft. Reading/comparing must not confer write ownership.
+        const canLocateRemote = (): boolean => {
+            try {
+                this.assertAuthenticatedAccount(uri);
+                const parsed = parseUri(uri);
+                return !this.disposed && uri.scheme === ROOT_NAME
+                    && parsed.serverName === this.serverName
+                    && parsed.projectId === this.projectId;
+            } catch { return false; }
+        };
+        const hasDirtyAlias = (docId: string): boolean => vscode.workspace.textDocuments.some(candidate =>
+            candidate !== originalDocument && !candidate.isClosed && candidate.isDirty
+            && this.cachedDocumentIdForUri(candidate.uri) === docId,
+        );
+        const canReloadBound = (): boolean => !!(stillOriginalBuffer()
+            && !this.unboundEditorIncarnations.has(originalDocument!)
+            && canLocateRemote()
+            && this.currentSenderWitness()
+            && this.cachedDocumentIdForUri(uri) === originalDocId
+            && !hasDirtyAlias(originalDocId!));
         const saveCopy = vscode.l10n.t('Save Recovery Copy...');
         const reloadRemote = vscode.l10n.t('Reload Remote');
+        const compareRemote = vscode.l10n.t('Compare with Remote');
+        const saveAndReload = vscode.l10n.t('Save Copy and Reload Remote');
+        const actions = stillOriginalDocument() ? [saveCopy] : [];
+        if (canReloadBound()) { actions.push(reloadRemote); }
+        else if (stillOriginalDocument() && canLocateRemote()) { actions.push(compareRemote); }
         const message = vscode.l10n.t(
-            'Overleaf did not send this document because {reason}. The editor remains dirty. Save a local recovery copy, reload the remote text, or keep editing.',
+            'Overleaf save is blocked: {reason}. Keep your local draft until recovery is complete. Available recovery actions are shown below.',
             {reason},
         );
-        void Promise.resolve(vscode.window.showErrorMessage(message, saveCopy, reloadRemote)).then(async choice => {
+        void Promise.resolve(vscode.window.showErrorMessage(message, ...actions)).then(async choice => {
+            if (!choice || !actions.includes(choice)) { return; }
             if (choice === saveCopy) {
                 const target = await vscode.window.showSaveDialog({saveLabel: saveCopy});
                 if (!target) { return; }
@@ -2952,13 +3049,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 void vscode.window.showInformationMessage(
                     vscode.l10n.t('Recovery copy saved to {path}.', {path: target.fsPath || target.toString()}),
                 );
-            } else if (choice === reloadRemote) {
-                const confirmed = await vscode.window.showWarningMessage(
-                    vscode.l10n.t('Reloading discards the unsaved editor text. Continue only after saving a recovery copy if needed.'),
-                    {modal: true},
-                    reloadRemote,
-                );
-                if (confirmed !== reloadRemote) { return; }
+            } else if (choice === reloadRemote || choice === compareRemote) {
                 const document = stillOriginalDocument();
                 if (!document) {
                     void vscode.window.showErrorMessage(
@@ -2967,42 +3058,75 @@ export class VirtualFileSystem extends vscode.Disposable {
                     return;
                 }
                 const buffer = stillOriginalBuffer();
-                const sender = this.currentSenderWitness();
-                if (!buffer || !sender) {
-                    void vscode.window.showErrorMessage(
-                        vscode.l10n.t('The blocked editor has no current remote identity; no editor was reloaded.'),
-                    );
-                    return;
+                const needsNewBinding = !buffer || this.unboundEditorIncarnations.has(document);
+                if (!canLocateRemote() || (choice === reloadRemote && !canReloadBound())) {
+                    throw new Error('The recovery target or connection changed; request recovery again');
                 }
                 const blockedVersion = document.version;
                 const blockedText = document.getText();
-                const editor = await vscode.window.showTextDocument(document, {preserveFocus: false});
-                const authoritative = await this.joinFreshDocumentSession(buffer.docId);
+                const resolved = await this._resolveUri(uri);
+                const docId = resolved.fileType === 'doc' ? resolved.fileEntity?._id : undefined;
+                if (!docId || (originalDocId && docId !== originalDocId) || hasDirtyAlias(docId)) {
+                    throw new Error('The remote document cannot be uniquely resolved; no editor was reloaded');
+                }
+                const sender = this.currentSenderWitness();
+                if (!sender) { throw new Error('The remote connection is not ready; no editor was reloaded'); }
+                const authoritative = await this.joinFreshDocumentSession(docId);
                 const authoritativeVersion = authoritative.doc.version;
                 const authoritativeText = authoritative.content;
-                const senderAfterJoin = this.currentSenderWitness();
-                const editTarget = stillOriginalDocument();
-                const bufferAfterJoin = stillOriginalBuffer();
-                if (!editTarget
-                    || editTarget !== document
-                    || editor.document !== document
-                    || bufferAfterJoin?.docId !== buffer.docId
-                    || document.version !== blockedVersion
-                    || document.getText() !== blockedText
+                const remoteStillCurrent = (): boolean => {
+                    const currentSender = this.currentSenderWitness();
+                    return canLocateRemote()
+                        && this.cachedDocumentIdForUri(uri) === docId
+                        && !hasDirtyAlias(docId)
+                        && currentSender?.publicId === sender.publicId
+                        && currentSender.generation === sender.generation
+                        && this.documentMatchesAuthority(authoritative.doc, authoritativeVersion!, authoritativeText);
+                };
+                const draftStillCurrent = (): boolean => stillOriginalDocument() === document
+                    && document.version === blockedVersion && document.getText() === blockedText;
+                if (!draftStillCurrent()
                     || !isNonnegativeSafeInteger(authoritativeVersion)
-                    || senderAfterJoin?.publicId !== sender.publicId
-                    || senderAfterJoin.generation !== sender.generation
-                    || !this.documentMatchesAuthority(
-                        authoritative.doc,
-                        authoritativeVersion,
-                        authoritativeText,
-                    )) {
-                    void vscode.window.showErrorMessage(
-                        vscode.l10n.t('The blocked editor changed before reload; no text was replaced.'),
-                    );
-                    return;
+                    || !remoteStillCurrent()) {
+                    throw new Error('The editor or remote document changed during the read; no text was replaced');
                 }
-                this.stageEditorBase(uri, authoritative.doc, authoritativeText);
+                // Comparing is read-only even for an unbound hot-exit draft.
+                // Replacement is a separate, explicit action with a mandatory
+                // local backup; merely reading never removes quarantine.
+                if (choice === compareRemote) {
+                    await showRecoveryComparison(uri, blockedText, authoritativeText);
+                    const next = await vscode.window.showInformationMessage(
+                        vscode.l10n.t('These are read-only snapshots. To replace the blocked draft with the remote snapshot, save a local recovery copy first.'),
+                        saveAndReload,
+                    );
+                    if (next !== saveAndReload) { return; }
+                    const target = await vscode.window.showSaveDialog({saveLabel: saveCopy});
+                    if (!target) { return; }
+                    if (target.scheme !== 'file') { throw new Error('Choose a local file for the recovery copy'); }
+                    if (!draftStillCurrent() || !remoteStillCurrent()) {
+                        throw new Error('The editor or remote document changed; compare again before reloading');
+                    }
+                    await vscode.workspace.fs.writeFile(target, new TextEncoder().encode(blockedText));
+                    void vscode.window.showInformationMessage(
+                        vscode.l10n.t('Recovery copy saved to {path}.', {path: target.fsPath}),
+                    );
+                }
+                if (!draftStillCurrent() || !remoteStillCurrent()) {
+                    throw new Error('The editor or remote document changed; no text was replaced');
+                }
+                const confirmed = await vscode.window.showWarningMessage(
+                    vscode.l10n.t('Reloading replaces the unsaved editor text with the checked remote snapshot. Continue only after saving a recovery copy if needed.'),
+                    {modal: true},
+                    reloadRemote,
+                );
+                if (confirmed !== reloadRemote) { return; }
+                const editor = await vscode.window.showTextDocument(document, {preserveFocus: false});
+                if (!draftStillCurrent() || !remoteStillCurrent() || editor.document !== document) {
+                    throw new Error('The editor or remote document changed before reload; no text was replaced');
+                }
+                // Do not stage a read for an unbound draft until the host has
+                // actually replaced it with exactly the checked remote bytes.
+                if (!needsNewBinding) { this.stageEditorBase(uri, authoritative.doc, authoritativeText); }
                 const replaced = await editor.edit(edit => {
                     edit.replace(
                         new vscode.Range(
@@ -3020,10 +3144,36 @@ export class VirtualFileSystem extends vscode.Disposable {
                     );
                     return;
                 }
+                if (needsNewBinding) {
+                    if (!remoteStillCurrent()) {
+                        throw new Error('The remote document changed during replacement; editing remains blocked');
+                    }
+                    this.forgetTextDocument(document);
+                    this.stageEditorBase(uri, authoritative.doc, authoritativeText);
+                    const rebound = this.observeEditorBuffer(document);
+                    try {
+                        if (!rebound || rebound.docId !== docId) { throw new Error('The new editor identity could not be confirmed'); }
+                        await this.acceptEditorBase({
+                            ...rebound, documentVersion: document.version, content: authoritativeText,
+                        }, authoritative.doc, authoritativeVersion, authoritativeText);
+                    } catch (error) {
+                        this.forgetTextDocument(document);
+                        this.unboundEditorIncarnations.add(document);
+                        throw error;
+                    }
+                    // No automatic save: save participants or new keystrokes
+                    // must not upload anything as a side effect of recovery.
+                    void vscode.window.showInformationMessage(
+                        vscode.l10n.t('Remote text loaded and editing enabled. Your previous draft is in the local recovery copy. Save when ready.'),
+                    );
+                    return;
+                }
+                if (!buffer) { throw new Error('The recovery buffer identity is no longer available'); }
                 const senderBeforeSave = this.currentSenderWitness();
                 const exactBufferBeforeSave = stillOriginalBuffer();
                 const ledgerBeforeSave = this.remoteDocumentCausality.get(buffer.docId);
                 if (exactBufferBeforeSave?.docId !== buffer.docId
+                    || !remoteStillCurrent()
                     || senderBeforeSave?.publicId !== sender.publicId
                     || senderBeforeSave.generation !== sender.generation
                     || !this.documentMatchesAuthority(
@@ -3086,6 +3236,10 @@ export class VirtualFileSystem extends vscode.Disposable {
             }
         }).catch(error => {
             console.error('Unable to offer Overleaf document recovery', error);
+            void vscode.window.showErrorMessage(vscode.l10n.t(
+                'Overleaf recovery stopped: {reason}.',
+                {reason: error instanceof Error ? error.message : String(error)},
+            ));
         }).finally(() => {
             this.recoveryNotifications.delete(key);
         });
@@ -5449,6 +5603,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                     routing.compileGroup || 'standard',
                     routing.clsiServerId,
                     routing.pdfDownloadDomain,
+                    output.downloadURL,
                 )
                 .then((res) => {
                     if (res.type==='success') {
@@ -5899,6 +6054,12 @@ export class VirtualFileSystem extends vscode.Disposable {
         } catch {
             this.blockDocumentWrite(uri, content, 'document bytes are not valid UTF-8');
         }
+        // Pin the exact, already-confirmed editor before any async flush can
+        // rebase it or incorporate further typing. onWillSave may be omitted or
+        // precede additional save-participant edits; its cached intent alone is
+        // not a reliable witness for this invocation's bytes.
+        const saveEntry = liveBufferId === undefined
+            ? this.captureEditorSaveEntry(uri, desiredContent) : undefined;
         if (liveBufferId === undefined) {
             try {
                 await this.flushLiveEditorSubmissionForUri(uri);
@@ -5949,6 +6110,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                     overwrite,
                     liveBufferId,
                     liveSnapshot,
+                    saveEntry,
                 );
             } finally {
                 if (suppressionKey !== undefined) {
@@ -6431,6 +6593,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 providerStat: previousActive?.providerStat
                     ?? this.snapshotDocumentProviderStat(authoritative.doc),
                 causality,
+                saveLineage: previousActive?.causality.valid ? previousActive.saveLineage : undefined,
             };
             this.activeEditorBases.set(pending.bufferId, active);
             this.cleanEditorRefreshMap().delete(pending.bufferId);
@@ -8486,6 +8649,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         _overwrite: boolean,
         liveBufferId?: string,
         liveSnapshot?: LiveEditorWriteSnapshot,
+        saveEntry?: EditorSaveEntrySnapshot,
     ) {
         let desiredContent: string;
         try {
@@ -8557,6 +8721,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 docId,
                 _content,
                 liveBufferId === undefined,
+                saveEntry,
             );
             if (bufferResolution.kind === 'superseded') {
                 return;
@@ -9139,6 +9304,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         stopOnFirstError:boolean=false,
         rootDocId?:string,
         isCurrent: () => boolean = () => true,
+        markSourceClean: boolean = true,
     ): Promise<CompileOutcome | undefined> {
         try {
             const sourceRevision = this.sourceRevision;
@@ -9176,7 +9342,9 @@ export class VirtualFileSystem extends vscode.Disposable {
                 clsiServerId: cached.clsiServerId,
                 pdfDownloadDomain: cached.pdfDownloadDomain,
             });
-            this.isDirty = false;
+            // Restoring a preview only reads an existing build. It cannot
+            // establish that a local draft has been saved or compiled.
+            if (markSourceClean) { this.isDirty = false; }
             return {
                 status: 'success',
                 successful: true,
