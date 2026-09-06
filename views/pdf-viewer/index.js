@@ -35,6 +35,7 @@
         pdfViewerScrollMode: ScrollMode.VERTICAL,
         pdfViewerSpreadMode: SpreadMode.NONE,
         pdfSidebarView: SidebarView.NONE,
+        syncNavigationTop: 50,
     };
     const syncGenerationGate = OverleafPdfSyncGeneration.createGate();
     let pdfLoadGeneration = 0;
@@ -72,6 +73,7 @@
 
     function updatePdfViewerState() {
         const pdfViewerState = vscode.getState() || globalPdfViewerState;
+        positionSyncNavigation(pdfViewerState.syncNavigationTop);
 
         if (ColorThemes[pdfViewerState.colorTheme] === undefined) {
             pdfViewerState.colorTheme = Object.keys(ColorThemes)[0];
@@ -100,6 +102,10 @@
         globalPdfViewerState.pdfSidebarView = PDFViewerApplication.pdfSidebar.visibleView;
         globalPdfViewerState.containerScrollLeft = document.getElementById('viewerContainer').scrollLeft || 0;
         globalPdfViewerState.containerScrollTop = document.getElementById('viewerContainer').scrollTop || 0;
+        persistPdfViewerState();
+    }
+
+    function persistPdfViewerState() {
         vscode.setState(globalPdfViewerState);
         vscode.postMessage({
             type: 'saveState',
@@ -260,7 +266,7 @@
     }
 
     // Reference: https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/web/frontend/js/features/pdf-preview/util/pdf-js-wrapper.ts
-    function syncPdf(pageElem, pageNum, clientX, clientY, innerText) {
+    function syncPdf(pageElem, pageNum, clientX, clientY, innerText, fromButton = false) {
         if (!OverleafPdfSyncGeneration.isReadyPdfGeneration(
             readyPdfGeneration,
             pdfLoadGeneration,
@@ -287,9 +293,108 @@
                 v: top,
                 identifier: innerText,
                 pdfGeneration,
+                ...(fromButton ? {fromButton: true} : {}),
             },
         });
         backupPdfViewerState();
+    }
+
+    function canNavigateFromButton() {
+        if (OverleafPdfSyncGeneration.isReadyPdfGeneration(readyPdfGeneration, pdfLoadGeneration,
+            PDFViewerApplication.pdfDocument, loadingPdfDocument)) { return true; }
+        vscode.postMessage({type: 'syncUnavailable'});
+        return false;
+    }
+
+    function positionSyncNavigation(percent = 50) {
+        const navigation = document.getElementById('overleaf-sync-navigation');
+        if (navigation.hidden || window.innerHeight <= 0) { return; }
+        const halfHeight = navigation.getBoundingClientRect().height / 2;
+        const toolbarBottom = document.getElementById('toolbarContainer').getBoundingClientRect().bottom;
+        const max = Math.max(halfHeight, window.innerHeight - halfHeight - 4);
+        const min = Math.min(max, toolbarBottom + halfHeight + 4);
+        const centre = window.innerHeight * (Number.isFinite(percent) ? percent : 50) / 100;
+        globalPdfViewerState.syncNavigationTop = 100 * Math.max(min, Math.min(max, centre)) / window.innerHeight;
+        navigation.style.top = `${globalPdfViewerState.syncNavigationTop}%`;
+    }
+
+    function enableSyncNavigationDrag() {
+        const navigation = document.getElementById('overleaf-sync-navigation');
+        let gesture;
+        let suppressPointerClick = false;
+        navigation.addEventListener('pointerdown', event => {
+            if (!event.isPrimary || event.button !== 0 || gesture) { return; }
+            suppressPointerClick = false;
+            const rect = navigation.getBoundingClientRect();
+            gesture = {id: event.pointerId, y: event.clientY, centre: rect.top + rect.height / 2, target: event.target};
+            // Keep the original button as the capture target: a normal click
+            // still reaches it, and release outside the group ends the gesture.
+            event.target.setPointerCapture(event.pointerId);
+        });
+        window.addEventListener('pointermove', event => {
+            if (!gesture || event.pointerId !== gesture.id) { return; }
+            const delta = event.clientY - gesture.y;
+            if (!suppressPointerClick && Math.abs(delta) < 4) { return; }
+            if (!suppressPointerClick) {
+                navigation.dataset.dragging = '';
+                suppressPointerClick = true;
+            }
+            event.preventDefault();
+            positionSyncNavigation(100 * (gesture.centre + delta) / window.innerHeight);
+        });
+        const finishDrag = event => {
+            if (!gesture || event.pointerId !== gesture.id) { return; }
+            const target = gesture.target;
+            gesture = undefined;
+            delete navigation.dataset.dragging;
+            if (target.hasPointerCapture(event.pointerId)) {
+                target.releasePointerCapture(event.pointerId);
+            }
+            if (suppressPointerClick) {
+                // Moving the arrows must not reset a restored zoom/theme.
+                Object.assign(globalPdfViewerState, vscode.getState(), {syncNavigationTop: globalPdfViewerState.syncNavigationTop});
+                persistPdfViewerState();
+            }
+        };
+        window.addEventListener('pointerup', finishDrag);
+        window.addEventListener('pointercancel', finishDrag);
+        navigation.addEventListener('lostpointercapture', finishDrag);
+        navigation.addEventListener('click', event => {
+            if (suppressPointerClick && event.detail > 0) {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+            }
+        }, true);
+        window.addEventListener('resize', () => positionSyncNavigation(globalPdfViewerState.syncNavigationTop));
+        positionSyncNavigation((vscode.getState() || globalPdfViewerState).syncNavigationTop);
+    }
+
+    function syncVisiblePdf() {
+        if (!canNavigateFromButton()) { return; }
+        const container = document.getElementById('viewerContainer').getBoundingClientRect();
+        let target;
+        // Use the centre of the most visible rendered page, including when the
+        // viewport centre falls in a page gap or pages are shown side by side.
+        for (const page of document.querySelectorAll('#viewer .page[data-page-number]')) {
+            const pageNum = Number(page.getAttribute('data-page-number'));
+            const canvas = page.querySelector('canvas');
+            if (!canvas || !Number.isSafeInteger(pageNum) || pageNum <= 0) { continue; }
+            const rect = canvas.getBoundingClientRect();
+            const left = Math.max(rect.left, container.left);
+            const right = Math.min(rect.right, container.right);
+            const top = Math.max(rect.top, container.top);
+            const bottom = Math.min(rect.bottom, container.bottom);
+            if (right <= left || bottom <= top) { continue; }
+            const area = (right - left) * (bottom - top);
+            if (Number.isFinite(area) && (!target || area > target.area)) {
+                target = {page, pageNum, area, x: (left + right) / 2, y: (top + bottom) / 2};
+            }
+        }
+        if (target) {
+            syncPdf(target.page, target.pageNum, target.x, target.y, '', true);
+        } else {
+            vscode.postMessage({type: 'syncUnavailable'});
+        }
     }
 
     window.addEventListener('load', async () => {
@@ -313,9 +418,16 @@
         });
 
         // add message listener
+        enableSyncNavigationDrag();
         document.getElementById('overleaf-pdf-retry').addEventListener('click', () => {
             vscode.postMessage({type: 'retryPdfDownload'});
         });
+        document.getElementById('overleaf-sync-to-pdf').addEventListener('click', () => {
+            if (canNavigateFromButton()) {
+                vscode.postMessage({type: 'syncCodeFromPdf', pdfGeneration: readyPdfGeneration});
+            }
+        });
+        document.getElementById('overleaf-sync-to-source').addEventListener('click', syncVisiblePdf);
         window.addEventListener('message', async (e) => {
             const message = e.data;
             switch (message.type) {

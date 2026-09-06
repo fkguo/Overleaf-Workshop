@@ -47,6 +47,7 @@ const vscodeStub = {
     },
     commands: {executeCommand: (...args: any[]) => executeCommand(...args)},
     window: {
+        showWarningMessage: async (message: string) => { shownErrors.push(message); },
         tabGroups: {
             get all() { return tabGroups; },
             get activeTabGroup() { return tabGroups.find(group => group.isActive) ?? tabGroups[0]; },
@@ -254,6 +255,36 @@ describe('PdfDocument refresh generations', () => {
 });
 
 describe('PDF provider respects the caller opening layout', () => {
+    it('renders accessible navigation buttons only for the compiled preview', () => {
+        const provider = new PdfViewEditorProvider({extensionUri: {}} as any);
+        const webview = {asWebviewUri: (uri: {parts: string[]}) => ({toString: () => uri.parts.join('/')})};
+        for (const enabled of [true, false]) {
+            const html = (provider as any).patchViewerHtml(webview, '<head></head><body></body>', enabled);
+            assert.match(html, /id="overleaf-sync-to-pdf" type="button" title="Jump to PDF from the TeX cursor"/);
+            assert.match(html, /id="overleaf-sync-to-source" type="button"/);
+            assert.equal(/id="overleaf-sync-navigation"[^>]* hidden/.test(html), !enabled);
+            assert.match(html, /title="Drag up or down to move the navigation arrows"/);
+        }
+    });
+
+    it('binds button requests to its own document and panel, ignoring message-supplied identities', async () => {
+        const provider = new PdfViewEditorProvider({} as any);
+        (provider as any).getHtmlForWebview = async () => '';
+        const doc = new PdfDocument({scheme: 'overleaf-workshop', path: '/p/.output/output.pdf'} as any);
+        let receive!: (message: any) => void;
+        const panel: any = {
+            webview: {postMessage() {}, onDidReceiveMessage: (listener: any) => { receive = listener; }},
+            onDidDispose() {}, onDidChangeViewState() {},
+        };
+        const calls: any[][] = [];
+        executeCommand = async (...args: any[]) => { calls.push(args); };
+        await provider.resolveCustomEditor(doc, panel);
+        receive({type: 'syncCodeFromPdf', pdfGeneration: 7, uri: 'wrong', webviewPanel: 'wrong'});
+        assert.deepEqual(calls, [['overleaf-workshop.compileManager.syncCodeFromPdf', {
+            pdfGeneration: 7, uri: doc.uri, webviewPanel: panel,
+        }]]);
+    });
+
     afterEach(() => { tabGroups = []; });
     for (const scenario of ['shared source group', 'already split', 'different project', 'ordinary PDF'] as const) {
         it(`handles ${scenario} without changing source tabs`, async () => {

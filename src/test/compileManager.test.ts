@@ -20,6 +20,8 @@ const executedCommands: string[] = [];
 const shownTextDocuments: any[][] = [];
 const documentChangeListeners = new Set<(event: any) => void>();
 const documentCloseListeners = new Set<(document: any) => void>();
+const activeEditorListeners = new Set<(editor: any) => void>();
+const navigationWarnings: string[] = [];
 let executeCommand = async (_command: string, ..._args: unknown[]): Promise<unknown> => undefined;
 let showTextDocument = async (..._args: any[]): Promise<any> => undefined;
 let diagnosticClears = 0;
@@ -56,6 +58,11 @@ const vscodeStub = {
     window: {
         activeTextEditor: undefined as any,
         visibleTextEditors: [] as any[],
+        onDidChangeActiveTextEditor: (listener: (editor: any) => void) => {
+            activeEditorListeners.add(listener);
+            return {dispose: () => activeEditorListeners.delete(listener)};
+        },
+        showWarningMessage: async (message: string) => { navigationWarnings.push(message); },
         showTextDocument: async (...args: any[]) => {
             shownTextDocuments.push(args);
             return showTextDocument(...args);
@@ -353,6 +360,7 @@ async function flushAsync() {
 
 describe('CompileManager cached startup', () => {
     beforeEach(() => {
+        navigationWarnings.length = 0;
         statusItems.length = 0;
         executedCommands.length = 0;
         shownTextDocuments.length = 0;
@@ -371,6 +379,7 @@ describe('CompileManager cached startup', () => {
             manager.pdfViewDisposedTrigger.dispose();
             manager.sourceDocumentChangedTrigger.dispose();
             manager.sourceDocumentClosedTrigger.dispose();
+            manager.sourceEditorChangedTrigger.dispose();
         }
     });
 
@@ -497,6 +506,7 @@ describe('CompileManager cached startup', () => {
 
 describe('CompileManager automatic forward SyncTeX after compile', () => {
     beforeEach(() => {
+        navigationWarnings.length = 0;
         statusItems.length = 0;
         executedCommands.length = 0;
         shownTextDocuments.length = 0;
@@ -515,6 +525,7 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
             manager.pdfViewDisposedTrigger.dispose();
             manager.sourceDocumentChangedTrigger.dispose();
             manager.sourceDocumentClosedTrigger.dispose();
+            manager.sourceEditorChangedTrigger.dispose();
         }
     });
 
@@ -1771,6 +1782,116 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
         assert.deepEqual(actions, ['refresh', 'sync-request']);
         assert.deepEqual(viewer.messages, []);
         assert.equal(statusItems.at(-1)?.text, 'pdfLaTex');
+    });
+
+    it('navigates from the PDF button after source focus is lost without saving or compiling', async () => {
+        const fixture = projectFixture();
+        const source = setActiveEditor(fixture.sourceUri, 12, 8);
+        const actions: string[] = [];
+        const calls: any[][] = [];
+        const manager = createManager(createVfs(successfulOutcome(), actions, async (...args) => {
+            calls.push(args); return [{page: 2, h: 3, v: 4}];
+        }));
+        const viewer = registerPdfViewer(fixture, actions);
+        vscodeStub.window.activeTextEditor = undefined;
+        await manager.syncCodeFromPdf(reverseSyncRequest(fixture, viewer));
+        assert.deepEqual(calls, [['main.tex', 13, 8, true]]);
+        assert.deepEqual(actions, ['sync-request', 'syncCode']);
+        assert.deepEqual(source.selection.active, {line: 12, character: 8});
+        assert.deepEqual(executedCommands, []);
+        assert.deepEqual(shownTextDocuments, []);
+    });
+
+    it('uses only the clicked PDF project even if another project source was last active', async () => {
+        const fixture = projectFixture();
+        const other = projectFixture();
+        const source = setActiveEditor(fixture.sourceUri, 10, 4);
+        const otherSource = setActiveEditor(other.sourceUri, 1, 0);
+        vscodeStub.window.visibleTextEditors = [otherSource, source];
+        vscodeStub.workspace.textDocuments.push(source.document);
+        const actions: string[] = [];
+        const manager = createManager(createVfs(successfulOutcome(), actions));
+        const viewer = registerPdfViewer(fixture, actions);
+        const otherViewer = registerPdfViewer(other, actions);
+        vscodeStub.window.activeTextEditor = undefined;
+        await manager.syncCodeFromPdf(reverseSyncRequest(fixture, viewer));
+        assert.equal(viewer.messages.length, 1);
+        assert.deepEqual(otherViewer.messages, []);
+        vscodeStub.window.visibleTextEditors = [otherSource];
+        actions.length = 0;
+        await manager.syncCodeFromPdf(reverseSyncRequest(fixture, viewer));
+        assert.deepEqual(actions, []);
+        assert.equal(navigationWarnings.length, 1);
+    });
+
+    it('remembers the last selected source among multiple visible TeX files', async () => {
+        const fixture = projectFixture();
+        const first = setActiveEditor(fixture.sourceUri, 2, 0);
+        const manager = createManager(createVfs(successfulOutcome(), []));
+        const second = setActiveEditor(makeUri(fixture.identifier, ['chapter.tex']), 5, 3);
+        vscodeStub.window.visibleTextEditors.push(first);
+        vscodeStub.workspace.textDocuments.push(first.document);
+        const calls: any[][] = [];
+        (manager as any).vfsm.prefetch = async () => ({getRootDocName: () => '/main.tex',
+            syncCode: async (...args: any[]) => { calls.push(args); return [{page: 1}]; }});
+        for (const listener of activeEditorListeners) { listener(second); listener(undefined); }
+        vscodeStub.window.activeTextEditor = undefined;
+        const viewer = registerPdfViewer(fixture, []);
+        await manager.syncCodeFromPdf(reverseSyncRequest(fixture, viewer));
+        assert.deepEqual(calls, [['chapter.tex', 6, 3, true]]);
+    });
+
+    it('does not guess among source editors after a restart with no selected source', async () => {
+        const fixture = projectFixture();
+        const first = setActiveEditor(fixture.sourceUri);
+        const second = setActiveEditor(makeUri(fixture.identifier, ['chapter.tex']));
+        vscodeStub.window.visibleTextEditors.push(first);
+        vscodeStub.workspace.textDocuments.push(first.document);
+        vscodeStub.window.activeTextEditor = undefined;
+        const actions: string[] = [];
+        const manager = createManager(createVfs(successfulOutcome(), actions));
+        const viewer = registerPdfViewer(fixture, actions);
+        await manager.syncCodeFromPdf(reverseSyncRequest(fixture, viewer));
+        assert.deepEqual(actions, []);
+        assert.equal(navigationWarnings.length, 1);
+        assert.notEqual(first, second);
+    });
+
+    for (const change of ['cursor', 'document', 'hidden', 'generation', 'replacement'] as const) {
+        it(`drops a delayed PDF button forward response after ${change} changes`, async () => {
+            const fixture = projectFixture();
+            const source = setActiveEditor(fixture.sourceUri);
+            let finish!: (value: any) => void;
+            const actions: string[] = [];
+            const manager = createManager(createVfs(successfulOutcome(), actions,
+                () => new Promise(resolve => { finish = resolve; })));
+            const viewer = registerPdfViewer(fixture, actions);
+            vscodeStub.window.activeTextEditor = undefined;
+            const request = manager.syncCodeFromPdf(reverseSyncRequest(fixture, viewer));
+            await flushAsync();
+            if (change === 'cursor') { source.selection.active.line += 1; }
+            if (change === 'document') { source.document.version += 1; }
+            if (change === 'hidden') { vscodeStub.window.visibleTextEditors = []; }
+            if (change === 'generation') { viewer.doc.generation += 1; }
+            if (change === 'replacement') { registerPdfViewer(fixture, actions); }
+            finish([{page: 1, h: 2, v: 3}]);
+            await request;
+            assert.deepEqual(viewer.messages, []);
+        });
+    }
+
+    it('rejects stale generations and replaced viewer button requests with a useful warning', async () => {
+        const fixture = projectFixture();
+        setActiveEditor(fixture.sourceUri);
+        const actions: string[] = [];
+        const manager = createManager(createVfs(successfulOutcome(), actions));
+        const viewer = registerPdfViewer(fixture, actions);
+        await manager.syncCodeFromPdf(reverseSyncRequest(fixture, viewer, 999));
+        await manager.syncPdf({...reverseSyncRequest(fixture, viewer, 999), fromButton: true});
+        registerPdfViewer(fixture, actions);
+        await manager.syncCodeFromPdf(reverseSyncRequest(fixture, viewer));
+        assert.deepEqual(actions, []);
+        assert.equal(navigationWarnings.length, 3);
     });
 
     it('reverse-syncs only from the exact ready PDF generation', async () => {

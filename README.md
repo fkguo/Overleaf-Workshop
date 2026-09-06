@@ -8,7 +8,7 @@ This is the [fkguo fork](https://github.com/fkguo/Overleaf-Workshop) of [Overlea
 
 ### Install this fork
 
-1. Download `overleaf-workshop-0.16.0.vsix` from the [fork release](https://github.com/fkguo/Overleaf-Workshop/releases/tag/v0.16.0). A SHA-256 checksum file is provided alongside it.
+1. Download the `overleaf-workshop-<version>.vsix` asset from the [latest fork release](https://github.com/fkguo/Overleaf-Workshop/releases/latest). A SHA-256 checksum file is provided alongside it.
 2. In VS Code or Cursor, run **Extensions: Install from VSIX...** and select the downloaded file. This fork retains the extension ID `iamhyc.overleaf-workshop`, so it replaces that installation rather than installing a second extension.
 3. Preserve any unsaved work, then run **Developer: Reload Window**. If updating an earlier build of the same version, reinstall the new VSIX even though the displayed version is unchanged. From a terminal, `code --install-extension <path-to-vsix> --force` or `cursor --install-extension <path-to-vsix> --force` can force replacement.
 
@@ -26,6 +26,8 @@ Disable automatic updates for this extension if you want to keep using the fork:
 
 - **Compile Project** requests a build even when the source is unchanged. **View Compiled PDF** opens the preview beside the source.
 - After compilation, automatic PDF navigation uses the visible, unchanged source associated with that build: the cursor when visible, otherwise a position in the visible source region. Double-click the PDF to jump back to the source. Navigation requires a valid PDF and its matching SyncTeX data.
+- In version 0.16.1, the compiled PDF preview has two arrows along its left edge: **→** jumps to the TeX cursor's PDF position; **←** jumps to the source corresponding to the centre of the most visible PDF page area. With multiple visible source files, select the desired TeX editor first. These buttons do not save or compile; use **Compile Project** if a matching compiled output is unavailable. Double-click remains available for precise reverse navigation.
+- Drag either compact arrow up or down to reposition the group along the left edge. The position is remembered for each PDF; dragging does not trigger a jump.
 - Reloading a preview or restarting the extension host refreshes available compiled output and restores the source/PDF split without implicitly saving source files or starting a new compile. If no compiled output is available, run **Compile Project**.
 - A failed PDF download retains the last loaded preview and offers **Retry PDF download**. Unverified output is not used for SyncTeX navigation.
 

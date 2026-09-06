@@ -135,6 +135,12 @@ type SourceSyncDeliveryGuard = {
     isStillApplicable?: () => boolean,
 };
 
+type PdfNavigationRequest = {
+    pdfGeneration: number,
+    uri: vscode.Uri,
+    webviewPanel: vscode.WebviewPanel,
+};
+
 class CompileDiagnosticProvider {
     private diagnosticCollection = vscode.languages.createDiagnosticCollection(`${ROOT_NAME}.compile`);
     constructor(private readonly vfsm: RemoteFileSystemProvider) {};
@@ -248,6 +254,8 @@ export class CompileManager {
     private readonly pdfViewDisposedTrigger: vscode.Disposable;
     private readonly sourceDocumentChangedTrigger: vscode.Disposable;
     private readonly sourceDocumentClosedTrigger: vscode.Disposable;
+    private readonly sourceEditorChangedTrigger: vscode.Disposable;
+    private lastSourceEditor?: vscode.TextEditor;
     private compileAsDraft: boolean = false;
     private compileStopOnFirstError: boolean = false;
     private activeCompileUri?: vscode.Uri;
@@ -272,6 +280,14 @@ export class CompileManager {
         this.status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, -1);
         this.status.command = `${ROOT_NAME}.compilerManager.settings`;
         this.diagnosticProvider = new CompileDiagnosticProvider(vfsm);
+        this.lastSourceEditor = vscode.window.activeTextEditor;
+        this.sourceEditorChangedTrigger = vscode.window.onDidChangeActiveTextEditor(editor => {
+            // Clicking a webview clears activeTextEditor. Keep the last source
+            // editor, but only use it while still visible in the same project.
+            if (editor && /\.(tex|ltx)$/i.test(editor.document.uri.path)) {
+                this.lastSourceEditor = editor;
+            }
+        });
         this.sourceDocumentChangedTrigger = vscode.workspace.onDidChangeTextDocument(event => {
             this.invalidatePendingSourceForDocument(event.document);
         });
@@ -1213,8 +1229,7 @@ export class CompileManager {
         };
     }
 
-    private async captureSourceSync(): Promise<ManualSourceSync | undefined> {
-        const editor = vscode.window.activeTextEditor;
+    private async captureSourceSync(editor = vscode.window.activeTextEditor): Promise<ManualSourceSync | undefined> {
         if (!editor) { return undefined; }
         // Snapshot everything which can change before the first asynchronous
         // settings/VFS lookup.
@@ -1516,6 +1531,62 @@ export class CompileManager {
         await this.requestSourceSync(source);
     }
 
+    async syncCodeFromPdf(r: PdfNavigationRequest) {
+        if (!r || r.uri?.scheme !== ROOT_NAME) { return; }
+        const {identifier, pathParts} = parseUri(r.uri);
+        const filePath = pathParts.join('/');
+        if (filePath !== `${OUTPUT_FOLDER_NAME}/output.pdf`) { return; }
+        const record = pdfViewRecord[identifier]?.[filePath];
+        const isCurrentPdf = () => Boolean(record && record.ready
+            && record.webviewPanel === r.webviewPanel && record.doc.uri.toString() === r.uri.toString()
+            && pdfViewRecord[identifier]?.[filePath] === record
+            && isPdfGenerationSyncable(record, r.pdfGeneration));
+        if (!isCurrentPdf()) { this.showPdfNavigationUnavailable(); return; }
+        const recordKey = pdfRecordKey(identifier, filePath);
+        const requestGeneration = sourceSyncRequests.begin(recordKey);
+        delete pendingSourceSync[recordKey];
+        delete pendingPdfSync[recordKey];
+        const isCurrentRequest = () => isCurrentPdf() && sourceSyncRequests.isCurrent(recordKey, requestGeneration);
+        const preferred = vscode.window.activeTextEditor ?? this.lastSourceEditor;
+        const candidates = vscode.window.visibleTextEditors.filter(editor => !editor.document.isClosed
+            && /\.(tex|ltx)$/i.test(editor.document.uri.path)
+            && (editor.document.uri.scheme === ROOT_NAME
+                ? parseUri(editor.document.uri).identifier === identifier : editor.document.uri.scheme === 'file'));
+        try {
+            const sources = await Promise.all(candidates.map(async editor => ({
+                editor, position: {line: editor.selection.active.line, character: editor.selection.active.character},
+                source: await this.captureSourceSync(editor),
+            })));
+            if (!isCurrentRequest()) { return; }
+            const matching = sources.filter(item => item.source?.identifier === identifier);
+            const chosen = matching.find(item => item.editor === preferred)
+                ?? (matching.length === 1 ? matching[0] : undefined);
+            if (!chosen?.source) {
+                void vscode.window.showWarningMessage(vscode.l10n.t(
+                    'Select a visible TeX source editor from this PDF project, then click Jump to PDF again.',
+                ));
+                return;
+            }
+            const {source, editor, position} = chosen;
+            await this.requestSourceSync(source, {
+                requestGeneration, expectedRecord: record, expectedPdfGeneration: r.pdfGeneration,
+                isStillApplicable: () => isCurrentRequest() && this.isManualSourceStillApplicable(source)
+                    && !editor.document.isClosed && vscode.window.visibleTextEditors.includes(editor)
+                    && editor.selection.active.line === position.line
+                    && editor.selection.active.character === position.character,
+            });
+        } catch (error) {
+            console.warn('Unable to navigate from the TeX cursor to the Overleaf PDF.', error);
+            if (isCurrentRequest()) { this.showPdfNavigationUnavailable(); }
+        }
+    }
+
+    private showPdfNavigationUnavailable() {
+        void vscode.window.showWarningMessage(vscode.l10n.t(
+            'PDF navigation is unavailable. Wait for the preview to load, or compile the project to obtain matching SyncTeX data.',
+        ));
+    }
+
     private _revealSelectionInEditor(editor: vscode.TextEditor, targetLine: number, identifier?: string) {
         // targetLine is 1-based from the syncTeX result
         const lineIndex = targetLine - 1;
@@ -1557,6 +1628,7 @@ export class CompileManager {
         pdfGeneration: number,
         uri: vscode.Uri,
         webviewPanel: vscode.WebviewPanel,
+        fromButton?: boolean,
     }) {
         if (!r || r.uri?.scheme !== ROOT_NAME || !Number.isSafeInteger(r.pdfGeneration) || r.pdfGeneration <= 0) {
             return;
@@ -1574,7 +1646,10 @@ export class CompileManager {
                 pdfViewRecord[identifier]?.[filePath] === record &&
                 isPdfGenerationSyncable(record, r.pdfGeneration)
             );
-            if (!isCurrentPdf()) { return; }
+            if (!isCurrentPdf()) {
+                if (r.fromButton) { this.showPdfNavigationUnavailable(); }
+                return;
+            }
 
             // A double-click is a new navigation intent, just like Jump to PDF.
             // Neither an older forward response nor an older double-click may
@@ -1708,6 +1783,7 @@ export class CompileManager {
             this.pdfViewDisposedTrigger,
             this.sourceDocumentChangedTrigger,
             this.sourceDocumentClosedTrigger,
+            this.sourceEditorChangedTrigger,
             // register compile commands
             vscode.commands.registerCommand(
                 `${ROOT_NAME}.compileManager.compile`,
@@ -1719,6 +1795,7 @@ export class CompileManager {
             ),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.viewPdf`, () =>  this.openPdf()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.syncCode`, () => this.syncCode()),
+            vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.syncCodeFromPdf`, (r) => this.syncCodeFromPdf(r)),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.syncPdf`, (r) => this.syncPdf(r)),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.refreshPdf`, (doc: PdfDocument) => this.refreshPdf(doc)),
             vscode.commands.registerCommand(`${ROOT_NAME}.compilerManager.settings`, ()=> this.compileSettings()),

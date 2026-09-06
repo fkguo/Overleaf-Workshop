@@ -9,6 +9,7 @@ export class PdfElement {
     parentElement?: PdfElement;
     children: PdfElement[] = [];
     innerText = '';
+    rect = {left: 20, top: 30, right: 620, bottom: 830};
     constructor(readonly kind: string, readonly pageNumber?: string) {}
     append(child: PdfElement) { child.parentElement = this; this.children.push(child); return child; }
     closest(selector: string): PdfElement | undefined {
@@ -20,17 +21,32 @@ export class PdfElement {
         return this.children.find(child => child.kind === selector)
             ?? this.children.map(child => child.querySelector(selector)).find(Boolean);
     }
-    getBoundingClientRect() { return {left: 20, top: 30}; }
+    getBoundingClientRect() { return this.rect; }
 }
 
-export async function createPdfViewerHarness() {
+export async function createPdfViewerHarness(initialState?: any) {
     const root = join(__dirname, '../../../views/pdf-viewer');
     const listeners = new Map<string, (event?: any) => unknown>();
     const messages: any[] = [];
     const destinations: any[] = [];
     const errors: unknown[][] = [];
     const animationFrames: Array<() => void> = [];
-    const container = {scrollLeft: 0, scrollTop: 0};
+    const container = {scrollLeft: 0, scrollTop: 0,
+        getBoundingClientRect: () => ({left: 0, top: 0, right: 800, bottom: 600})};
+    const pages: PdfElement[] = [];
+    const buttons = new Map<string, () => void>();
+    const navigationListeners = new Map<string, (event: any) => void>();
+    let savedState = initialState;
+    let capturedPointer: number | undefined;
+    const navigation = {
+        hidden: false, style: {top: '50%'}, dataset: {} as Record<string, string>,
+        getBoundingClientRect: () => ({left: 0, width: 22, height: 38,
+            top: parseFloat(navigation.style.top) * window.innerHeight / 100 - 19}),
+        addEventListener: (name: string, listener: (event: any) => void) => navigationListeners.set(name, listener),
+        setPointerCapture: (id: number) => { capturedPointer = id; },
+        hasPointerCapture: (id: number) => capturedPointer === id,
+        releasePointerCapture: () => { capturedPointer = undefined; },
+    };
     const errorBanner = {hidden: true};
     let retryDownload: (() => void) | undefined;
     const viewport = {
@@ -57,15 +73,23 @@ export async function createPdfViewerHarness() {
         },
     };
     const window = {
+        innerHeight: 600,
         addEventListener: (name: string, listener: (event?: any) => unknown) => listeners.set(name, listener),
         requestAnimationFrame: (callback: () => void) => animationFrames.push(callback),
     };
     runInNewContext(readFileSync(join(root, 'index.js'), 'utf8'), {
-        window, Element: PdfElement, document: {getElementById: (id: string) =>
+        window, Element: PdfElement, document: {
+            querySelectorAll: () => pages,
+            getElementById: (id: string) =>
+            id === 'overleaf-sync-navigation' ? navigation :
+            id === 'toolbarContainer' ? {getBoundingClientRect: () => ({bottom: 32})} :
             id === 'overleaf-pdf-load-error' ? errorBanner : id === 'overleaf-pdf-retry' ?
-                {addEventListener: (_name: string, listener: () => void) => { retryDownload = listener; }} : container},
+                {addEventListener: (_name: string, listener: () => void) => { retryDownload = listener; }} :
+                id.startsWith('overleaf-sync-') ?
+                    {addEventListener: (_name: string, listener: () => void) => buttons.set(id, listener)} : container},
         console: {log() {}, error: (...args: unknown[]) => errors.push(args)},
-        acquireVsCodeApi: () => ({postMessage: (message: any) => messages.push(message), getState() {}, setState() {}}),
+        acquireVsCodeApi: () => ({postMessage: (message: any) => messages.push(message),
+            getState: () => savedState, setState: (state: any) => { savedState = JSON.parse(JSON.stringify(state)); }}),
         PDFViewerApplication: application, pdfjsLib: {},
         OverleafPdfLifecycle: require(join(root, 'pdfLifecycle.js')),
         OverleafPdfSyncGeneration: require(join(root, 'syncGeneration.js')),
@@ -76,8 +100,21 @@ export async function createPdfViewerHarness() {
         for (const callback of animationFrames.splice(0)) { callback(); }
     };
     const send = (data: any) => listeners.get('message')?.({data});
+    const click = (id: string, detail = 1) => {
+        let stopped = false;
+        navigationListeners.get('click')?.({detail, preventDefault() {}, stopImmediatePropagation() { stopped = true; }});
+        if (!stopped) { buttons.get(id)?.(); }
+    };
     return {
-        messages, destinations, errors, application, viewport, settle, send,
+        messages, destinations, errors, application, viewport, settle, send, pages, container,
+        clickSyncToPdf: (detail = 1) => click('overleaf-sync-to-pdf', detail),
+        clickSyncToSource: (detail = 1) => click('overleaf-sync-to-source', detail),
+        navigation, savedState: () => savedState,
+        pointer: (type: string, clientY: number, overrides = {}) => {
+            const event = {pointerId: 1, clientY, isPrimary: true, button: 0, target: navigation, preventDefault() {}, ...overrides};
+            (navigationListeners.get(type) ?? listeners.get(type))?.(event);
+        },
+        resize: (height: number) => { window.innerHeight = height; listeners.get('resize')?.(); },
         errorBanner, retryDownload: () => retryDownload?.(),
         load: async (generation = 1) => { send({type: 'update', content: new Uint8Array([1]), pdfGeneration: generation}); await settle(); },
         doubleClick: (target: any) => listeners.get('dblclick')?.({target, clientX: 220, clientY: 330}),

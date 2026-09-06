@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.1] - 2026-09-06
+### Added
+- Add source/PDF navigation arrows on the left edge of the compiled PDF preview. Jump to PDF uses the selected visible TeX source's cursor; jump to source uses the centre of the most visible PDF page area.
+- Use compact 20 × 18 pixel arrow buttons, draggable vertically along the left edge with their position remembered for each PDF.
+- Keep navigation tied to the clicked preview's project and matching PDF/SyncTeX generation, without saving source files or starting a compile.
+
 ## [0.16.0] - 2026-09-05
 ### Added
 - Synchronize editor text while typing, without requiring an explicit save for every collaboration update.

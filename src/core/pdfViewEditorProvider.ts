@@ -136,6 +136,18 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                         webviewPanel,
                     });
                     break;
+                case 'syncCodeFromPdf':
+                    void vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.syncCodeFromPdf`, {
+                        pdfGeneration: e.pdfGeneration,
+                        uri: doc.uri,
+                        webviewPanel,
+                    });
+                    break;
+                case 'syncUnavailable':
+                    void vscode.window.showWarningMessage(vscode.l10n.t(
+                        'PDF navigation is unavailable. Wait for the preview to load, or compile the project to obtain matching SyncTeX data.',
+                    ));
+                    break;
                 case 'saveState':
                     GlobalStateManager.updatePdfViewPersist(this.context, doc.uri.toString(), e.content);
                     break;
@@ -174,7 +186,8 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         });
 
         webviewPanel.webview.options = {enableScripts:true};
-        webviewPanel.webview.html = await this.getHtmlForWebview(webviewPanel.webview);
+        webviewPanel.webview.html = await this.getHtmlForWebview(webviewPanel.webview,
+            doc.uri.path?.endsWith(`/${OUTPUT_FOLDER_NAME}/output.pdf`));
     }
 
     /** Reattach custom PDF tabs left behind by Restart Extension Host. */
@@ -255,7 +268,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         ];
     }
 
-    private patchViewerHtml(webview: vscode.Webview, html: string): string {
+    private patchViewerHtml(webview: vscode.Webview, html: string, enableSyncNavigation = false): string {
         const patchPath = (...path:string[]) => webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'views/pdf-viewer', ...path)).toString();
 
         // adjust original path
@@ -275,6 +288,10 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         );
 
         html = html.replace(/<body([^>]*)>/, `<body$1>
+<div id="overleaf-sync-navigation" role="group" aria-label="Source and PDF navigation" title="Drag up or down to move the navigation arrows"${enableSyncNavigation ? '' : ' hidden'}>
+    <button id="overleaf-sync-to-pdf" type="button" title="Jump to PDF from the TeX cursor" aria-label="Jump to PDF from the TeX cursor">&#8594;</button>
+    <button id="overleaf-sync-to-source" type="button" title="Jump to TeX from the visible PDF area" aria-label="Jump to TeX from the visible PDF area">&#8592;</button>
+</div>
 <div id="overleaf-pdf-load-error" role="status" hidden>
     The PDF could not be downloaded. The last loaded preview, if any, is unchanged.
     <button id="overleaf-pdf-retry" type="button">Retry PDF download</button>
@@ -283,10 +300,10 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         return html;
     }
 
-    private async getHtmlForWebview(webview: vscode.Webview): Promise<string> {
+    private async getHtmlForWebview(webview: vscode.Webview, enableSyncNavigation = false): Promise<string> {
         const htmlPath = vscode.Uri.joinPath(this.context.extensionUri, 'views/pdf-viewer/vendor/web/viewer.html');
         let html = (await vscode.workspace.fs.readFile(htmlPath)).toString();
-        return this.patchViewerHtml(webview, html);
+        return this.patchViewerHtml(webview, html, enableSyncNavigation);
     }
 
 }
