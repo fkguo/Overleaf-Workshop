@@ -37,6 +37,12 @@ exports.run = async function () {
     const commands = await vscode.commands.getCommands(true);
     assert.ok(commands.includes('overleaf-workshop.projectManager.addServer'));
     assert.ok(commands.includes('remoteFileSystem.prefetch'));
+    assert.ok(commands.includes('overleaf-workshop.remoteFileSystem.reloadRemote'));
+    const reload = extension.packageJSON.contributes.menus['editor/title'].find(
+        item => item.command === 'overleaf-workshop.remoteFileSystem.reloadRemote');
+    assert.equal(reload?.when, 'resourceScheme == overleaf-workshop && resourceExtname == .tex');
+    await vscode.commands.executeCommand('overleaf-workshop.remoteFileSystem.reloadRemote',
+        vscode.Uri.file(path.join(vscode.workspace.workspaceFolders[0].uri.fsPath, 'local.tex')));
     assert.equal(vscode.workspace.fs.isWritableFileSystem('overleaf-workshop'), true,
         'Overleaf file system provider was not registered');
     console.log(`PACKAGED_ACTIVATION_OK ${vscode.env.appName} ${extension.packageJSON.version}`);

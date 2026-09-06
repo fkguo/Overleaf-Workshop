@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.2] - 2026-09-06
+
+### Added
+
+- Add a Reload Remote button to Overleaf TeX editor tabs, with draft comparison and a required local backup before replacement. It does not invoke save or compile, and stops when a write remains unconfirmed.
+
+### Changed
+
+- Reduce PDF navigation button width from 20 to 15 pixels while retaining the 18-pixel height and vertical dragging. Highlight the hovered arrow with contrasting theme colors and an inset border.
+
+### Fixed
+
+- Update the inactive-thread GitHub workflow to lock-threads v6.0.2, fixing rejection of longer GitHub tokens and using its Node 24 runtime.
+
 ## [0.16.1] - 2026-09-06
 ### Added
 - Add source/PDF navigation arrows on the left edge of the compiled PDF preview. Jump to PDF uses the selected visible TeX source's cursor; jump to source uses the centre of the most visible PDF page area.

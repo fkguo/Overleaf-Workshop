@@ -2817,6 +2817,8 @@ describe('remote document exact-base write gate', () => {
     });
 
     async function recoverWithUI(harness: Harness, options: {
+        manual?: boolean,
+        cancelConfirmation?: boolean,
         action?: string,
         replace?: boolean,
         cancelBackup?: boolean,
@@ -2857,10 +2859,13 @@ describe('remote document exact-base write gate', () => {
                 backups.push(new TextDecoder().decode(bytes));
                 options.afterBackup?.();
             };
-            vscodeStub.window.showWarningMessage = async () => {
+            vscodeStub.window.showWarningMessage = async (_message, ...items) => {
+                if (options.manual && !items[0]?.modal) {
+                    return options.replace ? 'Save Copy and Reload Remote' : undefined;
+                }
                 confirmations += 1;
                 options.beforeConfirm?.();
-                return 'Reload Remote';
+                return options.cancelConfirmation ? undefined : 'Reload Remote';
             };
             vscodeStub.window.showTextDocument = async (document: TestTextDocument) => {
                 options.beforeEdit?.();
@@ -2893,7 +2898,11 @@ describe('remote document exact-base write gate', () => {
                 });
             };
             delete harness.vfs.showDocumentRecovery;
-            harness.vfs.showDocumentRecovery(harness.uri, new Uint8Array(), 'test blocked draft');
+            if (options.manual) {
+                await harness.vfs.reloadRemoteDocument(harness.document);
+            } else {
+                harness.vfs.showDocumentRecovery(harness.uri, new Uint8Array(), 'test blocked draft');
+            }
             await waitUntil(() => harness.vfs.recoveryNotifications.size === 0, 'recovery UI completes');
             return {errors, actions, comparisons, backups, confirmations, edits, saves};
         } finally {
@@ -2911,6 +2920,262 @@ describe('remote document exact-base write gate', () => {
         assert.equal(harness.vfs.unboundEditorIncarnations.has(harness.document), true);
         assert.equal(harness.vfs.editorBufferIds.get(harness.document), undefined);
         return harness;
+    }
+
+    it('toolbar reload reads a fresh clean remote head without saving or submitting a replacement', async () => {
+        const harness = makeHarness({remoteText: 'old', remoteVersion: 7});
+        await confirmBase(harness, 'old');
+        harness.setRemoteText('remote + collaborator');
+        harness.setRemoteVersion(8);
+        const result = await recoverWithUI(harness, {manual: true});
+        assert.deepEqual(result.errors, []);
+        assert.equal(result.confirmations, 0);
+        assert.equal(result.comparisons.length, 0);
+        assert.equal(result.backups.length, 0);
+        assert.equal(result.edits, 1);
+        assert.equal(result.saves, 0);
+        assert.equal(harness.document.getText(), 'remote + collaborator');
+        assert.equal(harness.submissions.length, 0);
+        assert.equal(harness.vfs.liveEditorSubmissions.size, 0, 'the remote replacement must not queue an OT edit');
+        await write(harness, 'remote + collaborator');
+        assert.equal(harness.submissions.length, 0);
+        await write(harness, 'remote + collaborator + mine');
+        assert.equal(harness.getRemoteText(), 'remote + collaborator + mine');
+        assert.equal(harness.submissions.length, 1);
+    });
+
+    it('toolbar command uses its explicit tab URI, not a later active editor', async () => {
+        const selected = makeHarness();
+        const other = makeHarness({projectId: 'other-project'});
+        const provider = Object.create(remoteModule.RemoteFileSystemProvider.prototype);
+        const calls: unknown[] = [];
+        provider.prefetch = async (uri: TestUri) => {
+            assert.equal(uri, selected.uri);
+            vscodeStub.window.activeTextEditor = {document: other.document};
+            return {reloadRemoteDocument: async (document: TestTextDocument) => { calls.push(document); }};
+        };
+        try {
+            await provider.reloadRemote(selected.uri);
+            assert.deepEqual(calls, [selected.document]);
+        } finally { vscodeStub.window.activeTextEditor = undefined; }
+    });
+
+    it('toolbar command rejects local files, PDF previews, and duplicate or changed editor instances', async () => {
+        const harness = makeHarness();
+        const provider = Object.create(remoteModule.RemoteFileSystemProvider.prototype);
+        const errors: string[] = [];
+        let reads = 0;
+        let reloads = 0;
+        const showError = vscodeStub.window.showErrorMessage;
+        vscodeStub.window.showErrorMessage = async message => { errors.push(message); };
+        provider.prefetch = async () => {
+            reads++;
+            harness.document.setDirtyText('changed before dispatch');
+            return {reloadRemoteDocument: async () => { reloads++; }};
+        };
+        try {
+            await provider.reloadRemote(makeUri('/local.tex', 'file'));
+            await provider.reloadRemote(harness.uri.with({path: '/Project/.output/output.pdf'}));
+            openTextDocuments.push(new TestTextDocument(harness.uri, 'duplicate'));
+            await provider.reloadRemote(harness.uri);
+            assert.equal(reads, 0);
+            openTextDocuments.pop();
+            await provider.reloadRemote(harness.uri);
+            assert.equal(reads, 1);
+            assert.equal(reloads, 0);
+            assert.equal(errors.length, 2);
+        } finally { vscodeStub.window.showErrorMessage = showError; }
+    });
+
+    it('toolbar reload cancels queued local sends before applying a remote replacement', async () => {
+        const harness = makeHarness({remoteText: 'abc'});
+        await confirmBase(harness, 'abc');
+        harness.document.setDirtyText('abc + local');
+        observeDirtyChange(harness);
+        assert.equal(harness.vfs.liveEditorSubmissions.size, 1);
+        const result = await recoverWithUI(harness, {manual: true, replace: true});
+        assert.deepEqual(result.errors, []);
+        assert.deepEqual(result.backups, ['abc + local']);
+        assert.equal(harness.vfs.liveEditorSubmissions.size, 0);
+        assert.equal(harness.document.getText(), 'abc');
+        assert.equal(harness.submissions.length, 0);
+    });
+
+    it('toolbar reload refuses a path already reused by a different remote document', async () => {
+        const harness = makeHarness();
+        await confirmBase(harness, harness.document.getText());
+        harness.doc._id = 'replacement-doc';
+        const before = harness.document.getText();
+        const result = await recoverWithUI(harness, {manual: true, replace: true});
+        assert.match(result.errors[0], /cannot be uniquely identified/);
+        assert.equal(result.edits, 0);
+        assert.equal(result.saves, 0);
+        assert.equal(harness.document.getText(), before);
+    });
+
+    for (const protocol of ['sharejs', 'history'] as const) {
+        it(`toolbar reload of unchanged ${protocol} text is a no-edit, no-save operation`, async () => {
+            const harness = protocol === 'history' ? makeHistoryWriteHarness() : makeHarness();
+            await confirmBase(harness, harness.document.getText());
+            const version = harness.document.version;
+            const result = await recoverWithUI(harness, {manual: true});
+            assert.deepEqual(result.errors, []);
+            assert.equal(result.edits, 0);
+            assert.equal(result.saves, 0);
+            assert.equal(harness.document.isDirty, false);
+            assert.equal(harness.document.version, version);
+            assert.equal(harness.submissions.length, 0);
+        });
+
+        it(`toolbar reload backs up a dirty ${protocol} draft and enables only subsequent explicit edits`, async () => {
+            const harness = protocol === 'history' ? makeHistoryWriteHarness() : makeHarness();
+            const remote = harness.document.getText();
+            await confirmBase(harness, remote);
+            harness.document.setDirtyText('local draft');
+            const result = await recoverWithUI(harness, {manual: true, replace: true});
+            assert.deepEqual(result.errors, []);
+            assert.deepEqual(result.comparisons, [{remote, draft: 'local draft'}]);
+            assert.deepEqual(result.backups, ['local draft']);
+            assert.equal(result.confirmations, 1);
+            assert.equal(result.edits, 1);
+            assert.equal(result.saves, 0);
+            assert.equal(harness.document.getText(), remote);
+            assert.equal(harness.vfs.liveEditorSubmissions.size, 0);
+            await write(harness, remote + ' + next edit');
+            assert.equal(harness.getRemoteText(), remote + ' + next edit');
+        });
+    }
+
+    it('canceling a live draft comparison does not rejoin or reset its editing base', async () => {
+        const harness = makeHistoryWriteHarness();
+        const bufferId = await confirmBase(harness, harness.document.getText());
+        harness.document.setDirtyText('abc + draft');
+        observeDirtyChange(harness);
+        const active = harness.vfs.activeEditorBases.get(bufferId);
+        const historyEpoch = harness.doc.historyOtEpoch;
+        let joins = 0;
+        harness.vfs.joinFreshDocumentSession = async () => { joins++; throw new Error('unexpected rejoin'); };
+        const result = await recoverWithUI(harness, {manual: true});
+        assert.deepEqual(result.errors, []);
+        assert.equal(result.edits, 0);
+        assert.equal(result.saves, 0);
+        assert.equal(joins, 0);
+        assert.equal(harness.vfs.activeEditorBases.get(bufferId), active);
+        assert.equal(harness.doc.historyOtEpoch, historyEpoch);
+        assert.equal(harness.document.getText(), 'abc + draft');
+        harness.vfs.cancelLiveEditorSubmissions();
+    });
+
+    for (const pending of [true, false]) {
+        it(`toolbar reload preserves previous-window recovery records with pending=${pending}`, async () => {
+            const harness = unboundRecoveryHarness();
+            const previous = new DocumentProvenanceStore(harness.storage, {sessionId: 'previous-window'});
+            const record = await previous.createOrUpdateCurrent({
+                identity: harness.identity, bufferIncarnationId: 'previous-buffer', baseVersion: 7,
+                baseText: 'old base', dirtyText: harness.document.getText(),
+            });
+            if (pending) { await previous.markPendingWrite(record.recordName, {token: 'unconfirmed', version: 7}); }
+            const before = [...harness.storage.records.entries()];
+            const result = await recoverWithUI(harness, {manual: true, replace: true});
+            assert.deepEqual([...harness.storage.records.entries()], before);
+            assert.equal(result.saves, 0);
+            assert.equal(harness.submissions.length, 0);
+            if (pending) {
+                assert.equal(result.edits, 0);
+                assert.match(result.errors[0], /unconfirmed write/);
+                assert.equal(harness.document.getText(), 'unbound hot-exit draft');
+            } else {
+                assert.deepEqual(result.errors, []);
+                assert.deepEqual(result.backups, ['unbound hot-exit draft']);
+                assert.equal(result.edits, 1);
+            }
+        });
+    }
+
+    for (const failure of ['cancel backup', 'failed backup', 'typing before backup', 'typing during backup',
+        'cancel confirmation', 'typing during confirmation', 'remote during confirmation',
+        'session during confirmation', 'path reused during confirmation', 'new dirty alias',
+        'reopened during confirmation', 'typing during focus', 'failed edit', 'remote during edit']) {
+        it(`toolbar reload retains the draft or backup on ${failure}`, async () => {
+            const harness = unboundRecoveryHarness();
+            const result = await recoverWithUI(harness, {
+                manual: true, replace: true,
+                cancelBackup: failure === 'cancel backup',
+                backupFailure: failure === 'failed backup',
+                cancelConfirmation: failure === 'cancel confirmation',
+                beforeBackup: failure === 'typing before backup' ? () => harness.document.setDirtyText('newer draft') : undefined,
+                afterBackup: failure === 'typing during backup' ? () => harness.document.setDirtyText('newer draft') : undefined,
+                beforeConfirm: () => {
+                    if (failure === 'typing during confirmation') { harness.document.setDirtyText('newer draft'); }
+                    if (failure === 'remote during confirmation') { harness.setRemoteText('newer remote'); harness.setRemoteVersion(9); }
+                    if (failure === 'session during confirmation') { harness.vfs.socket.generation++; }
+                    if (failure === 'path reused during confirmation') { harness.doc._id = 'new-doc'; }
+                    if (failure === 'new dirty alias') {
+                        const alias = new TestTextDocument(harness.uri, 'another draft');
+                        alias.isDirty = true;
+                        openTextDocuments.push(alias);
+                    }
+                    if (failure === 'reopened during confirmation') {
+                        harness.document.isClosed = true;
+                        openTextDocuments.splice(0, 1, new TestTextDocument(harness.uri, 'reopened draft'));
+                    }
+                },
+                beforeEdit: failure === 'typing during focus' ? () => harness.document.setDirtyText('newer draft') : undefined,
+                failEdit: failure === 'failed edit',
+                afterEdit: failure === 'remote during edit' ? () => { harness.doc.version = 9; harness.doc.remoteCache = 'newer remote'; } : undefined,
+            });
+            assert.equal(result.edits, failure === 'remote during edit' ? 1 : 0);
+            assert.equal(result.saves, 0);
+            assert.equal(harness.submissions.length, 0);
+            assert.equal(harness.vfs.activeEditorBases.size, 0);
+            if (result.edits) { assert.deepEqual(result.backups, ['unbound hot-exit draft']); }
+            else if (!harness.document.isClosed) { assert.match(harness.document.getText(), /draft/); }
+        });
+    }
+
+    for (const pending of ['queued save', 'OT outcome', 'conditional outcome', 'live submission']) {
+        it(`toolbar reload does not disturb a pending ${pending}`, async () => {
+            const harness = makeHarness();
+            const bufferId = await confirmBase(harness, harness.document.getText());
+            if (pending === 'queued save') { harness.vfs.documentWrites.set('doc:doc-1', Promise.resolve()); }
+            if (pending === 'OT outcome') { harness.vfs.pendingDocumentUpdates.set(bufferId, {docId: 'doc-1'}); }
+            if (pending === 'conditional outcome') { harness.vfs.pendingConditionalDocumentUpdates.set('doc-1', {token: 'uncertain'}); }
+            if (pending === 'live submission') { harness.vfs.liveEditorSubmissions.set(bufferId, {bufferId, running: Promise.resolve()}); }
+            let joins = 0;
+            harness.vfs.joinFreshDocumentSession = async () => { joins++; throw new Error('unexpected rejoin'); };
+            const result = await recoverWithUI(harness, {manual: true, replace: true});
+            assert.equal(joins, 0);
+            assert.equal(result.edits, 0);
+            assert.equal(result.saves, 0);
+            assert.match(result.errors[0], /pending or unconfirmed/);
+            assert.equal(harness.vfs.editorBufferIds.get(harness.document), bufferId);
+        });
+    }
+
+    for (const failure of ['missing file', 'binary file', 'disconnected', 'changed account', 'typing during read', 'read failure']) {
+        it(`toolbar reload makes no replacement on ${failure}`, async () => {
+            const harness = makeHarness();
+            await confirmBase(harness, harness.document.getText());
+            if (failure === 'missing file') { harness.vfs._resolveUri = async () => ({}); }
+            if (failure === 'binary file') { harness.vfs._resolveUri = async () => ({fileType: 'file', fileEntity: harness.doc}); }
+            if (failure === 'disconnected') { harness.vfs.socket.isConnected = false; }
+            if (failure === 'changed account') { harness.vfs.context.globalState.get = () => ({}); }
+            if (failure === 'read failure') { harness.vfs.joinFreshDocumentSession = async () => { throw new Error('read failed'); }; }
+            if (failure === 'typing during read') {
+                const join = harness.vfs.joinFreshDocumentSession;
+                harness.vfs.joinFreshDocumentSession = async () => {
+                    harness.document.setDirtyText('typed during reload');
+                    return join();
+                };
+            }
+            const before = harness.document.getText();
+            const result = await recoverWithUI(harness, {manual: true});
+            assert.equal(result.edits, 0);
+            assert.equal(result.saves, 0);
+            assert.equal(harness.submissions.length, 0);
+            assert.equal(harness.document.getText(), failure === 'typing during read' ? 'typed during reload' : before);
+            assert.equal(result.errors.length, 1);
+        });
     }
 
     it('offers read-only comparison, not Reload Remote, for an unbound draft with a project URI', async () => {

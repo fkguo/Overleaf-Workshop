@@ -40,7 +40,7 @@ export async function createPdfViewerHarness(initialState?: any) {
     let capturedPointer: number | undefined;
     const navigation = {
         hidden: false, style: {top: '50%'}, dataset: {} as Record<string, string>,
-        getBoundingClientRect: () => ({left: 0, width: 22, height: 38,
+        getBoundingClientRect: () => ({left: 0, width: 17, height: 38,
             top: parseFloat(navigation.style.top) * window.innerHeight / 100 - 19}),
         addEventListener: (name: string, listener: (event: any) => void) => navigationListeners.set(name, listener),
         setPointerCapture: (id: number) => { capturedPointer = id; },

@@ -1132,7 +1132,7 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     private documentProvenanceIdentity(
         docId: string,
-        buffer: Pick<EditorBufferState, 'bufferId' | 'canonicalEditorUri'>,
+        buffer: {canonicalEditorUri: string, bufferId?: string},
     ): DocumentProvenanceIdentity | undefined {
         const resolved = this._resolveById(docId);
         const otType = resolved?.fileType === 'doc'
@@ -2959,6 +2959,153 @@ export class VirtualFileSystem extends vscode.Disposable {
         return (this.liveRecoverySuppressions?.get(
             this.liveRecoverySuppressionKey(uri),
         ) ?? 0) > 0;
+    }
+
+    /** Explicit toolbar reload. Never invoke save participants or send an edit. */
+    async reloadRemoteDocument(document: vscode.TextDocument): Promise<void> {
+        const uri = document.uri;
+        const key = uri.toString();
+        if (this.recoveryNotifications.has(key)) {
+            void vscode.window.showInformationMessage(vscode.l10n.t('Recovery or reload is already open for this document.'));
+            return;
+        }
+        this.recoveryNotifications.add(key);
+        const originalBufferId = this.editorBufferIds.get(document);
+        const originalBuffer = originalBufferId ? this.editorBuffers.get(originalBufferId) : undefined;
+        const originalDocId = originalBuffer?.document === document
+            ? originalBuffer.docId : this.cachedDocumentIdForUri(uri);
+        const originalVersion = document.version;
+        const originalText = document.getText();
+        const stillOpen = () => !document.isClosed && this.exactOpenDocument(uri) === document;
+        const draftStillCurrent = () => stillOpen() && document.version === originalVersion
+            && document.getText() === originalText && this.editorBufferIds.get(document) === originalBufferId;
+        const saveCopy = vscode.l10n.t('Save Recovery Copy...');
+        const saveLocalCopy = async (text: string, isCurrent: () => boolean): Promise<boolean> => {
+            const target = await vscode.window.showSaveDialog({saveLabel: saveCopy});
+            if (!target) { return false; }
+            if (target.scheme !== 'file') { throw new Error('Choose a local file for the recovery copy'); }
+            if (!isCurrent()) { throw new Error('The editor changed; no recovery copy was written'); }
+            await vscode.workspace.fs.writeFile(target, new TextEncoder().encode(text));
+            return true;
+        };
+        try {
+            this.assertAuthenticatedAccount(uri);
+            const parsed = parseUri(uri);
+            if (this.disposed || uri.scheme !== ROOT_NAME || !/\.tex$/i.test(uri.path)
+                || parsed.serverName !== this.serverName || parsed.projectId !== this.projectId
+                || !draftStillCurrent()) {
+                throw new Error('The selected Overleaf editor cannot be uniquely identified');
+            }
+            const resolved = await this._resolveUri(uri);
+            const docId = resolved.fileType === 'doc' ? resolved.fileEntity?._id : undefined;
+            if (!docId || (originalDocId && originalDocId !== docId)) {
+                throw new Error('The remote text document cannot be uniquely identified');
+            }
+            const sender = this.currentSenderWitness();
+            const canRead = () => {
+                this.assertAuthenticatedAccount(uri);
+                return !this.disposed && this.cachedDocumentIdForUri(uri) === docId
+                    && this.currentSenderWitness()?.publicId === sender?.publicId
+                    && this.currentSenderWitness()?.generation === sender?.generation
+                    && !vscode.workspace.textDocuments.some(other => other !== document && !other.isClosed
+                        && this.cachedDocumentIdForUri(other.uri) === docId);
+            };
+            const hasPendingWrite = () => this.documentWrites.has(`doc:${docId}`)
+                || this.documentWrites.has(`path:${this.projectId}:${parsed.pathParts.join('/')}`)
+                || [...this.pendingDocumentUpdates.values()].some(pending => pending.docId === docId)
+                || this.pendingConditionalDocumentUpdates.has(docId)
+                || this.currentDocument(docId).historyOtSession?.getState().hasPendingOperation === true
+                || [...this.liveEditorSubmissions.values()].some(state => state.running
+                    && this.editorBuffers.get(state.bufferId)?.docId === docId);
+            const checkBeforeRead = () => {
+                if (!sender || !canRead() || !draftStillCurrent()) {
+                    throw new Error('The editor, file identity, or connection changed; reload again');
+                }
+                if (hasPendingWrite()) {
+                    throw new Error('A document write is still pending or unconfirmed. Keep the draft and retry after its outcome is known');
+                }
+            };
+            checkBeforeRead();
+            const identity = this.documentProvenanceIdentity(docId, {canonicalEditorUri: this.canonicalEditorUri(docId)});
+            if (!identity) { throw new Error('The remote document protocol or identity is not confirmed'); }
+            const recovered = await this.provenanceStore.recoverCold(identity, originalText);
+            checkBeforeRead();
+            if (recovered.kind === 'invalid' || recovered.kind === 'ambiguous'
+                || (recovered.kind === 'valid' && recovered.record.pendingWrite !== undefined)) {
+                throw new Error('Saved recovery records are ambiguous or contain an unconfirmed write; keep the draft and recovery copies');
+            }
+            const needsConfirmation = document.isDirty || !originalBufferId || !this.activeEditorBases.has(originalBufferId)
+                || this.unboundEditorIncarnations.has(document);
+            let compared: {version: number | undefined, text: string} | undefined;
+            if (needsConfirmation) {
+                // Comparing a live draft must not rejoin/reset its OT session.
+                const current = await this.ensureDocumentSession(docId);
+                checkBeforeRead();
+                compared = {version: current.doc.version, text: current.content};
+                await showRecoveryComparison(uri, originalText, compared.text);
+                const proceed = vscode.l10n.t('Save Copy and Reload Remote');
+                const choice = await vscode.window.showWarningMessage(
+                    vscode.l10n.t('Reloading replaces this local draft. Compare the snapshots, then save a local recovery copy before continuing.'),
+                    proceed,
+                );
+                if (choice !== proceed) { return; }
+                checkBeforeRead();
+                if (!await saveLocalCopy(originalText, draftStillCurrent)) { return; }
+                const reload = vscode.l10n.t('Reload Remote');
+                if (await vscode.window.showWarningMessage(
+                    vscode.l10n.t('A local recovery copy has been saved. Replace this editor with the checked remote text?'),
+                    {modal: true}, reload,
+                ) !== reload) { return; }
+                checkBeforeRead();
+            }
+            const authoritative = await this.joinFreshDocumentSession(docId);
+            const version = authoritative.doc.version;
+            const text = authoritative.content;
+            const remoteStillCurrent = () => canRead() && !hasPendingWrite()
+                && isNonnegativeSafeInteger(version)
+                && this.documentMatchesAuthority(authoritative.doc, version, text);
+            if (!draftStillCurrent() || !remoteStillCurrent()
+                || (compared && (version !== compared.version || text !== compared.text))) {
+                throw new Error('The editor or remote snapshot changed; no text was replaced. Compare again before reloading');
+            }
+            const editor = await vscode.window.showTextDocument(document, {preserveFocus: false});
+            if (editor.document !== document || !draftStillCurrent() || !remoteStillCurrent()) {
+                throw new Error('The editor or remote snapshot changed before replacement');
+            }
+            // A whole-document replacement is a remote read, not a local OT
+            // operation. Quarantine it before change callbacks can schedule a send.
+            this.forgetTextDocument(document);
+            this.unboundEditorIncarnations.add(document);
+            const replaced = text === originalText || await editor.edit(edit => {
+                edit.replace(new vscode.Range(document.positionAt(0), document.positionAt(originalText.length)), text);
+            });
+            if (!replaced || !stillOpen() || document.getText() !== text || !remoteStillCurrent()) {
+                throw new Error('The editor could not be reloaded safely; its current text remains unsaved');
+            }
+            this.unboundEditorIncarnations.delete(document);
+            this.stageEditorBase(uri, authoritative.doc, text);
+            const rebound = this.observeEditorBuffer(document);
+            try {
+                if (!rebound || rebound.docId !== docId) { throw new Error('The reloaded editor identity could not be confirmed'); }
+                await this.acceptEditorBase({
+                    ...rebound, documentVersion: document.version, content: text,
+                }, authoritative.doc, version!, text);
+            } catch (error) {
+                this.forgetTextDocument(document);
+                this.unboundEditorIncarnations.add(document);
+                throw error;
+            }
+        } catch (error) {
+            const choice = await vscode.window.showErrorMessage(vscode.l10n.t(
+                'Overleaf reload stopped: {reason}. This reload did not save anything to Overleaf.',
+                {reason: error instanceof Error ? error.message : String(error)},
+            ), ...(stillOpen() ? [saveCopy] : []));
+            if (choice === saveCopy && stillOpen()) {
+                await saveLocalCopy(document.getText(), stillOpen);
+            }
+        } finally {
+            this.recoveryNotifications.delete(key);
+        }
     }
 
     private showDocumentRecovery(uri: vscode.Uri, _content: Uint8Array, reason: string) {
@@ -9934,6 +10081,29 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider, vsco
         return this.getVFS(uri).then((vfs) => {return vfs;});
     }
 
+    async reloadRemote(uri = vscode.window.activeTextEditor?.document.uri): Promise<void> {
+        if (!uri || uri.scheme !== ROOT_NAME || !/\.tex$/i.test(uri.path)) { return; }
+        const matches = vscode.workspace.textDocuments.filter(document => !document.isClosed
+            && document.uri.toString() === uri.toString());
+        if (matches.length !== 1) {
+            void vscode.window.showErrorMessage(vscode.l10n.t('The selected Overleaf editor is not uniquely open.'));
+            return;
+        }
+        const document = matches[0];
+        const version = document.version;
+        try {
+            const vfs = await this.prefetch(uri);
+            if (document.isClosed || !vscode.workspace.textDocuments.includes(document) || document.version !== version) {
+                throw new Error('The selected editor changed before reload started');
+            }
+            await vfs.reloadRemoteDocument(document);
+        } catch (error) {
+            void vscode.window.showErrorMessage(vscode.l10n.t('Overleaf reload stopped: {reason}.', {
+                reason: error instanceof Error ? error.message : String(error),
+            }));
+        }
+    }
+
     getTrackChangesPresentation(uri: vscode.Uri) {
         return this.getVFS(uri).then(vfs => vfs.getTrackChangesPresentation(uri));
     }
@@ -9998,6 +10168,9 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider, vsco
             // register file system provider
             vscode.workspace.registerFileSystemProvider(ROOT_NAME, this, { isCaseSensitive: true }),
             // register commands
+            vscode.commands.registerCommand(`${ROOT_NAME}.remoteFileSystem.reloadRemote`, (uri?: vscode.Uri) => {
+                return this.reloadRemote(uri);
+            }),
             vscode.commands.registerCommand(`${ROOT_NAME}.remoteFileSystem.refreshLinkedFile`, (uri: vscode.Uri) => {
                 return this.prefetch(uri).then((vfs) => vfs.refreshLinkedFile(uri));
             }),

@@ -2,7 +2,7 @@
   "name": "overleaf-workshop",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.16.1",
+  "version": "0.16.2",
   "icon": "resources/icons/app_icon.png",
   "author": {
     "name": "iamhyc",
@@ -115,6 +115,13 @@
       }
     ],
     "commands": [
+      {
+        "command": "overleaf-workshop.remoteFileSystem.reloadRemote",
+        "title": "%commands.remoteFileSystem.reloadRemote.title%",
+        "icon": "$(refresh)",
+        "enablement": "resourceScheme == overleaf-workshop && resourceExtname == .tex",
+        "category": "Overleaf Workshop"
+      },
       {
         "command": "overleaf-workshop.remoteFileSystem.refreshLinkedFile",
         "title": "%commands.remoteFileSystem.refreshLinkedFile.title%",
@@ -620,6 +627,11 @@
         }
       ],
       "editor/title": [
+        {
+          "command": "overleaf-workshop.remoteFileSystem.reloadRemote",
+          "when": "resourceScheme == overleaf-workshop && resourceExtname == .tex",
+          "group": "navigation@3"
+        },
         {
           "command": "overleaf-workshop.compileManager.compile",
           "when": "(resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile) && resourceExtname == .tex",

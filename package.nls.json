@@ -1,4 +1,5 @@
 {
+    "commands.remoteFileSystem.reloadRemote.title": "Reload Remote",
     "extension.displayName": "Overleaf Workshop",
     "extension.description": "Open Overleaf/ShareLaTex projects in VSCode, with full collaboration support.",
 
