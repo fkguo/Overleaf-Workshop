@@ -4961,3 +4961,83 @@ describe('remote document exact-base write gate', () => {
         invisible.vfs.dispose();
     });
 });
+
+describe('Compile preview cache and explicit root safety', () => {
+    for (const message of ['401: Unauthorized', '403: Forbidden', '503: Offline', 'fetch failed', 'invalid JSON']) {
+        it(`does not misclassify a failed cache probe as missing output: ${message}`, async () => {
+            const harness = makeHarness();
+            harness.vfs.api = {getCachedCompile: async () => ({type: 'error', message})};
+            await assert.rejects(harness.vfs.adoptCachedCompile(), /Unable to query/);
+            assert.equal(harness.vfs.outputIdentityGeneration, 0);
+            assert.deepEqual(harness.submissions, []);
+        });
+    }
+
+    for (const message of ['404: Not Found', '410: Gone']) {
+        it(`permits a missing compiled output to be built: ${message}`, async () => {
+            const harness = makeHarness();
+            harness.vfs.api = {getCachedCompile: async () => ({type: 'error', message})};
+            assert.equal(await harness.vfs.adoptCachedCompile(), undefined);
+            assert.equal(harness.vfs.outputIdentityGeneration, 0);
+        });
+    }
+
+    it('rejects a cached build for another main file without publishing its PDF or SyncTeX identity', async () => {
+        const harness = makeHarness();
+        harness.vfs._resolveById = () => ({path: '/reply2.tex'});
+        harness.vfs.api = {getCachedCompile: async () => ({type: 'success', compile: {
+            status: 'success', options: {rootResourcePath: 'main.tex'},
+            outputFiles: [{path: 'output.pdf', build: 'main-build', editorId: 'main-editor'}],
+        }})};
+        assert.equal(await harness.vfs.adoptCachedCompile(false, false, 'reply-id'), undefined);
+        assert.equal(harness.vfs.outputIdentityGeneration, 0);
+        assert.equal(harness.vfs.outputBuildId, undefined);
+    });
+
+    it('does not silently compile the default document when an explicit root no longer resolves', async () => {
+        const harness = makeHarness();
+        assert.throws(() => harness.vfs.compileRootResourcePath('missing-id'), /no longer available/);
+        assert.deepEqual(harness.submissions, []);
+    });
+
+    it('surfaces a cache-publication failure instead of treating it as absent output', async () => {
+        const harness = makeHarness();
+        harness.vfs.api = {getCachedCompile: async () => ({type: 'success', compile: {
+            status: 'success', options: {rootResourcePath: null},
+            outputFiles: [{path: 'output.pdf', url: '/build/editor-build/output/output.pdf', build: 'build', editorId: 'editor'}],
+        }})};
+        harness.vfs.notify = () => { throw new Error('Failed to publish outputs'); };
+        await assert.rejects(harness.vfs.adoptCachedCompile(), /Failed to publish/);
+        assert.equal(harness.vfs.outputIdentityGeneration, 1);
+        assert.deepEqual(harness.submissions, []);
+    });
+
+    it('publishes PDF and SyncTeX from the same latest root while a superseded compile returns late', async () => {
+        const harness = makeHarness();
+        harness.vfs.resolve = async () => undefined;
+        harness.vfs._resolveById = (id: string) => ({path: `/${id}.tex`});
+        let release!: () => void;
+        const requests: string[] = [];
+        harness.vfs.api = {compile: async (_identity: unknown, _project: string, rootPath: string) => {
+            requests.push(rootPath);
+            if (rootPath === 'main.tex') { await new Promise<void>(resolve => { release = resolve; }); }
+            return {type: 'success', compile: {status: 'success', outputFiles: [{
+                path: 'output.pdf', url: `/${rootPath}/output.pdf`, build: rootPath, editorId: `${rootPath}-editor`,
+            }]}};
+        }};
+        let mainCurrent = true;
+        const old = harness.vfs.compile(true, false, false, 'main', 'automatic', () => mainCurrent);
+        await waitUntil(() => requests.length === 1, 'First compile did not start');
+        mainCurrent = false;
+        await harness.vfs.compile(true, false, false, 'reply2', 'automatic');
+        release();
+        await old;
+        assert.deepEqual(requests, ['main.tex', 'reply2.tex']);
+        assert.equal(harness.vfs.outputBuildId, 'reply2.tex');
+        assert.equal(harness.vfs.outputEditorId, 'reply2.tex-editor');
+        assert.equal(harness.vfs.outputIdentityGeneration, 1);
+        const output = harness.vfs.root.rootFolder[0].folders.find((folder: any) => folder.name === '.output');
+        assert.equal(output.outputs.find((file: any) => file.name === 'output.pdf').build, 'reply2.tex');
+        assert.deepEqual(harness.submissions, []);
+    });
+});

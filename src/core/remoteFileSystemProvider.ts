@@ -9437,14 +9437,18 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (rootEntry?.path) {
             return rootEntry.path.replace(/^\//, '');
         }
+        if (rootDocId) {
+            throw new Error(`The requested main document '${rootDocId}' is no longer available. Select it again before compiling.`);
+        }
         console.warn(`Unable to resolve root document id '${resolvedRootDocId}' to a path; compiling without explicit rootResourcePath.`);
         return null;
     }
 
     /**
      * Probe the optional recent-build cache used by current Overleaf SaaS.
-     * Unsupported/self-hosted endpoints and incompatible cached settings are
-     * intentionally indistinguishable here: both fall back to a real compile.
+     * A missing endpoint/output or incompatible build permits a fresh compile.
+     * Authentication, transport and publication failures must remain errors,
+     * otherwise opening a preview could repeatedly start server compilations.
      */
     async adoptCachedCompile(
         draft:boolean=false,
@@ -9453,54 +9457,53 @@ export class VirtualFileSystem extends vscode.Disposable {
         isCurrent: () => boolean = () => true,
         markSourceClean: boolean = true,
     ): Promise<CompileOutcome | undefined> {
-        try {
-            const sourceRevision = this.sourceRevision;
-            const rootResourcePath = this.compileRootResourcePath(rootDocId);
-            const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-            if (!isCurrent()) { return undefined; }
-            const res = await this.api.getCachedCompile(identity, this.projectId);
-            if (
-                !isCurrent() ||
-                sourceRevision !== this.sourceRevision ||
-                res.type !== 'success' ||
-                !res.compile
-            ) { return undefined; }
+        const sourceRevision = this.sourceRevision;
+        const rootResourcePath = this.compileRootResourcePath(rootDocId);
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        if (!isCurrent()) { return undefined; }
+        const res = await this.api.getCachedCompile(identity, this.projectId);
+        if (
+            !isCurrent() ||
+            sourceRevision !== this.sourceRevision
+        ) { return undefined; }
+        if (res.type !== 'success') {
+            if (/^\s*(404|410)(?::|\s|$)/.test(res.message ?? '')) { return undefined; }
+            throw new Error(`Unable to query the compiled PDF cache: ${res.message ?? 'request failed'}`);
+        }
+        if (!res.compile) { return undefined; }
 
-            const cached = res.compile;
-            if (!isCachedCompileCompatible(
-                cached.status,
-                cached.outputFiles,
-                cached.options,
-                {rootResourcePath, draft, stopOnFirstError},
-            )) { return undefined; }
+        const cached = res.compile;
+        if (!isCachedCompileCompatible(
+            cached.status,
+            cached.outputFiles,
+            cached.options,
+            {rootResourcePath, draft, stopOnFirstError},
+        )) { return undefined; }
 
-            const cachedPdf = cached.outputFiles.find(output => output.path === 'output.pdf');
-            // A cached build belongs to the editor session which produced it.
-            // Guessing the current session id would make SyncTeX target a build
-            // identity which never existed, so older cache schemas fail closed.
-            if (!hasUsableCachedPdfIdentity(cached.outputFiles) || !cachedPdf?.editorId) {
-                return undefined;
-            }
-            const outputIdentity = resolveSynctexOutputIdentity(cached.outputFiles, cachedPdf.editorId);
-            if (!outputIdentity.buildId || !outputIdentity.editorId) { return undefined; }
-
-            this.updateOutputs(cached.outputFiles, true, {
-                compileGroup: cached.compileGroup,
-                clsiServerId: cached.clsiServerId,
-                pdfDownloadDomain: cached.pdfDownloadDomain,
-            });
-            // Restoring a preview only reads an existing build. It cannot
-            // establish that a local draft has been saved or compiled.
-            if (markSourceClean) { this.isDirty = false; }
-            return {
-                status: 'success',
-                successful: true,
-                outputsUpdated: true,
-                hasLog: cached.outputFiles.some(output => output.path === 'output.log'),
-            };
-        } catch {
+        const cachedPdf = cached.outputFiles.find(output => output.path === 'output.pdf');
+        // A cached build belongs to the editor session which produced it.
+        // Guessing the current session id would make SyncTeX target a build
+        // identity which never existed, so older cache schemas fail closed.
+        if (!hasUsableCachedPdfIdentity(cached.outputFiles) || !cachedPdf?.editorId) {
             return undefined;
         }
+        const outputIdentity = resolveSynctexOutputIdentity(cached.outputFiles, cachedPdf.editorId);
+        if (!outputIdentity.buildId || !outputIdentity.editorId) { return undefined; }
+
+        this.updateOutputs(cached.outputFiles, true, {
+            compileGroup: cached.compileGroup,
+            clsiServerId: cached.clsiServerId,
+            pdfDownloadDomain: cached.pdfDownloadDomain,
+        });
+        // Restoring a preview only reads an existing build. It cannot
+        // establish that a local draft has been saved or compiled.
+        if (markSourceClean) { this.isDirty = false; }
+        return {
+            status: 'success',
+            successful: true,
+            outputsUpdated: true,
+            hasLog: cached.outputFiles.some(output => output.path === 'output.log'),
+        };
     }
 
     async compile(

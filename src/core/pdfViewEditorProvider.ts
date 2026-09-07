@@ -33,6 +33,11 @@ export class PdfDocument implements vscode.CustomDocument {
         this.refreshRequestGeneration += 1;
     }
 
+    reportLoadFailure() {
+        this.loadFailed = true;
+        this._onDidChangeLoadState.fire();
+    }
+
     async refresh(): Promise<Uint8Array> {
         const requestGeneration = ++this.refreshRequestGeneration;
         try {
@@ -158,7 +163,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                     break;
                 case 'retryPdfDownload':
                     const retry = doc.uri.path?.endsWith(`/${OUTPUT_FOLDER_NAME}/output.pdf`)
-                        ? vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.refreshPdf`, doc)
+                        ? vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.refreshPdf`, doc, true)
                         : doc.refresh();
                     void retry
                         .then(updateLoadState, error => console.warn('Unable to retry the Overleaf PDF download.', error));

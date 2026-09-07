@@ -2,6 +2,7 @@
 import { strict as assert } from 'assert';
 import { CompileOutcome } from '../compile/compileResult';
 import {createPdfViewerHarness, pdfPage} from './helpers/pdfViewerHarness';
+import {resolveCompileRootDocId} from '../compile/compileTarget';
 
 interface ModuleLoader {
     _load(request: string, parent: NodeModule | null, isMain: boolean): unknown,
@@ -22,6 +23,9 @@ const documentChangeListeners = new Set<(event: any) => void>();
 const documentCloseListeners = new Set<(document: any) => void>();
 const activeEditorListeners = new Set<(editor: any) => void>();
 const navigationWarnings: string[] = [];
+const registeredCommands = new Map<string, (...args: any[]) => any>();
+const saveListeners = new Set<(document: any) => any>();
+let inspectCompileRoot: typeof resolveCompileRootDocId = async () => undefined;
 let executeCommand = async (_command: string, ..._args: unknown[]): Promise<unknown> => undefined;
 let showTextDocument = async (..._args: any[]): Promise<any> => undefined;
 let diagnosticClears = 0;
@@ -95,13 +99,20 @@ const vscodeStub = {
             documentCloseListeners.add(listener);
             return {dispose: () => documentCloseListeners.delete(listener)};
         },
+        onDidSaveTextDocument: (listener: (document: any) => any) => {
+            saveListeners.add(listener);
+            return {dispose: () => saveListeners.delete(listener)};
+        },
     },
     commands: {
         executeCommand: (command: string, ...args: unknown[]) => {
             executedCommands.push(command);
             return executeCommand(command, ...args);
         },
-        registerCommand: () => new DisposableStub(),
+        registerCommand: (name: string, callback: (...args: any[]) => any) => {
+            registeredCommands.set(name, callback);
+            return {dispose: () => registeredCommands.delete(name)};
+        },
     },
 };
 
@@ -157,7 +168,7 @@ moduleLoader._load = function(request, parent, isMain): unknown {
         return {LocalReplicaSCMProvider: {readSettings: async () => undefined}};
     }
     if (request === './compileTarget') {
-        return {resolveCompileRootDocId: async () => undefined};
+        return {resolveCompileRootDocId: (...args: Parameters<typeof resolveCompileRootDocId>) => inspectCompileRoot(...args)};
     }
     return originalLoad.call(this, request, parent, isMain);
 };
@@ -268,6 +279,7 @@ function registerPdfViewer(
     const doc = {
         uri: fixture.pdfUri,
         generation: options.initialGeneration ?? 1,
+        reportLoadFailure: () => { actions.push('load-error'); },
         invalidateRefresh: () => {
             refreshRequestGeneration += 1;
         },
@@ -420,7 +432,7 @@ describe('CompileManager cached startup', () => {
         assert.equal(statusItems.at(-1)?.text, 'pdfLaTex');
     });
 
-    it('does not start a server compile when no cached startup output exists', async () => {
+    it('starts one server compile when no cached startup output exists and permits an unchanged manual recompile', async () => {
         const uri = projectFixture().compileUri;
         let liveCompiles = 0;
         const vfs = {
@@ -436,12 +448,12 @@ describe('CompileManager cached startup', () => {
         const manager = createManager(vfs);
 
         await manager.compile(true, 'initial-project', uri as any);
-        assert.equal(liveCompiles, 0);
+        assert.equal(liveCompiles, 1);
         assert.equal(statusItems.at(-1)?.text, 'pdfLaTex');
         assert.equal(statusItems.at(-1)?.text.includes('sync'), false);
 
         await manager.compile(true, 'command', uri as any);
-        assert.equal(liveCompiles, 1);
+        assert.equal(liveCompiles, 2);
     });
 
     it('clears old diagnostics when a successful output set has no log', async () => {
@@ -604,7 +616,7 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
         assert.deepEqual(actions, ['refresh']);
     });
 
-    it('loads the preview after dirty startup skipped compile-cache adoption', async () => {
+    it('loads a remote preview during dirty startup without clearing the recovered draft', async () => {
         const fixture = projectFixture();
         setActiveEditor(fixture.sourceUri).document.isDirty = true;
         const vfs = createVfs(successfulOutcome(), []);
@@ -683,6 +695,7 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
     it('keeps a stale preview unsyncable after a failed read-only restore', async () => {
         const fixture = projectFixture();
         const vfs = createVfs(successfulOutcome(), []);
+        vfs.adoptCachedCompile = async () => { throw new Error('Cache request failed: 401'); };
         let reverseCalls = 0;
         vfs.syncPdf = async () => { reverseCalls += 1; return undefined; };
         const manager = createManager(vfs);
@@ -2118,5 +2131,340 @@ describe('CompileManager automatic forward SyncTeX after compile', () => {
         await syncing;
 
         assert.deepEqual(shownTextDocuments, []);
+    });
+});
+
+describe('CompileManager command arguments and main-document preview selection', () => {
+    let disposables: {dispose(): void}[] = [];
+    let saves = 0;
+    const saveAll = vscodeStub.workspace.saveAll;
+
+    beforeEach(() => {
+        inspectCompileRoot = resolveCompileRootDocId;
+        registeredCommands.clear();
+        saveListeners.clear();
+        navigationWarnings.length = 0;
+        executedCommands.length = 0;
+        saves = 0;
+        vscodeStub.workspace.saveAll = async () => { saves += 1; return true; };
+        vscodeStub.window.activeTextEditor = undefined;
+        vscodeStub.window.visibleTextEditors = [];
+        vscodeStub.workspace.textDocuments = [];
+        executeCommand = async () => undefined;
+    });
+
+    afterEach(() => {
+        for (const disposable of disposables) { disposable.dispose(); }
+        disposables = [];
+        for (const manager of managers.splice(0)) {
+            manager.pdfWillOpenTrigger.dispose();
+            manager.pdfViewerReadyTrigger.dispose();
+            manager.pdfViewDisposedTrigger.dispose();
+            manager.sourceDocumentChangedTrigger.dispose();
+            manager.sourceDocumentClosedTrigger.dispose();
+            manager.sourceEditorChangedTrigger.dispose();
+        }
+        inspectCompileRoot = async () => undefined;
+        vscodeStub.workspace.saveAll = saveAll;
+    });
+
+    function setup() {
+        const fixture = projectFixture();
+        const reply = makeUri(fixture.identifier, ['reply2.tex']);
+        const chapter = makeUri(fixture.identifier, ['chapter.tex']);
+        const files: Record<string, string> = {
+            'main.tex': '\\documentclass{article}\n\\begin{document}Main\\end{document}',
+            'reply2.tex': '\\documentclass{article}\n\\begin{document}Reply\\end{document}',
+            'chapter.tex': '% \\documentclass{article}\n\\section{Chapter}',
+        };
+        const calls: any[][] = [];
+        let publishedRoot: string | undefined;
+        const vfs: any = {
+            ...createVfs(successfulOutcome(), []),
+            _resolveUri: async (uri: any) => ({fileType: 'doc', fileId: uri.pathParts.join('/')}),
+            openFile: async (uri: any) => new TextEncoder().encode(files[uri.pathParts.join('/')] ?? ''),
+            compile: async (...args: any[]) => {
+                calls.push(args);
+                if (args[5]()) {
+                    publishedRoot = args[3];
+                    vfs.outputIdentityGeneration += 1;
+                }
+                return successfulOutcome();
+            },
+        };
+        const manager = createManager(vfs);
+        disposables.push(...manager.triggers);
+        const command = registeredCommands.get('overleaf-workshop.compileManager.compile')!;
+        const select = async (uri: any) => {
+            const editor = setActiveEditor(uri);
+            for (const listener of activeEditorListeners) { listener(editor); }
+            await flushAsync();
+            return editor;
+        };
+        return {fixture, reply, chapter, files, calls, vfs, manager, command, select,
+            publishedRoot: () => publishedRoot};
+    }
+
+    it('executes the actual editor-title callback with (resourceUri, editorContext), twice without edits', async () => {
+        const s = setup();
+        setActiveEditor(s.fixture.sourceUri);
+        await s.command(s.reply, {groupId: 1});
+        await s.command(s.reply, {groupId: 1});
+        assert.deepEqual(s.calls.map(args => [args[0], args[3], args[4]]),
+            [[true, 'reply2.tex', 'manual'], [true, 'reply2.tex', 'manual']]);
+        assert.equal(saves, 2);
+    });
+
+    it('supports the palette, malformed non-resource context, and internal startup callback contracts', async () => {
+        const s = setup();
+        setActiveEditor(s.fixture.sourceUri);
+        await s.command();
+        await s.command({groupId: 1}, {groupId: 2});
+        await s.command('initial-project', makeUri(s.fixture.identifier, []));
+        assert.deepEqual(s.calls.map(args => [args[3], args[4]]),
+            [['main.tex', 'manual'], ['main.tex', 'manual'], ['main.tex', 'automatic']]);
+        assert.equal(saves, 2);
+    });
+
+    it('keeps save-triggered compilation registered and automatic', async () => {
+        const s = setup();
+        s.vfs.isInvisibleMode = false;
+        const editor = setActiveEditor(s.fixture.sourceUri);
+        Object.assign(editor.document, {fileName: editor.document.uri.path});
+        for (const listener of saveListeners) { await listener(editor.document); }
+        await flushAsync();
+        assert.equal(s.calls.length, 1);
+        assert.equal(s.calls[0][4], 'automatic');
+    });
+
+    it('adopts only the active main target on first restored PDF open', async () => {
+        const s = setup();
+        setActiveEditor(s.reply);
+        const roots: string[] = [];
+        s.vfs.adoptCachedCompile = async (...args: any[]) => {
+            roots.push(args[2]);
+            assert.equal(args[4], false);
+            return successfulOutcome();
+        };
+        const viewer = registerPdfViewer(s.fixture, [], {initialGeneration: 0});
+        await s.manager.refreshPdf(viewer.doc as any);
+        assert.deepEqual(roots, ['reply2.tex']);
+        assert.equal(viewer.doc.generation, 1);
+        assert.equal(s.calls.length, 0);
+        assert.equal(saves, 0);
+    });
+
+    it('compiles a missing initial PDF once and retains the same side panel', async () => {
+        const s = setup();
+        setActiveEditor(s.reply);
+        const viewer = registerPdfViewer(s.fixture, [], {initialGeneration: 0});
+        await s.manager.refreshPdf(viewer.doc as any);
+        await s.manager.refreshPdf(viewer.doc as any);
+        assert.equal(s.calls.length, 1);
+        assert.equal(s.calls[0][3], 'reply2.tex');
+        assert.equal(s.calls[0][4], 'automatic');
+        assert.equal(saves, 0);
+        assert.equal(executedCommands.includes('vscode.openWith'), false);
+        assert.ok(viewer.doc.generation > 0);
+    });
+
+    for (const trigger of ['initial-project', 'active-root', 'preview'] as const) {
+        it(`does not save or compile dirty recovered/unbound project drafts during ${trigger}`, async () => {
+            const s = setup();
+            const editor = setActiveEditor(s.reply);
+            editor.document.isDirty = true;
+            await s.manager.compile(true, trigger, s.reply);
+            assert.equal(saves, 0);
+            assert.equal(s.calls.length, 0);
+            assert.equal(editor.document.isDirty, true);
+            assert.ok(navigationWarnings.some(message => message.includes('unsaved')));
+        });
+    }
+
+    it('does not retry failed automatic builds on viewer readiness; an explicit retry is bounded to one build', async () => {
+        const s = setup();
+        setActiveEditor(s.fixture.sourceUri);
+        let builds = 0;
+        s.vfs.compile = async () => { builds += 1; return failedOutcome(); };
+        const viewer = registerPdfViewer(s.fixture, [], {initialGeneration: 0});
+        await s.command('initial-project', s.fixture.compileUri);
+        await s.manager.refreshPdf(viewer.doc as any);
+        await s.manager.refreshPdf(viewer.doc as any);
+        assert.equal(builds, 1);
+        await s.manager.refreshPdf(viewer.doc as any, true);
+        assert.equal(builds, 2);
+        assert.equal(saves, 0);
+    });
+
+    for (const message of ['401: Unauthorized', '403: Forbidden', 'Network offline', '503: Unavailable']) {
+        it(`does not turn a cache query failure into compilation: ${message}`, async () => {
+            const s = setup();
+            setActiveEditor(s.reply);
+            s.vfs.adoptCachedCompile = async () => { throw new Error(message); };
+            const viewer = registerPdfViewer(s.fixture, []);
+            await s.command('initial-project', s.reply);
+            await s.manager.refreshPdf(viewer.doc as any);
+            assert.equal(s.calls.length, 0);
+            assert.equal(saves, 0);
+            assert.equal(viewer.doc.generation, 1);
+            assert.ok(navigationWarnings.length > 0);
+        });
+    }
+
+    it('keeps a cached PDF download failure as a download retry, never a fresh compile', async () => {
+        const s = setup();
+        setActiveEditor(s.reply);
+        s.vfs.adoptCachedCompile = async () => successfulOutcome();
+        const viewer = registerPdfViewer(s.fixture, [], {refresh: async () => new Uint8Array()});
+        await s.command('initial-project', s.reply);
+        await flushAsync();
+        await s.manager.refreshPdf(viewer.doc as any, true);
+        assert.equal(s.calls.length, 0);
+        assert.equal(viewer.doc.generation, 1);
+    });
+
+    it('follows standalone roots but keeps the selected root for chapter tabs and chapter saves', async () => {
+        const s = setup();
+        registerPdfViewer(s.fixture, []);
+        await s.select(s.fixture.sourceUri);
+        await s.select(s.reply);
+        await s.select(s.chapter);
+        assert.deepEqual(s.calls.map(args => args[3]), ['main.tex', 'reply2.tex']);
+        assert.equal(saves, 0);
+        await s.manager.compile(false, 'save', s.chapter);
+        assert.equal(s.calls.at(-1)![3], 'reply2.tex');
+        assert.equal(saves, 1);
+    });
+
+    it('reselects the current main after closing the preview and switching TeX tabs', async () => {
+        const s = setup();
+        const old = registerPdfViewer(s.fixture, []);
+        await s.select(s.fixture.sourceUri);
+        fireEvent('pdfViewDisposedEvent', {uri: s.fixture.pdfUri, webviewPanel: old.webviewPanel});
+        await s.select(s.reply);
+        const viewer = registerPdfViewer(s.fixture, [], {initialGeneration: 0});
+        await s.manager.refreshPdf(viewer.doc as any);
+        assert.equal(s.calls.at(-1)![3], 'reply2.tex');
+        assert.equal(viewer.doc.generation, 1);
+        assert.equal(saves, 0);
+    });
+
+    it('uses View Compiled PDF to retry an already-open failed preview without saving', async () => {
+        const s = setup();
+        setActiveEditor(s.reply);
+        let builds = 0;
+        s.vfs.compile = async () => ++builds === 1 ? failedOutcome() : successfulOutcome();
+        const viewer = registerPdfViewer(s.fixture, [], {initialGeneration: 0});
+        await s.manager.refreshPdf(viewer.doc as any);
+        assert.equal(builds, 1);
+        await registeredCommands.get('overleaf-workshop.compileManager.viewPdf')!();
+        assert.equal(builds, 2);
+        assert.equal(viewer.doc.generation, 1);
+        assert.equal(saves, 0);
+        assert.equal(executedCommands.filter(command => command === 'vscode.openWith').length, 1);
+    });
+
+    it('abandons a root inspection if the side preview was closed during the read', async () => {
+        const s = setup();
+        let release!: () => void;
+        const read = s.vfs.openFile;
+        s.vfs.openFile = async (uri: any) => {
+            await new Promise<void>(resolve => { release = resolve; });
+            return read(uri);
+        };
+        const viewer = registerPdfViewer(s.fixture, []);
+        await s.select(s.reply);
+        fireEvent('pdfViewDisposedEvent', {uri: s.fixture.pdfUri, webviewPanel: viewer.webviewPanel});
+        release();
+        await flushAsync();
+        assert.equal(s.calls.length, 0);
+        assert.equal(saves, 0);
+    });
+
+    it('does not publish an obsolete root-inspection error over the current preview', async () => {
+        const s = setup();
+        let reject!: (error: Error) => void;
+        const read = s.vfs.openFile;
+        s.vfs.openFile = async (uri: any) => {
+            if (uri.pathParts[0] === 'reply2.tex') {
+                return new Promise((_resolve, rejectRead) => { reject = rejectRead; });
+            }
+            return read(uri);
+        };
+        registerPdfViewer(s.fixture, []);
+        await s.select(s.reply);
+        await s.select(s.fixture.sourceUri);
+        reject(new Error('Old lookup lost its connection'));
+        await flushAsync();
+        assert.equal(navigationWarnings.length, 0);
+        assert.deepEqual(s.calls.map(args => args[3]), ['main.tex']);
+    });
+
+    it('fences a slow A build and preserves preview intent for the latest A-B-A selection', async () => {
+        const s = setup();
+        const publications: string[] = [];
+        let release!: () => void;
+        s.vfs.compile = async (...args: any[]) => {
+            s.calls.push(args);
+            if (s.calls.length === 1) { await new Promise<void>(resolve => { release = resolve; }); }
+            if (args[5]()) {
+                publications.push(args[3]);
+                s.vfs.outputIdentityGeneration += 1;
+            }
+            return successfulOutcome();
+        };
+        const viewer = registerPdfViewer(s.fixture, [], {initialGeneration: 0});
+        await s.select(s.fixture.sourceUri);
+        await s.select(s.reply);
+        await s.select(s.fixture.sourceUri);
+        assert.equal(s.calls[0][5](), false, 'Old VFS response must lose publication authority');
+        release();
+        await flushAsync();
+        await flushAsync();
+        assert.deepEqual(publications, ['main.tex']);
+        assert.equal(s.calls.length, 2);
+        assert.equal(s.calls[1][4], 'automatic');
+        assert.equal(saves, 0);
+        assert.equal(viewer.doc.generation, 1);
+    });
+
+    it('does not let a late root inspection supersede a newer tab', async () => {
+        const s = setup();
+        let release!: () => void;
+        const read = s.vfs.openFile;
+        s.vfs.openFile = async (uri: any) => {
+            if (uri.pathParts[0] === 'reply2.tex') { await new Promise<void>(resolve => { release = resolve; }); }
+            return read(uri);
+        };
+        registerPdfViewer(s.fixture, []);
+        await s.select(s.reply);
+        await s.select(s.fixture.sourceUri);
+        release();
+        await flushAsync();
+        assert.deepEqual(s.calls.map(args => args[3]), ['main.tex']);
+    });
+
+    it('invalidates a delayed old-root PDF download and delivers SyncTeX only for the replacement build', async () => {
+        const s = setup();
+        const syncRoots: string[] = [];
+        s.vfs.syncCode = async () => {
+            syncRoots.push(s.publishedRoot()!);
+            return [{page: 1, h: 2, v: 3}];
+        };
+        let release!: (bytes: Uint8Array) => void;
+        let reads = 0;
+        const viewer = registerPdfViewer(s.fixture, [], {initialGeneration: 0, refresh: async () => {
+            reads += 1;
+            return reads === 1 ? new Promise<Uint8Array>(resolve => { release = resolve; }) : new Uint8Array([2]);
+        }});
+        await s.select(s.fixture.sourceUri);
+        await s.select(s.reply);
+        release(new Uint8Array([1]));
+        await flushAsync();
+        assert.equal(viewer.doc.generation, 1);
+        assert.equal(s.publishedRoot(), 'reply2.tex');
+        assert.deepEqual(syncRoots, ['reply2.tex']);
+        assert.equal(viewer.messages.filter(message => message.type === 'syncCode').length, 1);
+        assert.equal(saves, 0);
     });
 });
