@@ -55,6 +55,20 @@ describe('resolveCompileRootDocId', () => {
         assert.equal(rootDocId, undefined);
     });
 
+    for (const content of ['% \\documentclass{article}\n\\section{A}',
+        'Text mentioning \\documentclass{article}', '\\newcommand{\\example}{\\documentclass{article}}']) {
+        it(`does not mistake a chapter comment or inline example for a main document: ${JSON.stringify(content)}`, async () => {
+            assert.equal(await resolveCompileRootDocId('/chapter.tex',
+                async () => ({fileType: 'doc', fileId: 'chapter'}), async () => encode(content)), undefined);
+        });
+    }
+
+    it('recognizes documentclass options and braces separated by comments or line breaks', async () => {
+        assert.equal(await resolveCompileRootDocId('/main.tex',
+            async () => ({fileType: 'doc', fileId: 'main'}),
+            async () => encode('\\documentclass % comment\n [11pt]\n {article}')), 'main');
+    });
+
     it('falls back to the configured main document when a restored resource is stale', async () => {
         const failure = new Error('HTTP 404');
         let fallbackError: unknown;

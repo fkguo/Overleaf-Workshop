@@ -3,6 +3,8 @@ export type CompileRequestKind = 'manual' | 'automatic';
 export type CompileTrigger =
     | 'command'
     | 'initial-project'
+    | 'preview'
+    | 'active-root'
     | 'save'
     | 'project-setting-event';
 

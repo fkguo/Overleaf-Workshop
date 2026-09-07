@@ -21,7 +21,6 @@ import {
     CompileTrigger,
     compileRequestKindForTrigger,
     hasDirtyCompileSource,
-    mergeCompileRequestKinds,
 } from './compileResult';
 import { projectConnectionKey } from '../core/projectUri';
 
@@ -70,6 +69,14 @@ function pdfRecordKey(identifier: string, filePath: string): string {
     return `${identifier}\n${filePath}`;
 }
 
+function commandResourceUri(value: unknown): vscode.Uri | undefined {
+    if (!value || typeof value !== 'object') { return undefined; }
+    const uri = value as Partial<vscode.Uri>;
+    return typeof uri.scheme === 'string' && typeof uri.authority === 'string'
+        && typeof uri.path === 'string' && typeof uri.query === 'string'
+        && typeof uri.with === 'function' ? uri as vscode.Uri : undefined;
+}
+
 function isPdfGenerationSyncable(record: PdfViewRecord, generation: number | undefined): boolean {
     return Boolean(
         Number.isSafeInteger(generation) &&
@@ -113,6 +120,7 @@ type PdfCompileTransition = {
     outputIdentityMutationMayHaveStarted: boolean,
     outputIdentityVfs?: VirtualFileSystem,
     outputIdentityGeneration?: number,
+    targetChanged?: boolean,
 };
 
 type PendingCompiledPdfRefresh = {
@@ -265,6 +273,7 @@ export class CompileManager {
     private readonly stopGate = new SingleFlightGate();
     private pendingCompileForce?: boolean;
     private pendingCompileRequestKind?: CompileRequestKind;
+    private pendingCompileTrigger?: CompileTrigger;
     private pendingCompileUri?: vscode.Uri;
     private pendingCompileSourcePromise?: Promise<CapturedCompileSourceSync | undefined>;
     private activePdfTransition?: {
@@ -272,6 +281,10 @@ export class CompileManager {
         transition: PdfCompileTransition,
     };
     private suppressCompileOnSave = 0;
+    private readonly rootSelectionRequests = new LatestRequestGate();
+    private readonly previewRoots = new Map<string, {uri: vscode.Uri, rootDocId: string}>();
+    private readonly compiledRoots = new Map<string, string | undefined>();
+    private readonly automaticPreviewAttempts = new Set<string>();
 
     constructor(
         private vfsm: RemoteFileSystemProvider,
@@ -284,8 +297,13 @@ export class CompileManager {
         this.sourceEditorChangedTrigger = vscode.window.onDidChangeActiveTextEditor(editor => {
             // Clicking a webview clears activeTextEditor. Keep the last source
             // editor, but only use it while still visible in the same project.
-            if (editor && /\.(tex|ltx)$/i.test(editor.document.uri.path)) {
+            if (editor && /\.(tex|ltx|ctx)$/i.test(editor.document.uri.path)) {
                 this.lastSourceEditor = editor;
+                void this.followActiveRoot(editor).catch(error => {
+                    console.warn('Unable to select the Overleaf preview main document.', error);
+                    this.reportPreviewProblem(editor.document.uri,
+                        'Unable to inspect the main document. Retry View Compiled PDF when the connection is available.');
+                });
             }
         });
         this.sourceDocumentChangedTrigger = vscode.workspace.onDidChangeTextDocument(event => {
@@ -403,6 +421,74 @@ export class CompileManager {
         return this.compileRunGate.active;
     }
 
+    private reportPreviewProblem(uri: vscode.Uri, message: string) {
+        if (uri.scheme !== ROOT_NAME) { return; }
+        const identifier = parseUri(uri).identifier;
+        pdfViewRecord[identifier]?.[`${OUTPUT_FOLDER_NAME}/output.pdf`]?.doc.reportLoadFailure();
+        void vscode.window.showWarningMessage(vscode.l10n.t(message));
+    }
+
+    private inspectRoot(vfs: VirtualFileSystem, uri: vscode.Uri, strict = false) {
+        return resolveCompileRootDocId(uri.path,
+            () => vfs._resolveUri(uri), () => vfs.openFile(uri), error => {
+                if (strict) { throw error; }
+                console.warn(`Unable to inspect compile target '${uri.toString()}'; compiling the configured main document.`, error);
+            });
+    }
+
+    private async followActiveRoot(editor: vscode.TextEditor) {
+        const uri = editor.document.uri;
+        if (uri.scheme !== ROOT_NAME) { return; }
+        const identifier = parseUri(uri).identifier;
+        const selection = this.rootSelectionRequests.begin(identifier);
+        // Only an existing side preview needs to follow editor navigation.
+        const record = pdfViewRecord[identifier]?.[`${OUTPUT_FOLDER_NAME}/output.pdf`];
+        if (!record) { return; }
+        let rootDocId: string | undefined;
+        try {
+            const vfs = await this.vfsm.prefetch(uri);
+            rootDocId = await this.inspectRoot(vfs, uri, true);
+        } catch (error) {
+            if (!this.rootSelectionRequests.isCurrent(identifier, selection)
+                || vscode.window.activeTextEditor !== editor) { return; }
+            throw error;
+        }
+        if (!rootDocId || !this.rootSelectionRequests.isCurrent(identifier, selection)
+            || vscode.window.activeTextEditor !== editor
+            || pdfViewRecord[identifier]?.[`${OUTPUT_FOLDER_NAME}/output.pdf`] !== record) { return; }
+        if (this.previewRoots.get(identifier)?.rootDocId === rootDocId) { return; }
+        this.previewRoots.set(identifier, {uri, rootDocId});
+        // Fence both VFS publication and downloads as soon as the target changes,
+        // before waiting for the old server request to vacate the compile slot.
+        if (this.inCompiling && (!this.activeCompileUri
+            || parseUri(this.activeCompileUri).identifier === identifier)) {
+            this.compileRunGate.cancel();
+        }
+        this.invalidateCompiledPdf(identifier);
+        await this.compile(true, 'active-root', uri);
+    }
+
+    private async previewTarget(vfs: VirtualFileSystem, uri: vscode.Uri, isCurrent: () => boolean) {
+        const identifier = parseUri(uri).identifier;
+        const selected = this.previewRoots.get(identifier);
+        const sourceUri = this.compileSourceEditor(identifier, this.lastSourceEditor?.document)?.document.uri ?? selected?.uri ?? uri;
+        const rootDocId = await this.inspectRoot(vfs, sourceUri, true);
+        if (rootDocId && isCurrent()) { this.previewRoots.set(identifier, {uri: sourceUri, rootDocId}); }
+        return rootDocId ? {uri: sourceUri, rootDocId} : selected ?? {uri: sourceUri, rootDocId};
+    }
+
+    private allowAutomaticPreviewCompile(uri: vscode.Uri, rootDocId: string | undefined): boolean {
+        if (this.hasDirtyProjectDocument(uri)) {
+            this.reportPreviewProblem(uri,
+                'No verified PDF is available. Save or resolve the unsaved project drafts, then compile the project.');
+            return false;
+        }
+        const key = JSON.stringify([parseUri(uri).identifier, rootDocId]);
+        if (this.automaticPreviewAttempts.has(key)) { return false; }
+        this.automaticPreviewAttempts.add(key);
+        return true;
+    }
+
     static async check(uri?: vscode.Uri) {
         // check if supported vfs
         uri = uri || vscode.window.activeTextEditor?.document.uri;
@@ -428,7 +514,8 @@ export class CompileManager {
         if (uri) {
             const vfs = await this.vfsm.prefetch(uri);
             if (!isCurrent()) { return uri; }
-            const rootDocName = vfs.getRootDocName().slice(1);
+            const selectedRoot = this.previewRoots.get(parseUri(uri).identifier);
+            const rootDocName = selectedRoot ? parseUri(selectedRoot.uri).pathParts.join('/') : vfs.getRootDocName().slice(1);
             const compilerName = vfs.getCompiler()?.name || '';
             this.status.tooltip = new vscode.MarkdownString();
             switch (status) {
@@ -780,6 +867,7 @@ export class CompileManager {
 
     private restorePdfSyncability(identifier: string, transition: PdfCompileTransition) {
         if (!compiledPdfBuildRequests.isCurrent(identifier, transition.buildGeneration)) { return; }
+        if (transition.targetChanged) { return; }
         if (
             transition.priorBuildUnverified ||
             transition.buildMayHaveChanged ||
@@ -856,9 +944,10 @@ export class CompileManager {
     }
 
     private discardPendingSaveCoveredByCurrentRun() {
-        if (this.pendingCompileForce === false && this.pendingCompileRequestKind === 'automatic') {
+        if (this.pendingCompileForce === false && this.pendingCompileTrigger === 'save') {
             this.pendingCompileForce = undefined;
             this.pendingCompileRequestKind = undefined;
+            this.pendingCompileTrigger = undefined;
             this.pendingCompileUri = undefined;
             this.pendingCompileSourcePromise = undefined;
         }
@@ -888,6 +977,7 @@ export class CompileManager {
         requestedSourcePromise?: Promise<CapturedCompileSourceSync | undefined>,
     ) {
         const requestKind = compileRequestKindForTrigger(trigger);
+        const previewOnly = trigger === 'initial-project' || trigger === 'preview' || trigger === 'active-root';
         // Pin source identities at the trigger boundary, including queued runs.
         // The viewport is selected later, after this build's PDF is refreshed.
         let capturedSourcePromise = requestedSourcePromise ??
@@ -899,13 +989,11 @@ export class CompileManager {
             // Coalesce every trigger which arrives during an active run. In
             // particular, a save during the initial cache probe must result in
             // a fresh build after that probe finishes.
-            this.pendingCompileForce = this.pendingCompileForce === true || force;
             const previousRequestKind = this.pendingCompileRequestKind;
-            this.pendingCompileRequestKind = mergeCompileRequestKinds(
-                previousRequestKind,
-                requestKind,
-            );
-            if (requestKind === 'manual' || previousRequestKind !== 'manual') {
+            if (trigger === 'active-root' || requestKind === 'manual' || previousRequestKind !== 'manual') {
+                this.pendingCompileForce = this.pendingCompileForce === true || force;
+                this.pendingCompileRequestKind = requestKind;
+                this.pendingCompileTrigger = trigger;
                 this.pendingCompileUri = requestedUri;
                 this.pendingCompileSourcePromise = capturedSourcePromise;
             }
@@ -915,6 +1003,7 @@ export class CompileManager {
         await this.compileRunGate.run(async (isCurrent) => {
             let uri: vscode.Uri | undefined;
             let pdfTransition: PdfCompileTransition | undefined;
+            let automaticAttemptKey: string | undefined;
             try {
                 uri = await CompileManager.check(requestedUri);
                 if (!isCurrent()) { return; }
@@ -935,7 +1024,7 @@ export class CompileManager {
                 // On project open, probe the last successful server build before
                 // saveAll. Otherwise the save event is suppressed by this active
                 // run and a newly saved edit could be left behind a stale cache.
-                if (trigger !== 'initial-project') {
+                if (!previewOnly) {
                     await this.saveAllForCompile(); // save all dirty files
                     if (!isCurrent()) { return; }
                     this.discardPendingSaveCoveredByCurrentRun();
@@ -947,29 +1036,27 @@ export class CompileManager {
                 if (!isCurrent()) { return; }
                 this.activeCompileVfs = vfs;
                 this.captureOutputIdentityWitness(pdfTransition, vfs);
-                const rootDocId = await resolveCompileRootDocId(
-                    compileUri.path,
-                    () => vfs._resolveUri(compileUri),
-                    () => vfs.openFile(compileUri),
-                    error => console.warn(
-                        `Unable to inspect compile target '${compileUri.toString()}'; compiling the configured main document.`,
-                        error,
-                    ),
-                );
+                const target = previewOnly ? await this.previewTarget(vfs, compileUri, isCurrent) : undefined;
+                const inspectedRoot = target ? target.rootDocId : await this.inspectRoot(vfs, compileUri);
+                const rootDocId = inspectedRoot ?? this.previewRoots.get(identifier)?.rootDocId;
                 if (!isCurrent()) { return; }
-                if (trigger === 'initial-project') {
-                    // A hot-exit/restored dirty editor has not reached the VFS yet,
-                    // so its change cannot advance sourceRevision. Never adopt a
-                    // cached PDF while such a document exists.
-                    const cachedOutcome = this.hasDirtyProjectDocument(compileUri) ? undefined :
-                        await vfs.adoptCachedCompile(
+                pdfTransition.targetChanged = rootDocId !== this.compiledRoots.get(identifier);
+                if (inspectedRoot && !previewOnly) {
+                    this.previewRoots.set(identifier, {uri: compileUri, rootDocId: inspectedRoot});
+                }
+                if (previewOnly) {
+                    // Display a verified remote build without treating it as a
+                    // build of an unsaved/hot-exit draft or clearing source dirt.
+                    const cachedOutcome = await vfs.adoptCachedCompile(
                             this.compileAsDraft,
                             this.compileStopOnFirstError,
                             rootDocId,
                             isCurrent,
-                    );
+                            false,
+                        );
                     if (!isCurrent()) { return; }
                     if (cachedOutcome) {
+                        this.compiledRoots.set(identifier, rootDocId);
                         try {
                             await this.commitCompileOutcome(
                                 cachedOutcome,
@@ -1001,21 +1088,20 @@ export class CompileManager {
                                 );
                             }
                         }
-                    } else {
-                        this.restorePdfSyncability(identifier, pdfTransition);
-                        await this.update('idle', compileUri, isCurrent);
+                        return;
                     }
-                    // Opening a project is read-only initialization. Never
-                    // occupy the server compile slot before the user saves,
-                    // changes compile settings, or explicitly requests a build.
-                    return;
+                    if (!this.allowAutomaticPreviewCompile(compileUri, rootDocId)) {
+                        await this.update('idle', compileUri, isCurrent);
+                        return;
+                    }
+                    automaticAttemptKey = JSON.stringify([identifier, rootDocId]);
                 }
                 // Save participants may have changed the source before the
                 // request. Pin the clean document versions actually submitted,
                 // without allowing a reopened editor to inherit an old identity.
                 capturedSourcePromise = this.pinCompileSourceVersions(capturedSourcePromise);
                 const result = await vfs.compile(
-                    force,
+                    force || previewOnly || trigger === 'command',
                     this.compileAsDraft,
                     this.compileStopOnFirstError,
                     rootDocId,
@@ -1034,6 +1120,10 @@ export class CompileManager {
                     await this.update('success', compileUri, isCurrent);
                     return;
                 }
+                if (result.successful) {
+                    this.compiledRoots.set(identifier, rootDocId);
+                    this.automaticPreviewAttempts.delete(JSON.stringify([identifier, rootDocId]));
+                }
                 await this.commitCompileOutcome(
                     result,
                     compileUri,
@@ -1041,12 +1131,18 @@ export class CompileManager {
                     pdfTransition,
                     capturedSourcePromise,
                 );
+                if (previewOnly && !result.successful) {
+                    this.reportPreviewProblem(compileUri, 'Unable to create the PDF preview. Check the compile status and retry Compile Project.');
+                }
             } catch (error) {
                 if (!isCurrent()) { return; }
-                if (uri && pdfTransition) {
+                if (uri && pdfTransition && !previewOnly) {
                     this.restorePdfSyncability(parseUri(uri).identifier, pdfTransition);
                 }
                 console.error('Compile failed unexpectedly.', error);
+                if (previewOnly && uri) {
+                    this.reportPreviewProblem(uri, 'Unable to load the PDF preview. Check the connection and retry View Compiled PDF.');
+                }
                 if (uri) {
                     try {
                         await this.update('error', uri, isCurrent);
@@ -1055,6 +1151,9 @@ export class CompileManager {
                     }
                 }
             } finally {
+                if (automaticAttemptKey && !isCurrent()) {
+                    this.automaticPreviewAttempts.delete(automaticAttemptKey);
+                }
                 if (this.activePdfTransition?.transition === pdfTransition) {
                     this.activePdfTransition = undefined;
                 }
@@ -1079,14 +1178,19 @@ export class CompileManager {
         }
     }
 
-    /** Restore a preview without saving editors or starting a server compile. */
-    async refreshPdf(doc: PdfDocument): Promise<void> {
+    /** Restore a verified preview, compiling a missing build once without saving editors. */
+    async refreshPdf(doc: PdfDocument, retry = false): Promise<void> {
         if (doc?.uri?.scheme !== ROOT_NAME) { return; }
         const {identifier, pathParts} = parseUri(doc.uri);
         const filePath = pathParts.join('/');
         if (filePath !== `${OUTPUT_FOLDER_NAME}/output.pdf`) { return; }
         const record = pdfViewRecord[identifier]?.[filePath];
         if (!record || record.doc !== doc) { return; }
+        if (retry) {
+            for (const key of this.automaticPreviewAttempts) {
+                if (JSON.parse(key)[0] === identifier) { this.automaticPreviewAttempts.delete(key); }
+            }
+        }
         const pending = pendingCompiledPdfRefresh[identifier];
         if (pending?.refreshRecord === record && pending.refreshPromise) {
             await pending.refreshPromise;
@@ -1115,32 +1219,69 @@ export class CompileManager {
                 return;
             }
             const transition = this.invalidateCompiledPdf(identifier);
+            let automaticAttemptKey: string | undefined;
             try {
+                this.activeCompileUri = doc.uri;
                 const vfs = await this.vfsm.prefetch(doc.uri);
                 if (!isCurrent()) { return; }
+                this.activeCompileVfs = vfs;
+                this.activePdfTransition = {identifier, transition};
                 this.captureOutputIdentityWitness(transition, vfs);
+                const target = await this.previewTarget(vfs, doc.uri, isCurrent);
+                if (!isCurrent()) { return; }
+                transition.targetChanged = target.rootDocId !== this.compiledRoots.get(identifier);
                 // Dirty/hot-exit TeX does not prevent displaying a remote PDF;
                 // preserve source dirt and never claim it is that draft's build.
                 const hasCurrentBuild = !transition.priorBuildUnverified
                     && transition.previousSyncableGeneration !== undefined
-                    && vfs.outputIdentityGeneration > 0;
+                    && vfs.outputIdentityGeneration > 0
+                    && this.compiledRoots.get(identifier) === target.rootDocId;
                 // A known current build is stronger than an optional cache
                 // endpoint, which can still lag a just-completed compilation.
                 const cached = hasCurrentBuild ? undefined : await vfs.adoptCachedCompile(
-                    this.compileAsDraft, this.compileStopOnFirstError, undefined, isCurrent, false,
+                    this.compileAsDraft, this.compileStopOnFirstError, target.rootDocId, isCurrent, false,
                 );
                 if (!isCurrent()) { return; }
                 if (cached?.successful || (hasCurrentBuild && this.isOutputIdentityUnchanged(transition))) {
+                    this.compiledRoots.set(identifier, target.rootDocId);
                     this.scheduleCompiledPdfRefresh(identifier, transition.buildGeneration,
                         transition.autoSourceGeneration, undefined);
                     await pendingCompiledPdfRefresh[identifier]?.refreshPromise;
-                } else {
-                    console.warn('Overleaf PDF restore: no verified compiled output is available; compile the project to create one.');
+                } else if (this.allowAutomaticPreviewCompile(target.uri, target.rootDocId)) {
+                    automaticAttemptKey = JSON.stringify([identifier, target.rootDocId]);
+                    await this.update('compiling', target.uri, isCurrent);
+                    if (!isCurrent()) { return; }
+                    const outcome = await vfs.compile(true, this.compileAsDraft, this.compileStopOnFirstError,
+                        target.rootDocId, 'automatic', isCurrent, () => { this.activeServerCompile = true; });
+                    this.activeServerCompile = false;
+                    if (!isCurrent()) { return; }
+                    if (outcome) {
+                        if (outcome.successful) {
+                            this.compiledRoots.set(identifier, target.rootDocId);
+                            this.automaticPreviewAttempts.delete(JSON.stringify([identifier, target.rootDocId]));
+                        }
+                        await this.commitCompileOutcome(outcome, target.uri, isCurrent, transition);
+                        await pendingCompiledPdfRefresh[identifier]?.refreshPromise;
+                    }
+                    if (!outcome?.successful) {
+                        this.reportPreviewProblem(doc.uri, 'Unable to create the PDF preview. Check the compile status and retry Compile Project.');
+                    }
                 }
             } catch (error) {
                 // Keep old bytes visible but never attach an unverified build's
                 // coordinates. A later reload can retry the read-only probe.
                 console.warn('Unable to restore the Overleaf PDF preview.', error);
+                if (isCurrent()) {
+                    this.reportPreviewProblem(doc.uri, 'Unable to load the PDF preview. Check the connection and retry the PDF download.');
+                }
+            } finally {
+                if (automaticAttemptKey && !isCurrent()) {
+                    this.automaticPreviewAttempts.delete(automaticAttemptKey);
+                }
+                this.activeCompileUri = undefined;
+                this.activeCompileVfs = undefined;
+                this.activePdfTransition = undefined;
+                this.activeServerCompile = false;
             }
         });
         await this.runPendingCompile();
@@ -1150,17 +1291,18 @@ export class CompileManager {
     private async runPendingCompile() {
         if (this.compileRunGate.active || this.stoppingCompile) { return; }
         const pendingForce = this.pendingCompileForce;
-        const pendingRequestKind = this.pendingCompileRequestKind;
+        const pendingTrigger = this.pendingCompileTrigger;
         const pendingUri = this.pendingCompileUri;
         const pendingSourcePromise = this.pendingCompileSourcePromise;
         this.pendingCompileForce = undefined;
         this.pendingCompileRequestKind = undefined;
+        this.pendingCompileTrigger = undefined;
         this.pendingCompileUri = undefined;
         this.pendingCompileSourcePromise = undefined;
         if (pendingForce !== undefined) {
             await this.compile(
                 pendingForce,
-                pendingRequestKind === 'automatic' ? 'save' : 'command',
+                pendingTrigger ?? 'command',
                 pendingUri,
                 pendingSourcePromise,
             );
@@ -1514,6 +1656,8 @@ export class CompileManager {
                 `${ROOT_NAME}.pdfViewer`,
                 { preview: false, viewColumn: vscode.ViewColumn.Beside }
             );
+            const record = pdfViewRecord[parseUri(uri).identifier]?.[`${OUTPUT_FOLDER_NAME}/output.pdf`];
+            if (record) { await this.refreshPdf(record.doc, true); }
             if (source) {
                 await this.requestSourceSync(source);
             }
@@ -1787,17 +1931,17 @@ export class CompileManager {
             // register compile commands
             vscode.commands.registerCommand(
                 `${ROOT_NAME}.compileManager.compile`,
-                (trigger?: CompileTrigger, requestedUri?: vscode.Uri) => this.compile(
+                (argument?: unknown, context?: unknown) => this.compile(
                     true,
-                    trigger === 'initial-project' ? trigger : 'command',
-                    requestedUri,
+                    argument === 'initial-project' ? argument : 'command',
+                    commandResourceUri(argument) ?? commandResourceUri(context),
                 ),
             ),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.viewPdf`, () =>  this.openPdf()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.syncCode`, () => this.syncCode()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.syncCodeFromPdf`, (r) => this.syncCodeFromPdf(r)),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.syncPdf`, (r) => this.syncPdf(r)),
-            vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.refreshPdf`, (doc: PdfDocument) => this.refreshPdf(doc)),
+            vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.refreshPdf`, (doc: PdfDocument, retry?: boolean) => this.refreshPdf(doc, retry)),
             vscode.commands.registerCommand(`${ROOT_NAME}.compilerManager.settings`, ()=> this.compileSettings()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.setCompiler`, () => this.setCompiler()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.setRootDoc`, () => this.setRootDoc()),

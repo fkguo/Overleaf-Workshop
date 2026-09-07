@@ -1,4 +1,4 @@
-const documentClassRegex = /\\documentclass(?:\[[^\[\]\{\}]*\])?\{([^\[\]\{\}]+)\}/;
+const documentClassRegex = /^\s*\\documentclass\s*(?:\[[^\[\]\{\}]*\]\s*)?\{([^\[\]\{\}]+)\}/m;
 
 export type CompileResource = {
     fileType?: string,
@@ -23,7 +23,8 @@ export async function resolveCompileRootDocId(
         if ((fileType !== 'doc' && fileType !== 'file') || !fileId) {
             return undefined;
         }
-        const content = new TextDecoder().decode(await read());
+        const content = new TextDecoder().decode(await read())
+            .replace(/(^|[^\\])(?:\\\\)*%[^\r\n]*/gm, '$1');
         return documentClassRegex.test(content) ? fileId : undefined;
     } catch (error) {
         // A restored editor can refer to a stale resource. That must not block

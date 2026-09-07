@@ -38,6 +38,11 @@ exports.run = async function () {
     assert.ok(commands.includes('overleaf-workshop.projectManager.addServer'));
     assert.ok(commands.includes('remoteFileSystem.prefetch'));
     assert.ok(commands.includes('overleaf-workshop.remoteFileSystem.reloadRemote'));
+    for (const command of ['compile', 'viewPdf', 'refreshPdf', 'syncCode', 'syncPdf', 'syncCodeFromPdf']) {
+        assert.ok(commands.includes(`overleaf-workshop.compileManager.${command}`), `${command} was not registered`);
+    }
+    assert.ok(extension.packageJSON.contributes.customEditors.some(editor =>
+        editor.viewType === 'overleaf-workshop.pdfViewer'));
     const reload = extension.packageJSON.contributes.menus['editor/title'].find(
         item => item.command === 'overleaf-workshop.remoteFileSystem.reloadRemote');
     assert.equal(reload?.when, 'resourceScheme == overleaf-workshop && resourceExtname == .tex');
