@@ -17,8 +17,10 @@
   - [Commands and Shortcuts](wiki.md#commands-and-shortcuts)
   - [Configurations](wiki.md#configurations)
 - [Frequently Asked Questions (FAQ)](wiki.md#faq)
+- [Self-hosted server compatibility](compatibility.md)
 
 ## For Developers
+
 - [Overleaf Server Public API](webapi.md)
 - [Overleaf Workshop Extension Anatomy](anatomy.md)
 - [How to Contribute](../CONTRIBUTING.md#contribution-guidance)

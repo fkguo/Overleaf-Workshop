@@ -4,115 +4,102 @@
 
 Open Overleaf (ShareLaTeX) projects in VS Code or a compatible VS Code-based editor, with realtime collaborative editing and integrated PDF previews.
 
-This is a fork of [Overleaf Workshop](https://github.com/overleaf-workshop/Overleaf-Workshop), with modifications last updated on 2026-09-06. Its GitHub releases are separate from upstream and the Marketplace extension; they are not endorsed by upstream or Overleaf.
+This is a fork of [Overleaf Workshop](https://github.com/overleaf-workshop/Overleaf-Workshop). Releases from this repository are separate from the upstream Marketplace extension and are not endorsed by upstream or Overleaf.
 
-### Install this fork
+## Features
 
-1. Download the `overleaf-workshop-<version>.vsix` asset from the [latest fork release](https://github.com/fkguo/Overleaf-Workshop/releases/latest).
-2. In VS Code or a compatible VS Code-based editor, run **Extensions: Install from VSIX...** and select the downloaded file. This fork retains the extension ID `iamhyc.overleaf-workshop`, so it replaces that installation rather than installing a second extension.
+- Open and manage Overleaf projects without leaving your editor.
+- Collaborate in realtime: share text changes while typing, see collaborators' cursors, and chat.
+- Compile on save or on demand, with a PDF preview beside your TeX source.
+- Navigate between source and PDF using shortcuts, arrow buttons, or a double-click.
+- Browse project history, compare versions, add labels, and inspect contributor information.
+- Work with a [local project copy](./docs/wiki.md#local-replica-source-control) and use [LaTeX Workshop](https://github.com/James-Yu/LaTeX-Workshop) for local compilation.
+
+## Installation
+
+1. Download the `overleaf-workshop-<version>.vsix` asset from the [latest release](https://github.com/fkguo/Overleaf-Workshop/releases/latest).
+2. In VS Code or a compatible VS Code-based editor, run **Extensions: Install from VSIX...** and select the downloaded file.
 3. Preserve any unsaved work, then run **Developer: Reload Window**.
 
-Disable automatic updates for this extension if you want to keep using the fork: a Marketplace update can replace it with the upstream build. See [CHANGELOG.md](./CHANGELOG.md) for changes in this fork.
+This fork uses the same extension ID as the upstream extension, so installing it replaces that installation. Disable automatic updates for this extension to prevent a Marketplace update from replacing it with the upstream build.
 
-### Collaboration, history, and recovery
+## Connect to a project
 
-- Text is synchronized while typing; an explicit save is not required for every collaboration update. Saves and realtime updates retain checks against stale or unconfirmed document state.
-- **Reload Remote** in an Overleaf TeX tab reads the remote text without saving or compiling. A local draft is compared and backed up before explicit replacement; pending or unconfirmed writes stop the reload. Replacement may leave the editor marked as unsaved until you explicitly save it. This manual action does not replace normal realtime synchronization.
-- In **History**, open a version comparison and hover over a changed block to see participants and the change interval when the server supplies that information. A block's participant list is not necessarily authorship for every individual character. The History sidebar remains available while browsing comparisons.
-- History OT editing and Track Changes data are supported on compatible sessions. **Accepting or rejecting tracked changes is not enabled in this fork**; use the Overleaf web editor for those actions.
-- If a save is blocked, keep the local draft and use **Save Recovery Copy...** before replacing it. **Reload Remote** is offered only when the editor has a resolvable remote binding and the connection is ready; the target is checked again before replacement. An unbound restored draft can instead use **Compare with Remote** to inspect read-only snapshots, then save a local copy and explicitly confirm a reload. Reading or comparing remote text does not authorize uploading the draft.
-- Ambiguous or unconfirmed writes remain blocked. The supported text-update path also rejects NUL and non-BMP characters locally, retaining the editor text for recovery. Ordinary Chinese characters in the BMP are supported.
+1. Open **Overleaf Workshop** in the Activity Bar, then add your Overleaf server in **Hosts** if it is not already listed.
+2. Choose **Login to Server**. For `www.overleaf.com`, use **Login with Cookies**; this also supports servers that require SSO or a captcha.
+3. Select your project and choose **Open Project in Current Window** or **Open Project in New Window**. Open its TeX files from Explorer.
 
-### Compilation and PDF navigation
-
-- **Compile Project** requests a build even when the source is unchanged. **View Compiled PDF** opens the preview beside the source.
-- After compilation, automatic PDF navigation uses the visible, unchanged source associated with that build: the cursor when visible, otherwise a position in the visible source region. Double-click the PDF to jump back to the source. Navigation requires a valid PDF and its matching SyncTeX data.
-- In version 0.16.1, the compiled PDF preview has two arrows along its left edge: **→** jumps to the TeX cursor's PDF position; **←** jumps to the source corresponding to the centre of the most visible PDF page area. With multiple visible source files, select the desired TeX editor first. These buttons do not save or compile; use **Compile Project** if a matching compiled output is unavailable. Double-click remains available for precise reverse navigation.
-- Drag either compact arrow up or down to reposition the group along the left edge. The position is remembered for each PDF; dragging does not trigger a jump.
-- Reloading a preview or restarting the extension host refreshes available compiled output and restores the source/PDF split without implicitly saving source files or starting a new compile. If no compiled output is available, run **Compile Project**.
-- A failed PDF download retains the last loaded preview and offers **Retry PDF download**. Unverified output is not used for SyncTeX navigation.
-
-### User Guide
-
-The [upstream user guide](https://github.com/overleaf-workshop/Overleaf-Workshop/wiki) covers general usage. The fork-specific behavior and limitations are described above.
-
-### Features
-
-> [!NOTE]
-> For SSO login or captcha enabled servers like `https://www.overleaf.com`, please use "**Login with Cookies**" method.
-> For more details, please refer to [How to Login with Cookies](#how-to-login-with-cookies).
-
-- Login Server, Open Projects and Edit Files
-
-    <img src="https://raw.githubusercontent.com/overleaf-workshop/Overleaf-Workshop/master/docs/assets/demo01-login.gif" height=400px/>
-
-- On-the-fly Compiling and Previewing
-  > <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>B</kbd> to compile, <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>V</kbd> preview.
-
-    <img src="https://raw.githubusercontent.com/overleaf-workshop/Overleaf-Workshop/master/docs/assets/demo03-synctex.gif" height=400px/>
-
-- SyncTeX and Reverse SyncTeX
-  > <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>J</kbd> to jump to PDF.
-  > Double click on PDF to jump to source code
-
-- Chat with Collaborators
-
-    <img src="https://raw.githubusercontent.com/overleaf-workshop/Overleaf-Workshop/master/docs/assets/demo06-chat.gif" height=400px/>
-
-- Open Project Locally, Compile/Preview with [LaTeX-Workshop](https://github.com/James-Yu/LaTeX-Workshop)
-
-    <img src="https://raw.githubusercontent.com/overleaf-workshop/Overleaf-Workshop/master/docs/assets/demo07-local.gif" height=400px/>
+<img src="./docs/assets/demo01-login.gif" alt="Logging in and opening an Overleaf project" height="400"/>
 
 ### How to Login with Cookies
 
-<img src="https://raw.githubusercontent.com/overleaf-workshop/Overleaf-Workshop/master/docs/assets/login_with_cookie.png" height=400px/>
+1. Log in to your Overleaf server in a browser.
+2. Open the browser's developer tools and select **Network**, then load the server's project list (for example, `https://www.overleaf.com/project`).
+3. Filter requests by `/project`, select the project-list request, and copy the **Cookie** value from its request headers.
+4. Return to the extension, choose **Login with Cookies**, and paste that value.
 
-In an already logged-in browser (Firefox for example):
+<img src="./docs/assets/login_with_cookie.png" alt="Finding the Cookie request header in browser developer tools" height="400"/>
 
-1. Open "Developer Tools" (usually by pressing <kbd>F12</kbd>) and switch to the "Network" tab;
+Keep login cookies private: they grant access to your session.
 
-   Then, navigate to the Overleaf main page (e.g., `https://www.overleaf.com`) in the address bar.
+## Everyday use
 
-2. Filter the listed items with `/project` and select the exact match.
+### Editing and collaboration
 
-3. Check the "Cookie" under "Request Headers" of the selected item and copy its value to login.
-    > The format of the Cookie value would be like: `overleaf_session2=...` or `sharelatex.sid=...`
+In a connected remote project, text changes are shared while you type; you do not need to save after every edit to send them to collaborators. Other collaborators' edits appear in your editor automatically.
 
-### Compatibility
+Use the chat view to discuss changes with collaborators. Saving and compiling are separate from live text synchronization.
 
-The following is the upstream compatibility list for Overleaf (ShareLaTeX) Community Edition images on [Docker Hub](https://hub.docker.com/r/sharelatex/sharelatex). It is not a new certification of every fork feature on each server version; protocol-dependent features require server support.
+### Compilation and PDF navigation
 
-- [x] [sharelatex/sharelatex:5.0.4](https://hub.docker.com/layers/sharelatex/sharelatex/5.0.4/images/sha256-429f6c4c02d5028172499aea347269220fb3505cbba2680f5c981057ffa59316?context=explore) (verified by [@Mingbo-Lee](https://github.com/Mingbo-Lee))
+- Select a TeX tab and run **Compile Project** from its title bar or the Command Palette. It saves pending editor changes before compiling and can recompile even when nothing has changed.
+- Saving a `.tex` or `.bib` file normally triggers compilation in a remote project. Turn off `overleaf-workshop.compileOnSave.enabled` in Settings if you prefer manual compilation.
+- Run **View Compiled PDF** to open the preview beside the source. On project open or preview restore, the extension first looks for an existing PDF for the selected main file. If none is available and the project has no unsaved drafts, it can compile automatically. It does not save drafts just to open a preview.
+- With the preview open, selecting another independent main file containing `\documentclass` switches the PDF target. Opening a chapter file keeps the selected main file. If no main file has been selected this way, the project's configured main file is used.
+- After a successful compilation, the PDF follows the visible source location when the source still matches that build. Use **Jump to PDF** to navigate from the TeX cursor, or double-click a location in the PDF to return to the source.
+- Along the PDF's left edge, **→** jumps from the selected TeX cursor to the PDF; **←** jumps to the source corresponding to the centre of the most visible PDF page area. Select the desired TeX tab first if several source editors are visible. Drag either arrow vertically to reposition the buttons.
+- If navigation is unavailable, compile the current source again. If downloading the PDF fails, the last loaded preview is retained; use **Retry PDF download** after checking the connection.
 
-- [x] [sharelatex/sharelatex:4.2.4](https://hub.docker.com/layers/sharelatex/sharelatex/4.2.4/images/sha256-ac0fc6dbda5e82b9c979721773aa120ad3c4a63469b791b16c3711e0b937528c?context=explore)
+| Action | Windows / Linux | macOS |
+| --- | --- | --- |
+| Compile Project | Ctrl+Alt+B | Cmd+Option+B |
+| View Compiled PDF | Ctrl+Alt+V | Cmd+Option+V |
+| Jump to PDF | Ctrl+Alt+J | Cmd+Option+J |
 
-- [x] [sharelatex/sharelatex:4.1](https://hub.docker.com/layers/sharelatex/sharelatex/4.1/images/sha256-3798913f1ada2da8b897f6b021972db7874982b23bef162019a9ac57471bcee8?context=explore) (verified by [@iamhyc](https://github.com/iamhyc))
+These shortcuts apply while a supported `.tex` editor has keyboard focus.
 
-- [x] [sharelatex/sharelatex:3.5](https://hub.docker.com/layers/sharelatex/sharelatex/3.5/images/sha256-f97fa20e45cdbc688dc051cc4b0e0f4f91ae49fd12bded047d236ca389ad80ac?context=explore) (verified by [@iamhyc](https://github.com/iamhyc))
+<img src="./docs/assets/demo03-synctex.gif" alt="Compiling and navigating between TeX and PDF" height="400"/>
 
-- [ ] [sharelatex/sharelatex:3.4](https://hub.docker.com/layers/sharelatex/sharelatex/3.4/images/sha256-2a72e9b6343ed66f37ded4e6da8df81ed66e8af77e553b91bd19307f98badc7a?context=explore)
+### History
 
-- [ ] [sharelatex/sharelatex:3.3](https://hub.docker.com/layers/sharelatex/sharelatex/3.3/images/sha256-e1ec01563d259bbf290de4eb90dce201147c0aae5a07738c8c2e538f6d39d3a8?context=explore)
+Open a source file and select a version in **History** to compare it with the previous version. Right-click a version for other comparisons or to add and remove labels.
 
-- [ ] [sharelatex/sharelatex:3.2](https://hub.docker.com/layers/sharelatex/sharelatex/3.2/images/sha256-5db71af296f7c16910f8e8939e3841dad8c9ac48ea0a807ad47ca690087f44bf?context=explore)
+Hover over an added or removed block in the comparison to see its participants and time interval when Overleaf provides them. This identifies participants in the block's changes, not necessarily the author of every character. The History sidebar stays available so you can select another version.
 
-- [ ] [sharelatex/sharelatex:3.1](https://hub.docker.com/layers/sharelatex/sharelatex/3.1/images/sha256-5b9de1e65257cea4682c1654af06408af7f9c0e2122952d6791cdda45705e84e?context=explore)
+### Reloading remote text and recovering a draft
 
-- [ ] [sharelatex/sharelatex:3.0](https://hub.docker.com/layers/sharelatex/sharelatex/3.0/images/sha256-a36e54c66ef62fdee736ce2229289aa261b44f083a9fd553cf8264500612db27?context=explore)
+Normal collaboration updates arrive automatically. Use **Reload Remote** in a TeX tab only when you want to reload the online text manually; it does not save or compile the document.
 
-### Development
+If a save is blocked, keep the editor open and choose **Save Recovery Copy...** before replacing any text. Use **Compare with Remote** or **Reload Remote**, when offered, to review the online version. Replacing a local draft requires a recovery copy and your confirmation. Cancel if you are unsure which changes to keep.
 
-Please refer to the development guidance in [CONTRIBUTING.md](./CONTRIBUTING.md)
+After a reload, the editor may still show an unsaved indicator. If recovery cannot proceed, keep your local copy and resolve the connection or reported problem before trying again.
 
-### License and source
+## Compatibility
 
-This modified version is distributed under the [GNU Affero General Public License, version 3](./LICENSE), without warranty as described in that license. Existing copyright and license notices are retained; third-party components retain their own licenses and notices.
+- Requires VS Code 1.86 or later, or a compatible VS Code-based editor supporting that extension API.
+- Self-hosted Overleaf/ShareLaTeX support varies by server version. See the [self-hosted compatibility reference](./docs/compatibility.md) for the upstream version list; history and collaboration features also depend on server support and project permissions.
+- **Accepting or rejecting tracked changes is not available in the extension**; use the Overleaf web editor for those actions.
+- Most everyday Chinese characters are supported. Inserting characters outside Unicode's Basic Multilingual Plane, such as many emoji and some rare characters, or a NUL character is not supported. If a write is blocked, keep a recovery copy.
 
-Each [fork release](https://github.com/fkguo/Overleaf-Workshop/releases) links the source commit corresponding to its VSIX. The repository includes the extension source, dependency manifests, patches, and build scripts; follow [CONTRIBUTING.md](./CONTRIBUTING.md) to build it. See [CHANGELOG.md](./CHANGELOG.md) for the changes from upstream.
+## Documentation
 
-### References
+- [Detailed user guide](./docs/README.md)
+- [Changes in this fork](./CHANGELOG.md)
+- [Development and build instructions](./CONTRIBUTING.md)
+- [Report a problem](https://github.com/fkguo/Overleaf-Workshop/issues)
 
-- [Overleaf Official Logos](https://www.overleaf.com/for/partners/logos)
-- [Overleaf Web Route List](./docs/webapi.md)
-- [James-Yu/LaTeX-Workshop](https://github.com/James-Yu/LaTeX-Workshop)
-- [jlelong/vscode-latex-basics](https://github.com/jlelong/vscode-latex-basics/tags)
+## License and source
+
+Distributed under the [GNU Affero General Public License, version 3](./LICENSE), without warranty. Existing copyright and license notices are retained; third-party components retain their own licenses and notices.
+
+Each [release](https://github.com/fkguo/Overleaf-Workshop/releases) links the source commit corresponding to its VSIX.
