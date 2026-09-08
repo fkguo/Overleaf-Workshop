@@ -2,15 +2,15 @@
 
 [![Fork release](https://img.shields.io/github/v/release/fkguo/Overleaf-Workshop)](https://github.com/fkguo/Overleaf-Workshop/releases/latest)
 
-Open Overleaf (ShareLaTeX) projects in VS Code and Cursor, with realtime collaborative editing and integrated PDF previews.
+Open Overleaf (ShareLaTeX) projects in VS Code or a compatible VS Code-based editor, with realtime collaborative editing and integrated PDF previews.
 
-This is the [fkguo fork](https://github.com/fkguo/Overleaf-Workshop) of [Overleaf Workshop](https://github.com/overleaf-workshop/Overleaf-Workshop), with modifications last updated on 2026-09-06. Its GitHub releases are separate from upstream and the Marketplace extension; they are not endorsed by upstream or Overleaf.
+This is a fork of [Overleaf Workshop](https://github.com/overleaf-workshop/Overleaf-Workshop), with modifications last updated on 2026-09-06. Its GitHub releases are separate from upstream and the Marketplace extension; they are not endorsed by upstream or Overleaf.
 
 ### Install this fork
 
-1. Download the `overleaf-workshop-<version>.vsix` asset from the [latest fork release](https://github.com/fkguo/Overleaf-Workshop/releases/latest). A SHA-256 checksum file is provided alongside it.
-2. In VS Code or Cursor, run **Extensions: Install from VSIX...** and select the downloaded file. This fork retains the extension ID `iamhyc.overleaf-workshop`, so it replaces that installation rather than installing a second extension.
-3. Preserve any unsaved work, then run **Developer: Reload Window**. If updating an earlier build of the same version, reinstall the new VSIX even though the displayed version is unchanged. From a terminal, `code --install-extension <path-to-vsix> --force` or `cursor --install-extension <path-to-vsix> --force` can force replacement.
+1. Download the `overleaf-workshop-<version>.vsix` asset from the [latest fork release](https://github.com/fkguo/Overleaf-Workshop/releases/latest).
+2. In VS Code or a compatible VS Code-based editor, run **Extensions: Install from VSIX...** and select the downloaded file. This fork retains the extension ID `iamhyc.overleaf-workshop`, so it replaces that installation rather than installing a second extension.
+3. Preserve any unsaved work, then run **Developer: Reload Window**.
 
 Disable automatic updates for this extension if you want to keep using the fork: a Marketplace update can replace it with the upstream build. See [CHANGELOG.md](./CHANGELOG.md) for changes in this fork.
 
